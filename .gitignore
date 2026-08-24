@@ -14,3 +14,5 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Local reference checkouts used for architecture study
+.reference-repos/
