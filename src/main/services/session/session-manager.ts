@@ -39,6 +39,8 @@ export type SessionCursor = string | null;
 export interface SessionSnapshot {
   readonly state: SessionLifecycleState;
   readonly sessionId: string | null;
+  /** Pi-owned session file path, authoritative for resuming the session. */
+  readonly sessionFile: string | null;
   readonly lastEntryId: SessionCursor;
   readonly lastError: string | null;
 }
@@ -58,11 +60,18 @@ export type SessionSnapshotListener = (snapshot: SessionSnapshot) => void | Prom
 
 /**
  * Commands are injectable because Pi protocol command names and paging fields
- * may evolve independently of the desktop shell.  The defaults match the
- * current Pi RPC vocabulary used by the reference adapters.
+ * may evolve independently of the desktop shell.  The defaults match Pi's
+ * current RPC vocabulary: session open is `switch_session` (resume) or
+ * `new_session` (create) followed by `get_state`; history replay is
+ * `get_entries` with an optional `since` cursor; `entries`/`leafId` in the
+ * response are authoritative.
  */
 export interface SessionCommandFactory {
   readonly create: (sessionId: string | null) => PiRpcCommand;
+  /** Resume a persisted Pi-owned session file (`switch_session`). */
+  readonly switchSession: (sessionFile: string) => PiRpcCommand;
+  /** Read authoritative session identity (`get_state`). */
+  readonly getState: () => PiRpcCommand;
   readonly synchronize: (sessionId: string | null, cursor: SessionCursor) => PiRpcCommand;
   readonly close: (sessionId: string | null) => PiRpcCommand | null;
   readonly fork: (sessionId: string | null, entryId: string) => PiRpcCommand;
@@ -71,6 +80,7 @@ export interface SessionCommandFactory {
 export interface SessionManagerOptions {
   readonly client?: SessionPiRpcClient;
   readonly sessionId?: string | null;
+  readonly sessionFile?: string | null;
   readonly lastEntryId?: SessionCursor;
   readonly initialSnapshot?: SessionSnapshot;
   readonly commands?: Partial<SessionCommandFactory>;
@@ -83,12 +93,23 @@ export interface SessionReconnectOptions {
 
 export interface SessionSynchronizationResult {
   readonly sessionId: string | null;
+  /** The durable cursor the replay was requested from; null = full history. */
   readonly requestedAfter: SessionCursor;
   readonly previousLastEntryId: SessionCursor;
+  /** Authoritative cursor from the response (prefers `leafId`). */
   readonly lastEntryId: SessionCursor;
   /** Raw Pi-owned records returned by the synchronization command. */
   readonly entries: readonly JsonValue[];
   readonly entryCount: number;
+}
+
+/** Outcome of the open handshake: resume (switch) or fresh session plus state. */
+export interface SessionOpenResult {
+  readonly sessionId: string | null;
+  readonly sessionFile: string | null;
+  /** True when a persisted Pi session file was resumed via switch_session. */
+  readonly resumed: boolean;
+  readonly snapshot: SessionSnapshot;
 }
 
 export interface SessionForkResult {
@@ -125,8 +146,12 @@ export class SessionManagerError extends Error {
 
 const defaultCommands: SessionCommandFactory = {
   create: () => ({ type: "new_session" }),
+  // Resume the persisted Pi-owned session file. Cancellation and failures are
+  // soft fallbacks handled by openSession, not startup errors.
+  switchSession: (sessionFile) => ({ type: "switch_session", sessionPath: sessionFile }),
+  getState: () => ({ type: "get_state" }),
   synchronize: (_sessionId, cursor) =>
-    cursor === null ? { type: "get_messages" } : { type: "get_messages", after: cursor },
+    cursor === null ? { type: "get_entries" } : { type: "get_entries", since: cursor },
   // Closing a logical session does not terminate a Pi process.  The owner of
   // PiRpcClient decides whether to abort or close that process separately.
   close: () => null,
@@ -165,49 +190,27 @@ function readEntries(value: unknown): JsonValue[] {
   const record = asRecord(value);
   if (!record) return [];
 
-  for (const key of ["entries", "missingEntries", "messages", "items"]) {
-    if (Array.isArray(record[key])) {
-      return [...(record[key] as JsonValue[])];
-    }
-  }
-
-  return [];
+  // `entries` is the authoritative history output of Pi's get_entries
+  // command; legacy message/item collection shapes are no longer read.
+  const entries = record["entries"];
+  return Array.isArray(entries) ? [...(entries as JsonValue[])] : [];
 }
 
-function entryIdFromValue(value: unknown, allowGenericId: boolean): string | null {
+function entryIdFromValue(value: unknown): string | null {
   const record = asRecord(value);
   if (!record) return null;
 
-  const namedId = readString(record, [
+  // Named id fields first; a bare `id` is accepted only for records that are
+  // part of the authoritative get_entries output.
+  return readString(record, [
     "entryId",
     "entry_id",
     "lastEntryId",
     "last_entry_id",
     "leafId",
     "leaf_id",
+    "id",
   ]);
-  if (namedId !== null) return namedId;
-
-  return allowGenericId ? readString(record, ["id"]) : null;
-}
-
-function eventEntryId(event: PiRpcEvent): string | null {
-  const direct = entryIdFromValue(event, false);
-  if (direct !== null) return direct;
-
-  const record = asRecord(event);
-  if (!record) return null;
-
-  // Pi adapters place entry metadata on the event, its message, or a data
-  // envelope.  Do not inspect event.id: Pi uses that field for RPC request
-  // correlation, not session history identity.
-  for (const key of ["entry", "message", "data", "payload"]) {
-    const nested = asRecord(record[key]);
-    const nestedId = entryIdFromValue(nested, key === "entry");
-    if (nestedId !== null) return nestedId;
-  }
-
-  return null;
 }
 
 function responseSessionId(response: PiRpcSuccessResponse): string | null {
@@ -222,12 +225,26 @@ function responseSessionId(response: PiRpcSuccessResponse): string | null {
   return readString(asRecord(data?.session), ["sessionId", "session_id"]);
 }
 
+function responseSessionFile(response: PiRpcSuccessResponse): string | null {
+  const root = asRecord(response);
+  const rootFile = readString(root, ["sessionFile", "session_file"]);
+  if (rootFile !== null) return rootFile;
+  return readString(asRecord(response.data), ["sessionFile", "session_file"]);
+}
+
 function responseCursor(response: PiRpcSuccessResponse, entries: readonly JsonValue[]): string | null {
   const root = asRecord(response);
+  // `leafId` is the authoritative cursor of a get_entries response.
+  const rootLeaf = readString(root, ["leafId", "leaf_id"]);
+  if (rootLeaf !== null) return rootLeaf;
+
+  const data = asRecord(response.data);
+  const dataLeaf = readString(data, ["leafId", "leaf_id"]);
+  if (dataLeaf !== null) return dataLeaf;
+
   const rootCursor = readString(root, ["lastEntryId", "last_entry_id", "nextCursor", "next_cursor"]);
   if (rootCursor !== null) return rootCursor;
 
-  const data = asRecord(response.data);
   const dataCursor = readString(data, [
     "lastEntryId",
     "last_entry_id",
@@ -241,7 +258,7 @@ function responseCursor(response: PiRpcSuccessResponse, entries: readonly JsonVa
   if (nestedCursor !== null) return nestedCursor;
 
   for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const entryId = entryIdFromValue(entries[index], true);
+    const entryId = entryIdFromValue(entries[index]);
     if (entryId !== null) return entryId;
   }
 
@@ -250,6 +267,15 @@ function responseCursor(response: PiRpcSuccessResponse, entries: readonly JsonVa
 
 function responseData(response: PiRpcSuccessResponse): JsonValue | null {
   return response.data === undefined ? null : response.data;
+}
+
+/**
+ * A successful `switch_session` may still report `cancelled: true`; that is a
+ * soft fallback signal, not an RPC failure.
+ */
+function isCancelled(response: PiRpcSuccessResponse): boolean {
+  if (asRecord(response)?.["cancelled"] === true) return true;
+  return asRecord(response.data)?.["cancelled"] === true;
 }
 
 function errorMessage(error: unknown): string {
@@ -276,6 +302,47 @@ function validateSessionId(sessionId: string | null | undefined): string | null 
   return normalized;
 }
 
+function validateSessionFile(sessionFile: string | null | undefined): string | null {
+  if (sessionFile === undefined || sessionFile === null) return null;
+  const normalized = nonEmptyString(sessionFile);
+  if (normalized === null) {
+    throw new TypeError("sessionFile must be a non-empty string or null");
+  }
+  if (!isCanonicalSessionFilePath(normalized)) {
+    throw new TypeError(
+      "sessionFile must be an absolute Linux-style path without backslashes, " +
+        "control characters, dot segments, duplicate separators, or a trailing slash",
+    );
+  }
+  return normalized;
+}
+
+/**
+ * Only canonical absolute Linux-style paths may be forwarded to Pi via
+ * `switch_session`. Relative and Windows-style paths, NUL/control
+ * characters, `.`/`..` segments, duplicate separators, and trailing slashes
+ * (except root itself) are rejected so malformed session files never reach
+ * Pi.
+ */
+function isCanonicalSessionFilePath(path: string): boolean {
+  if (!path.startsWith("/")) return false;
+  if (path.includes("\\")) return false;
+  for (let index = 0; index < path.length; index += 1) {
+    const code = path.charCodeAt(index);
+    if (code === 0 || code < 0x20 || code === 0x7f) return false;
+  }
+  if (path === "/") return true; // root: canonical absolute path, no name
+  if (path.endsWith("/")) return false;
+  const segments = path.split("/");
+  // segments[0] is the "" from the leading "/"; every later segment must be a
+  // non-empty, non-dot name (an empty name means a duplicate separator).
+  for (let index = 1; index < segments.length; index += 1) {
+    const segment = segments[index];
+    if (segment.length === 0 || segment === "." || segment === "..") return false;
+  }
+  return true;
+}
+
 function validateCursor(cursor: SessionCursor | undefined): SessionCursor {
   if (cursor === undefined || cursor === null) return null;
   return validateSessionId(cursor);
@@ -284,16 +351,19 @@ function validateCursor(cursor: SessionCursor | undefined): SessionCursor {
 /**
  * Owns logical session state and Pi-history catch-up, but not the Pi process.
  *
- * `PiRpcClient` satisfies `SessionPiRpcClient` structurally.  A new client can
- * be supplied to `reconnect()` after a Pi restart; the manager then requests
- * history after its persisted `lastEntryId` cursor and returns raw Pi records
- * to the caller without maintaining a second history database.
+ * `PiRpcClient` satisfies `SessionPiRpcClient` structurally.  `openSession()`
+ * runs the resume-or-create handshake (`switch_session`/`new_session` then
+ * `get_state`) and adopts Pi's authoritative session file/id; `synchronize()`
+ * requests history via `get_entries` since the persisted `lastEntryId` cursor
+ * and returns the raw `entries` plus the authoritative `leafId` cursor to the
+ * caller without maintaining a second history database.  Durable cursors come
+ * only from those responses, never from agent events.
  */
 export class SessionManager {
   private clientValue: SessionPiRpcClient | null = null;
-  private unsubscribeValue: (() => void) | null = null;
   private stateValue: SessionLifecycleState = "new";
   private sessionIdValue: string | null = null;
+  private sessionFileValue: string | null = null;
   private lastEntryIdValue: SessionCursor = null;
   private lastErrorValue: string | null = null;
   private readonly commands: SessionCommandFactory;
@@ -304,6 +374,7 @@ export class SessionManager {
     const initial = options.initialSnapshot;
     this.stateValue = initial?.state ?? "new";
     this.sessionIdValue = validateSessionId(options.sessionId ?? initial?.sessionId);
+    this.sessionFileValue = validateSessionFile(options.sessionFile ?? initial?.sessionFile);
     this.lastEntryIdValue = validateCursor(options.lastEntryId ?? initial?.lastEntryId);
     this.lastErrorValue = initial?.lastError ?? null;
     this.commands = { ...defaultCommands, ...options.commands };
@@ -330,6 +401,10 @@ export class SessionManager {
     return this.sessionIdValue;
   }
 
+  get sessionFile(): string | null {
+    return this.sessionFileValue;
+  }
+
   get lastEntryId(): SessionCursor {
     return this.lastEntryIdValue;
   }
@@ -343,6 +418,7 @@ export class SessionManager {
     return {
       state: this.stateValue,
       sessionId: this.sessionIdValue,
+      sessionFile: this.sessionFileValue,
       lastEntryId: this.lastEntryIdValue,
       lastError: this.lastErrorValue,
     };
@@ -375,6 +451,42 @@ export class SessionManager {
         return this.getSnapshot();
       } catch (error: unknown) {
         throw this.fail("create", error, "failed");
+      }
+    });
+  }
+
+  /**
+   * Open the Pi-owned session and read its authoritative identity.
+   *
+   * Handshake: when a persisted session file is supplied, `switch_session` is
+   * tried first; a cancellation (`cancelled: true`) or any failure degrades
+   * softly to `new_session`. The successful open is always followed by
+   * `get_state`, whose `sessionFile` (falling back to `sessionId`) is the
+   * authoritative session identity. Pi owns the session file; the caller
+   * persists only this pointer.
+   */
+  openSession(sessionFile: string | null): Promise<SessionOpenResult> {
+    return this.enqueue(async () => {
+      if (this.stateValue === "ready") return this.openResult(false);
+      this.assertState("open", ["new", "failed", "disconnected"]);
+      const client = this.requireClient("open");
+      this.clearError();
+      // Reject a malformed persisted session file before touching state or
+      // Pi: it must never reach `switch_session`, and the manager must not be
+      // left mid-handshake by a validation error.
+      const target = validateSessionFile(sessionFile);
+      this.setState("creating");
+
+      try {
+        const resumed = target !== null ? await this.trySwitchSession(client, target) : false;
+        if (!resumed) {
+          const command = validateCommand(this.commands.create(this.sessionIdValue), "create");
+          const response = await this.request(client, command, "create");
+          this.applyResponseMetadata(response);
+        }
+        return await this.readState(client, resumed);
+      } catch (error: unknown) {
+        throw this.fail("open", error, "failed");
       }
     });
   }
@@ -502,6 +614,43 @@ export class SessionManager {
     });
   }
 
+  /**
+   * Attempt `switch_session` against a persisted Pi session file. Returns
+   * true when Pi accepted it; cancellation and RPC failures degrade softly to
+   * false so the caller falls back to `new_session` without failing startup.
+   */
+  private async trySwitchSession(
+    client: SessionPiRpcClient,
+    sessionFile: string,
+  ): Promise<boolean> {
+    const command = validateCommand(this.commands.switchSession(sessionFile), "switch");
+    try {
+      const response = await this.request(client, command, "switch");
+      this.applyResponseMetadata(response);
+      return !isCancelled(response);
+    } catch {
+      return false;
+    }
+  }
+
+  /** Read `get_state` and adopt the authoritative session identity. */
+  private async readState(client: SessionPiRpcClient, resumed: boolean): Promise<SessionOpenResult> {
+    const command = validateCommand(this.commands.getState(), "state");
+    const response = await this.request(client, command, "state");
+    this.applyResponseMetadata(response);
+    this.setState("ready");
+    return this.openResult(resumed);
+  }
+
+  private openResult(resumed: boolean): SessionOpenResult {
+    return {
+      sessionId: this.sessionIdValue,
+      sessionFile: this.sessionFileValue,
+      resumed,
+      snapshot: this.getSnapshot(),
+    };
+  }
+
   private synchronizeInternal(operation: "resume" | "reconnect" | "synchronize"): Promise<SessionSynchronizationResult> {
     const client = this.requireClient(operation);
     const previousLastEntryId = this.lastEntryIdValue;
@@ -540,6 +689,9 @@ export class SessionManager {
     const sessionId = responseSessionId(response);
     if (sessionId !== null) this.sessionIdValue = sessionId;
 
+    const sessionFile = responseSessionFile(response);
+    if (sessionFile !== null) this.sessionFileValue = sessionFile;
+
     const cursor = responseCursor(response, entries);
     if (cursor !== null) this.lastEntryIdValue = cursor;
   }
@@ -562,28 +714,14 @@ export class SessionManager {
   }
 
   private attachClient(client: SessionPiRpcClient): void {
+    // Durable synchronization cursors come only from get_entries responses.
+    // Agent events are forwarded by the caller but never interpreted here as
+    // entry ids, so the manager does not subscribe to them.
     this.clientValue = client;
-    if (typeof client.onEvent !== "function") return;
-    this.unsubscribeValue = client.onEvent((event) => {
-      const entryId = eventEntryId(event);
-      if (entryId !== null) {
-        this.lastEntryIdValue = entryId;
-        this.emitSnapshot();
-      }
-    });
   }
 
   private detachClient(): void {
-    const unsubscribe = this.unsubscribeValue;
-    this.unsubscribeValue = null;
     this.clientValue = null;
-    if (unsubscribe) {
-      try {
-        unsubscribe();
-      } catch {
-        // Event-listener cleanup is best effort; the manager is detached.
-      }
-    }
   }
 
   private requireClient(operation: string): SessionPiRpcClient {

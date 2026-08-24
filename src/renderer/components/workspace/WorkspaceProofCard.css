@@ -1,0 +1,176 @@
+.workspace-proof-card {
+  padding-bottom: 22px;
+}
+
+.workspace-proof-badge {
+  padding: 5px 9px;
+  border: 1px solid rgba(167, 191, 222, 0.18);
+  border-radius: 999px;
+  color: #8494a9;
+  background: rgba(167, 191, 222, 0.06);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.workspace-proof-target {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 14px;
+  color: #cbd6e5;
+  font-size: 12px;
+}
+
+.workspace-proof-target span {
+  overflow: hidden;
+  color: #9aabbe;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-proof-target code {
+  overflow: hidden;
+  color: #dce7f4;
+  font: 11px "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-proof-button {
+  width: 100%;
+  justify-content: center;
+}
+
+.workspace-proof-results {
+  display: grid;
+  gap: 16px;
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px solid rgba(167, 191, 222, 0.1);
+}
+
+.workspace-proof-result-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  color: #8392a7;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.workspace-proof-result-heading strong,
+.workspace-proof-result-heading span:last-child {
+  overflow: hidden;
+  color: #b5e7de;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-overflow: ellipsis;
+  text-transform: none;
+  white-space: nowrap;
+}
+
+.workspace-proof-content {
+  max-height: 170px;
+  margin: 0;
+  overflow: auto;
+  padding: 11px;
+  border: 1px solid rgba(167, 191, 222, 0.13);
+  border-radius: 8px;
+  color: #c8d3e2;
+  background: rgba(8, 13, 20, 0.48);
+  font: 11px/1.55 "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.workspace-proof-muted,
+.workspace-proof-clean {
+  margin: 0;
+  color: #718197;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.workspace-proof-failure {
+  padding: 10px 11px;
+  border: 1px solid rgba(241, 167, 167, 0.22);
+  border-radius: 8px;
+  color: #f1c1c1;
+  background: rgba(110, 42, 52, 0.18);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.workspace-proof-failure strong {
+  display: block;
+  color: #f3d1d1;
+  font-weight: 650;
+}
+
+.workspace-proof-failure p {
+  margin: 4px 0 0;
+}
+
+.workspace-git-result {
+  min-width: 0;
+}
+
+.workspace-git-entries {
+  display: grid;
+  max-height: 180px;
+  gap: 8px;
+  margin: 0;
+  overflow: auto;
+  padding: 0;
+  list-style: none;
+}
+
+.workspace-git-entries li {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 7px;
+  min-width: 0;
+  color: #bdcada;
+  font-size: 11px;
+}
+
+.workspace-git-code {
+  color: #86daca;
+  font: 10px "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+}
+
+.workspace-git-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-git-rename {
+  display: block;
+  overflow: hidden;
+  color: #718197;
+  font-size: 10px;
+  text-overflow: ellipsis;
+}
+
+.workspace-git-label {
+  color: #8494a9;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.workspace-proof-request-error {
+  margin: 10px 0 0;
+  color: #f1a7a7;
+  font-size: 11px;
+  line-height: 1.4;
+}

@@ -65,23 +65,26 @@ test("models create state and persists only Pi session identity/cursor data", as
   });
 
   const created = await manager.create();
+  // Agent events carry no durable cursor; only get_entries responses do.
   client.emit({ type: "message_end", entryId: "entry-1" });
 
   assert.deepEqual(client.commands, [{ type: "new_session" }]);
-  assert.deepEqual(states, ["creating", "ready", "ready"]);
+  assert.deepEqual(states, ["creating", "ready"]);
   assert.equal(created.state, "ready");
   assert.equal(created.sessionId, "pi-session-1");
-  assert.equal(manager.lastEntryId, "entry-1");
+  assert.equal(created.sessionFile, null);
+  assert.equal(manager.lastEntryId, "entry-0");
   assert.deepEqual(Object.keys(manager.snapshot).sort(), [
     "lastEntryId",
     "lastError",
+    "sessionFile",
     "sessionId",
     "state",
   ]);
   assert.deepEqual(JSON.parse(JSON.stringify(manager.snapshot)), manager.snapshot);
 });
 
-test("reconnect replays records after the persisted cursor through a replacement client", async () => {
+test("reconnect replays records since the persisted cursor through a replacement client", async () => {
   const firstClient = new FakePiRpcClient();
   const manager = new SessionManager({
     client: firstClient,
@@ -92,13 +95,13 @@ test("reconnect replays records after the persisted cursor through a replacement
   const replacement = new FakePiRpcClient();
   replacement.queueResponse({
     entries: [{ id: "entry-2", role: "user" }, { entryId: "entry-3", role: "assistant" }],
-    lastEntryId: "entry-3",
+    leafId: "entry-3",
   });
 
   const result = await manager.reconnect(replacement);
   firstClient.emit({ type: "message_end", entryId: "stale-entry" });
 
-  assert.deepEqual(replacement.commands, [{ type: "get_messages", after: "entry-1" }]);
+  assert.deepEqual(replacement.commands, [{ type: "get_entries", since: "entry-1" }]);
   assert.equal(result?.requestedAfter, "entry-1");
   assert.equal(result?.entryCount, 2);
   assert.deepEqual(result?.entries, [
@@ -106,6 +109,8 @@ test("reconnect replays records after the persisted cursor through a replacement
     { entryId: "entry-3", role: "assistant" },
   ]);
   assert.equal(manager.state, "ready");
+  assert.equal(manager.lastEntryId, "entry-3");
+  // Stale events from the detached client must not move the durable cursor.
   assert.equal(manager.lastEntryId, "entry-3");
 });
 
@@ -133,6 +138,21 @@ test("resume and synchronize use injectable command builders and keep Pi records
   assert.deepEqual(result.entries, []);
   assert.equal(manager.lastEntryId, "e2");
   assert.equal(manager.snapshot.lastError, null);
+});
+
+test("initial synchronization requests the full entry list without a since cursor", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ entries: [{ id: "e1" }], leafId: "e1" });
+  const manager = new SessionManager({ client, sessionId: "session-6" });
+
+  const result = await manager.resume();
+
+  assert.deepEqual(client.commands, [{ type: "get_entries" }]);
+  assert.equal(result?.requestedAfter, null);
+  assert.deepEqual(result?.entries, [{ id: "e1" }]);
+  assert.equal(result?.lastEntryId, "e1");
+  assert.equal(manager.state, "ready");
+  assert.equal(manager.lastEntryId, "e1");
 });
 
 test("fork sends only the authoritative entry id and close detaches without owning Pi shutdown", async () => {
@@ -169,10 +189,10 @@ test("a failed sync becomes recoverable and reconnect can continue from the same
   assert.equal(manager.lastEntryId, "entry-9");
 
   const recoveredClient = new FakePiRpcClient();
-  recoveredClient.queueResponse({ entries: [{ id: "entry-10" }] });
+  recoveredClient.queueResponse({ entries: [{ id: "entry-10" }], leafId: "entry-10" });
   const result = await manager.reconnect(recoveredClient);
 
-  assert.deepEqual(recoveredClient.commands, [{ type: "get_messages", after: "entry-9" }]);
+  assert.deepEqual(recoveredClient.commands, [{ type: "get_entries", since: "entry-9" }]);
   assert.equal(result?.lastEntryId, "entry-10");
   assert.equal(manager.state, "ready");
 });
@@ -181,6 +201,7 @@ test("restore from a serializable snapshot does not require a live Pi process un
   const restored = SessionManager.fromSnapshot({
     state: "disconnected",
     sessionId: "session-5",
+    sessionFile: "/home/pi/.pi/agent/sessions/session-5",
     lastEntryId: "entry-12",
     lastError: "previous process exited",
   });
@@ -188,9 +209,11 @@ test("restore from a serializable snapshot does not require a live Pi process un
   assert.deepEqual(restored.snapshot, {
     state: "disconnected",
     sessionId: "session-5",
+    sessionFile: "/home/pi/.pi/agent/sessions/session-5",
     lastEntryId: "entry-12",
     lastError: "previous process exited",
   });
+  assert.equal(restored.sessionFile, "/home/pi/.pi/agent/sessions/session-5");
   await assert.rejects(restored.resume(), (error: unknown) => {
     assert.ok(error instanceof SessionManagerError);
     assert.equal(error.code, "NO_CLIENT");
@@ -202,4 +225,198 @@ test("restore from a serializable snapshot does not require a live Pi process un
   await restored.reconnect(client);
   assert.equal(restored.lastEntryId, "entry-13");
   assert.equal(restored.state, "ready");
+});
+
+test("openSession resumes a persisted session file with switch_session then get_state", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ sessionId: "pi-session-1" }); // switch_session
+  client.queueResponse({
+    sessionId: "pi-session-1",
+    sessionFile: "/home/pi/.pi/agent/sessions/pi-session-1",
+  }); // get_state
+  const manager = new SessionManager({
+    client,
+    sessionId: "pi-session-1",
+    sessionFile: "/home/pi/.pi/agent/sessions/pi-session-1",
+    lastEntryId: "entry-9",
+  });
+
+  const opened = await manager.openSession("/home/pi/.pi/agent/sessions/pi-session-1");
+
+  assert.deepEqual(client.commands, [
+    { type: "switch_session", sessionPath: "/home/pi/.pi/agent/sessions/pi-session-1" },
+    { type: "get_state" },
+  ]);
+  assert.equal(opened.resumed, true);
+  assert.equal(opened.sessionId, "pi-session-1");
+  assert.equal(opened.sessionFile, "/home/pi/.pi/agent/sessions/pi-session-1");
+  assert.equal(opened.snapshot.state, "ready");
+  assert.equal(manager.sessionFile, "/home/pi/.pi/agent/sessions/pi-session-1");
+});
+
+test("openSession without a persisted file creates a fresh session then reads state", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ sessionId: "pi-session-new" }); // new_session
+  client.queueResponse({
+    sessionId: "pi-session-new",
+    sessionFile: "/home/pi/.pi/agent/sessions/pi-session-new",
+  }); // get_state
+  const manager = new SessionManager({ client });
+
+  const opened = await manager.openSession(null);
+
+  assert.deepEqual(client.commands, [{ type: "new_session" }, { type: "get_state" }]);
+  assert.equal(opened.resumed, false);
+  assert.equal(opened.sessionId, "pi-session-new");
+  assert.equal(opened.sessionFile, "/home/pi/.pi/agent/sessions/pi-session-new");
+  assert.equal(manager.state, "ready");
+});
+
+test("a cancelled switch_session degrades softly to new_session", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ cancelled: true }); // switch_session cancelled
+  client.queueResponse({ sessionId: "pi-session-2" }); // new_session
+  client.queueResponse({
+    sessionId: "pi-session-2",
+    sessionFile: "/sessions/pi-session-2",
+  }); // get_state
+  const manager = new SessionManager({ client });
+
+  const opened = await manager.openSession("/sessions/old");
+
+  assert.deepEqual(client.commands, [
+    { type: "switch_session", sessionPath: "/sessions/old" },
+    { type: "new_session" },
+    { type: "get_state" },
+  ]);
+  assert.equal(opened.resumed, false);
+  assert.equal(manager.state, "ready");
+  assert.equal(manager.snapshot.lastError, null);
+});
+
+test("a failed switch_session degrades softly to new_session", async () => {
+  const client = new FakePiRpcClient();
+  client.queueError("session file is invalid"); // switch_session failure
+  client.queueResponse({ sessionId: "pi-session-3" }); // new_session
+  client.queueResponse({
+    sessionId: "pi-session-3",
+    sessionFile: "/sessions/pi-session-3",
+  }); // get_state
+  const manager = new SessionManager({ client });
+
+  const opened = await manager.openSession("/sessions/invalid");
+
+  assert.deepEqual(client.commands, [
+    { type: "switch_session", sessionPath: "/sessions/invalid" },
+    { type: "new_session" },
+    { type: "get_state" },
+  ]);
+  assert.equal(opened.resumed, false);
+  assert.equal(manager.state, "ready");
+  assert.equal(manager.snapshot.lastError, null);
+});
+
+test("openSession fails when the new_session fallback also fails", async () => {
+  const client = new FakePiRpcClient();
+  client.queueError("switch rejected");
+  client.queueError("new_session rejected");
+  const manager = new SessionManager({ client, sessionFile: "/sessions/old" });
+
+  await assert.rejects(manager.openSession("/sessions/old"), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "RPC_FAILURE");
+    return true;
+  });
+  assert.equal(manager.state, "failed");
+});
+
+test("get_state identity falls back from sessionFile to sessionId", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ sessionId: "pi-session-4" }); // new_session
+  client.queueResponse({ sessionId: "pi-session-4" }); // get_state without sessionFile
+  const manager = new SessionManager({ client });
+
+  const opened = await manager.openSession(null);
+
+  assert.equal(opened.resumed, false);
+  assert.equal(opened.sessionId, "pi-session-4");
+  assert.equal(opened.sessionFile, null);
+  assert.equal(manager.sessionId, "pi-session-4");
+});
+
+test("openSession injectable commands build switch and state through the factory", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ sessionId: "custom-session" });
+  client.queueResponse({ sessionId: "custom-session" });
+  const commands: PiRpcCommand[] = [];
+  const manager = new SessionManager({
+    client,
+    commands: {
+      switchSession: (sessionFile) => {
+        const command = { type: "session_resume", sessionFile };
+        commands.push(command);
+        return command;
+      },
+      getState: () => {
+        const command = { type: "session_info" };
+        commands.push(command);
+        return command;
+      },
+    },
+  });
+
+  const opened = await manager.openSession("/sessions/custom");
+
+  assert.deepEqual(commands, [
+    { type: "session_resume", sessionFile: "/sessions/custom" },
+    { type: "session_info" },
+  ]);
+  assert.equal(opened.resumed, true);
+  assert.equal(opened.sessionId, "custom-session");
+  assert.equal(manager.state, "ready");
+});
+
+test("openSession rejects malformed session files before issuing any command", async () => {
+  const client = new FakePiRpcClient();
+  const manager = new SessionManager({ client });
+  const malformed = [
+    "relative/path",
+    "../etc/passwd",
+    ".hidden",
+    "..\\..\\windows\\evil",
+    "C:\\Users\\pi\\sessions\\x",
+    "/a\\b",
+    "/a//b",
+    "//etc/passwd",
+    "/a/../b",
+    "/a/./b",
+    "/a/",
+    "/a/\u0000b",
+    "/a/\u0001b",
+    "/a/\u007f",
+  ];
+  for (const path of malformed) {
+    await assert.rejects(manager.openSession(path), TypeError);
+  }
+  // A malformed path never reached Pi and never wedged the handshake state.
+  assert.deepEqual(client.commands, []);
+  assert.equal(manager.state, "new");
+});
+
+test("a malformed persisted session file is rejected at construction", () => {
+  assert.throws(() => new SessionManager({ sessionFile: "/a//b" }), TypeError);
+  assert.throws(() => new SessionManager({ sessionFile: "/a/../b" }), TypeError);
+  assert.throws(() => new SessionManager({ sessionFile: "/a/" }), TypeError);
+  assert.throws(() => new SessionManager({ sessionFile: "..\\evil" }), TypeError);
+  assert.throws(
+    () =>
+      SessionManager.fromSnapshot({
+        state: "disconnected",
+        sessionId: null,
+        sessionFile: "/a/./b",
+        lastEntryId: null,
+        lastError: null,
+      }),
+    TypeError,
+  );
 });

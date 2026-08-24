@@ -14,6 +14,18 @@ export type { ConversationEvent, ConversationSnapshot } from '../../../shared/co
 type Prompt = { id: number; message: string };
 type Listener = (event: ConversationEvent) => void;
 
+/** Streaming accumulation for the assistant message currently being produced. */
+interface StreamingAssistant {
+  /** content-block index -> accumulated visible text */
+  textByIndex: Map<number, string>;
+  /** content-block index -> accumulated thinking */
+  thinkingByIndex: Map<number, string>;
+  /** text deltas received before any text block was visible in a snapshot */
+  pendingText: string;
+  /** thinking deltas received before any thinking block was visible in a snapshot */
+  pendingThinking: string;
+}
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -28,8 +40,14 @@ function objectValue(value: unknown): Record<string, unknown> | null {
 
 function messageText(value: unknown): string {
   if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    return value.map((part) => {
+      const item = objectValue(part);
+      return item && typeof item.text === 'string' ? item.text : '';
+    }).join('');
+  }
   const record = objectValue(value);
-  if (!record) return value === undefined || value === null ? '' : String(value);
+  if (!record) return '';
   if (typeof record.content === 'string') return record.content;
   if (Array.isArray(record.content)) {
     return record.content.map((part) => {
@@ -44,16 +62,158 @@ function isBashTool(name: string, event: Record<string, unknown>): boolean {
   return name.toLowerCase() === 'bash' || name.toLowerCase() === 'shell' || Boolean(event.command);
 }
 
+/** Assistant message content blocks with their array positions. */
+function contentBlocks(value: unknown): Array<{ index: number; block: Record<string, unknown> }> | null {
+  // Session entries carry `message.content` as the bare block array; live
+  // events carry it under a message/partial record. Accept both.
+  const content = Array.isArray(value) ? value : objectValue(value)?.content;
+  if (!Array.isArray(content)) return null;
+  const blocks: Array<{ index: number; block: Record<string, unknown> }> = [];
+  for (let index = 0; index < content.length; index++) {
+    const block = objectValue(content[index]);
+    if (block) blocks.push({ index, block });
+  }
+  return blocks;
+}
+
+/**
+ * Grow-only reconciliation of a cumulative block snapshot against the text
+ * already accumulated for that block: snapshots may extend earlier text, but a
+ * stale or truncated snapshot must never roll the known stream backward.
+ */
+function mergeBlockSnapshot(previous: string, update: string): string {
+  if (!update) return previous;
+  if (!previous) return update;
+  if (update === previous) return previous;
+  if (update.startsWith(previous)) return update;
+  if (previous.startsWith(update)) return previous;
+  return previous + update;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** Visible assistant text: `text` blocks in content order, thinking excluded. */
+function assistantText(value: unknown): string {
+  const blocks = contentBlocks(value);
+  if (!blocks) return messageText(value);
+  let text = "";
+  for (const { block } of blocks) {
+    if (block.type === "text" && typeof block.text === "string") text += block.text;
+  }
+  return text;
+}
+
+interface HydratedToolCall {
+  readonly name: string;
+  readonly input?: string;
+}
+
+/** Collect assistant toolCall blocks so tool results carry their tool name/command. */
+function collectToolCalls(entries: readonly unknown[]): Map<string, HydratedToolCall> {
+  const calls = new Map<string, HydratedToolCall>();
+  for (const raw of entries) {
+    const entry = objectValue(raw);
+    if (!entry || entry.type !== "message") continue;
+    const message = objectValue(entry.message);
+    if (!message || message.role !== "assistant") continue;
+    const blocks = contentBlocks(message.content);
+    if (!blocks) continue;
+    for (const { block } of blocks) {
+      if (block.type !== "toolCall") continue;
+      const id = stringValue(block.toolCallId);
+      if (id === undefined) continue;
+      const input = objectValue(block.input);
+      calls.set(id, {
+        name: stringValue(block.toolName) ?? "Tool",
+        input: input && typeof input.command === "string" ? input.command : undefined,
+      });
+    }
+  }
+  return calls;
+}
+
+/**
+ * Project one raw Pi session entry into a timeline record. Entries that are
+ * not user/assistant message entries or tool results (compactions, model
+ * changes, custom entries, ...) project to null.
+ */
+function projectEntry(
+  raw: unknown,
+  toolCalls: Map<string, HydratedToolCall>,
+): ConversationTimelineRecord | null {
+  const entry = objectValue(raw);
+  if (!entry || entry.type !== "message") return null;
+  const message = objectValue(entry.message);
+  if (!message) return null;
+  const entryId = stringValue(entry.id);
+  const createdAt = stringValue(entry.timestamp);
+  if (entryId === undefined) return null;
+
+  switch (message.role) {
+    case "user": {
+      return {
+        id: entryId,
+        type: "message",
+        role: "user",
+        content: messageText(message.content),
+        createdAt,
+      };
+    }
+    case "assistant": {
+      const content = assistantText(message.content);
+      if (!content) return null;
+      return { id: entryId, type: "message", role: "assistant", content, createdAt };
+    }
+    case "toolResult": {
+      const toolCallId = stringValue(message.toolCallId);
+      if (toolCallId === undefined) return null;
+      const call = toolCalls.get(toolCallId);
+      const name = stringValue(message.toolName) ?? call?.name ?? "Tool";
+      const output = messageText(message.content) || undefined;
+      const status = message.isError === true ? "failed" : "completed";
+      if (name.toLowerCase() === "bash" || name.toLowerCase() === "shell") {
+        return {
+          id: toolCallId,
+          type: "bash",
+          command: call?.input ?? output ?? name,
+          status,
+          output,
+          exitCode: numberValue(message.exitCode),
+          createdAt,
+        };
+      }
+      return {
+        id: toolCallId,
+        type: "tool",
+        name,
+        status,
+        input: call?.input,
+        output,
+        createdAt,
+      };
+    }
+    default:
+      return null;
+  }
+}
+
 export class ConversationController {
   private readonly client: PiRpcClient;
   private readonly listeners = new Set<Listener>();
   private readonly queue: Prompt[] = [];
   private readonly records: ConversationTimelineRecord[] = [];
+  /** Entry/tool-call ids already projected by hydrate, for idempotent replays. */
+  private readonly hydratedRecordIds = new Set<string>();
+  private readonly hydratedToolCalls = new Map<string, HydratedToolCall>();
   private promptId = 0;
   private recordId = 0;
   private activePrompt: Prompt | null = null;
+  /** Whether the active turn is being aborted by the user (affects tool settlement). */
+  private abortRequested = false;
   private activeToolId: string | null = null;
-  private streamingTextValue: string | undefined;
+  private streamingState: StreamingAssistant | null = null;
   private snapshotValue: ConversationSnapshot = {
     timeline: [],
     executionState: 'idle',
@@ -64,7 +224,18 @@ export class ConversationController {
   constructor(client: PiRpcClient) {
     this.client = client;
     this.client.onEvent((event) => this.handleEvent(event));
-    this.client.onError((error) => this.setState('error', error.message));
+    this.client.onError((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.activePrompt) {
+        // A transport/client failure while a turn is active must not leave
+        // the controller blocked with a stuck active prompt: fail the turn,
+        // publish a visible error state, and keep the queue moving so future
+        // sends can recover.
+        this.failActiveTurn(message);
+      } else {
+        this.setState('error', message);
+      }
+    });
   }
 
   get snapshot(): ConversationSnapshot {
@@ -75,6 +246,34 @@ export class ConversationController {
     this.listeners.add(listener);
     listener({ type: 'conversation', snapshot: this.snapshot });
     return () => this.listeners.delete(listener);
+  }
+
+  /**
+   * Project raw Pi session entries (the `entries` of a `get_entries` response)
+   * into the same timeline the live reducer appends to.
+   *
+   * Idempotent: records are keyed by their Pi entry/tool-call id, so replaying
+   * the same entries (a second synchronize, a reconnection) never duplicates
+   * history, and a record already created by the live reducer is never
+   * clobbered. Hydration only appends records; it does not change execution
+   * state, the queue, or streaming state, and a later live message is a new
+   * record appended after the hydrated history.
+   */
+  hydrate(entries: readonly unknown[]): void {
+    const toolCalls = collectToolCalls(entries);
+    for (const [id, call] of toolCalls) this.hydratedToolCalls.set(id, call);
+
+    let changed = false;
+    for (const raw of entries) {
+      const record = projectEntry(raw, this.hydratedToolCalls);
+      if (!record) continue;
+      if (this.hydratedRecordIds.has(record.id)) continue;
+      if (this.records.some((existing) => existing.id === record.id)) continue;
+      this.hydratedRecordIds.add(record.id);
+      this.records.push(record);
+      changed = true;
+    }
+    if (changed) this.publish();
   }
 
   async sendPrompt(message: string): Promise<void> {
@@ -88,12 +287,15 @@ export class ConversationController {
   }
 
   async abort(): Promise<void> {
-    if (!this.activePrompt) return;
+    if (!this.activePrompt || this.snapshotValue.executionState === 'aborting') return;
+    this.abortRequested = true;
     this.setState('aborting', null);
     try {
       await this.client.request({ type: 'abort' }, { timeoutMs: 5_000 });
     } catch (error) {
-      this.setState('error', error instanceof Error ? error.message : String(error));
+      // A failed abort request (for example the transport died) must not
+      // strand the turn: fail it locally so the controller stays recoverable.
+      this.failActiveTurn(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -104,23 +306,20 @@ export class ConversationController {
       return;
     }
     this.activePrompt = prompt;
-    this.streamingTextValue = undefined;
+    this.abortRequested = false;
+    this.streamingState = null;
     this.setState('starting', null);
     try {
+      // Pi's prompt response only acknowledges acceptance; the run stays
+      // active until the agent_settled event completes the turn.
       await this.client.request({ type: 'prompt', message: prompt.message }, { timeoutMs: Infinity });
-      if (this.activePrompt?.id === prompt.id) {
-        this.finishStreaming('completed');
-        this.activePrompt = null;
-        this.setState('idle', null);
-      }
     } catch (error) {
+      // Transport failures are already handled by the onError listener (it
+      // runs before this pending-request rejection microtask); only fail the
+      // turn when it is still ours to fail.
       if (this.activePrompt?.id === prompt.id) {
-        this.finishStreaming('failed', error instanceof Error ? error.message : String(error));
-        this.activePrompt = null;
-        this.setState('error', error instanceof Error ? error.message : String(error));
+        this.failActiveTurn(error instanceof Error ? error.message : String(error));
       }
-    } finally {
-      if (!this.activePrompt) void this.processNext();
     }
   }
 
@@ -131,19 +330,32 @@ export class ConversationController {
       case 'turn_start':
         if (this.activePrompt) this.setState('running', null);
         break;
-      case 'message_start':
-        this.streamingTextValue = messageText(record.message);
-        this.setState('streaming', null);
+      case 'message_start': {
+        const message = objectValue(record.message);
+        if (message?.role === 'assistant') {
+          this.streamingState = { textByIndex: new Map(), thinkingByIndex: new Map(), pendingText: '', pendingThinking: '' };
+          this.setState('streaming', null);
+        }
         break;
-      case 'message_update':
-        this.streamingTextValue = messageText(record.message);
-        this.setState('streaming', null);
+      }
+      case 'message_update': {
+        const message = objectValue(record.message);
+        if (message?.role === 'assistant') {
+          this.applyAssistantDelta(record);
+          this.setState('streaming', null);
+        }
         break;
+      }
       case 'message_end': {
-        const text = messageText(record.message) || this.streamingTextValue || '';
-        if (text) this.records.push({ id: this.nextRecordId(), type: 'message', role: 'assistant', content: text, createdAt: now() });
-        this.streamingTextValue = undefined;
-        this.publish();
+        const message = objectValue(record.message);
+        if (message?.role === 'assistant') {
+          const text = messageText(record.message) || this.streamingText() || '';
+          if (text) {
+            this.records.push({ id: this.nextRecordId(), type: 'message', role: 'assistant', content: text, createdAt: now() });
+          }
+          this.streamingState = null;
+          this.publish();
+        }
         break;
       }
       case 'tool_execution_start':
@@ -155,6 +367,11 @@ export class ConversationController {
       case 'tool_execution_end':
         this.endTool(record);
         break;
+      case 'agent_settled':
+        // Pi settles the run only after every event for the turn has been
+        // emitted; this is the authoritative completion point.
+        this.completeTurn();
+        break;
       case 'agent_end':
       case 'turn_end':
         this.publish();
@@ -162,6 +379,84 @@ export class ConversationController {
       default:
         break;
     }
+  }
+
+  private applyAssistantDelta(event: Record<string, unknown>): void {
+    let state = this.streamingState;
+    if (!state) {
+      state = { textByIndex: new Map(), thinkingByIndex: new Map(), pendingText: '', pendingThinking: '' };
+      this.streamingState = state;
+    }
+    const message = objectValue(event.message);
+    const ame = objectValue(event.assistantMessageEvent);
+    const blocks = contentBlocks(message) ?? (ame ? contentBlocks(ame.partial) : null);
+    const hasText = blocks?.some(({ block }) => block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) ?? false;
+    const hasThinking = blocks?.some(({ block }) => block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.length > 0) ?? false;
+
+    // Reconcile visible content blocks into per-index accumulators. Blocks
+    // missing from a partial snapshot (stale or truncated) keep their text.
+    if (blocks) {
+      for (const { index, block } of blocks) {
+        if (block.type === 'text' && typeof block.text === 'string') {
+          const previous = state.pendingText || state.textByIndex.get(index) || '';
+          state.textByIndex.set(index, mergeBlockSnapshot(previous, block.text));
+          state.pendingText = '';
+        } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
+          const previous = state.pendingThinking || state.thinkingByIndex.get(index) || '';
+          state.thinkingByIndex.set(index, mergeBlockSnapshot(previous, block.thinking));
+          state.pendingThinking = '';
+        }
+      }
+    }
+
+    // Deltas are the fallback channel: they are applied only while no
+    // cumulative snapshot text of that kind is visible yet.
+    if (ame) {
+      if (ame.type === 'text_delta' && typeof ame.delta === 'string' && ame.delta.length > 0 && !hasText) {
+        state.pendingText += ame.delta;
+      } else if (ame.type === 'thinking_delta' && typeof ame.delta === 'string' && ame.delta.length > 0 && !hasThinking) {
+        state.pendingThinking += ame.delta;
+      } else if (ame.type === 'text_end' && typeof ame.content === 'string' && ame.content.length > 0) {
+        const textBlock = blocks ? [...blocks].reverse().find(({ block }) => block.type === 'text') : undefined;
+        if (textBlock) {
+          state.textByIndex.set(textBlock.index, mergeBlockSnapshot(state.textByIndex.get(textBlock.index) ?? '', ame.content));
+        } else {
+          state.pendingText = mergeBlockSnapshot(state.pendingText, ame.content);
+        }
+      } else if (ame.type === 'thinking_end' && typeof ame.content === 'string' && ame.content.length > 0) {
+        const thinkingBlock = blocks ? [...blocks].reverse().find(({ block }) => block.type === 'thinking') : undefined;
+        if (thinkingBlock) {
+          state.thinkingByIndex.set(thinkingBlock.index, mergeBlockSnapshot(state.thinkingByIndex.get(thinkingBlock.index) ?? '', ame.content));
+        } else {
+          state.pendingThinking = mergeBlockSnapshot(state.pendingThinking, ame.content);
+        }
+      }
+    }
+  }
+
+  /** Visible assistant text: accumulated text blocks in content order. */
+  private streamingText(): string {
+    const state = this.streamingState;
+    if (!state) return '';
+    const parts: string[] = [];
+    for (const index of [...state.textByIndex.keys()].sort((a, b) => a - b)) {
+      const text = state.textByIndex.get(index);
+      if (text) parts.push(text);
+    }
+    if (state.pendingText) parts.push(state.pendingText);
+    return parts.join('');
+  }
+
+  private completeTurn(): void {
+    if (!this.activePrompt) return;
+    // A turn that settled after the user aborted must not report its still
+    // active tools as completed: they were cancelled.
+    const status = this.abortRequested ? 'cancelled' : 'completed';
+    this.abortRequested = false;
+    this.finishStreaming(status);
+    this.activePrompt = null;
+    this.setState('idle', null);
+    void this.processNext();
   }
 
   private startTool(event: Record<string, unknown>): void {
@@ -193,7 +488,10 @@ export class ConversationController {
     const id = stringValue(event.toolCallId) ?? this.activeToolId;
     const target = this.records.find((record) => record.id === id);
     if (!target || (target.type !== 'tool' && target.type !== 'bash')) return;
-    target.status = event.isError || event.error ? 'failed' : 'completed';
+    // An end event landing after an abort was requested means the tool was
+    // still active when the user cancelled the turn: settle it as cancelled
+    // rather than completed/failed.
+    target.status = this.abortRequested ? 'cancelled' : event.isError || event.error ? 'failed' : 'completed';
     if (target.type === 'bash') {
       const exitCode = Number(event.exitCode);
       if (Number.isFinite(exitCode)) target.exitCode = exitCode;
@@ -203,11 +501,29 @@ export class ConversationController {
     this.publish();
   }
 
+  /**
+   * Fail the active turn locally after a transport/client failure or a failed
+   * prompt/abort request. Clears the active prompt, publishes a visible error
+   * state, and keeps the queue moving so future sends are not blocked. A no-op
+   * when the turn was already failed (the transport error listener and the
+   * pending-request rejection can both surface the same failure).
+   */
+  private failActiveTurn(message: string): void {
+    if (!this.activePrompt) return;
+    const status = this.abortRequested ? 'cancelled' : 'failed';
+    this.finishStreaming(status, message);
+    this.activePrompt = null;
+    this.abortRequested = false;
+    this.setState('error', message);
+    void this.processNext();
+  }
+
   private finishStreaming(status: ConversationRecordStatus, error?: string): void {
-    if (this.streamingTextValue) {
-      this.records.push({ id: this.nextRecordId(), type: 'message', role: 'assistant', content: this.streamingTextValue, createdAt: now() });
+    const text = this.streamingText();
+    if (text) {
+      this.records.push({ id: this.nextRecordId(), type: 'message', role: 'assistant', content: text, createdAt: now() });
     }
-    this.streamingTextValue = undefined;
+    this.streamingState = null;
     if (error) this.snapshotValue.error = error;
     for (const record of this.records) {
       if (record.type === 'tool' || record.type === 'bash') {
@@ -226,7 +542,7 @@ export class ConversationController {
     this.snapshotValue = {
       ...this.snapshotValue,
       timeline: this.records.map((record) => ({ ...record })),
-      streamingText: this.streamingTextValue,
+      streamingText: this.streamingText() || undefined,
       queuedPromptCount: this.queue.length,
     };
     const event: ConversationEvent = { type: 'conversation', snapshot: this.snapshot };

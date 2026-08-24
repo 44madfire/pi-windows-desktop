@@ -11,6 +11,7 @@ import {
   type PiRpcMessage,
   type PiRpcResponse,
   type PiRpcSuccessResponse,
+  type PiRpcWireCommand,
   type RpcRequestId,
 } from "./protocol.ts";
 import {
@@ -38,14 +39,21 @@ export interface PiRpcRequestOptions {
 }
 
 export interface PiRpcCloseOptions {
+  /** Bounded wait after stdin EOF before the escalation signal. Defaults to closeTimeoutMs. */
   readonly timeoutMs?: number;
+  /** Shorter wait after the escalation signal before the SIGKILL fallback. */
+  readonly sigkillTimeoutMs?: number;
+  /** Escalation signal used when the process does not exit on stdin EOF. Defaults to SIGTERM. */
   readonly signal?: PiRpcProcessSignal;
 }
 
 export interface PiRpcClientOptions {
   readonly transportFactory: PiRpcTransportFactory | PiRpcTransportProvider;
   readonly defaultTimeoutMs?: number;
+  /** Bounded wait after stdin EOF before the escalation signal during close(). */
   readonly closeTimeoutMs?: number;
+  /** Shorter wait after the escalation signal before the SIGKILL fallback during close(). */
+  readonly sigkillTimeoutMs?: number;
   readonly requestIdFactory?: () => RpcRequestId;
 }
 
@@ -77,6 +85,7 @@ export class PiRpcClient {
   private readonly transportFactory: PiRpcTransportFactory | PiRpcTransportProvider;
   private readonly defaultTimeoutMs: number;
   private readonly closeTimeoutMs: number;
+  private readonly sigkillTimeoutMs: number;
   private readonly requestIdFactory: () => RpcRequestId;
 
   private stateValue: PiRpcClientState = "idle";
@@ -106,16 +115,19 @@ export class PiRpcClient {
       this.transportFactory = optionsOrFactory;
       this.defaultTimeoutMs = supplementalOptions.defaultTimeoutMs ?? 30_000;
       this.closeTimeoutMs = supplementalOptions.closeTimeoutMs ?? 1_000;
+      this.sigkillTimeoutMs = supplementalOptions.sigkillTimeoutMs ?? 200;
       this.requestIdFactory = supplementalOptions.requestIdFactory ?? (() => `req_${++this.generatedRequestId}`);
     } else {
       this.transportFactory = optionsOrFactory.transportFactory;
       this.defaultTimeoutMs = optionsOrFactory.defaultTimeoutMs ?? 30_000;
       this.closeTimeoutMs = optionsOrFactory.closeTimeoutMs ?? 1_000;
+      this.sigkillTimeoutMs = optionsOrFactory.sigkillTimeoutMs ?? 200;
       this.requestIdFactory = optionsOrFactory.requestIdFactory ?? (() => `req_${++this.generatedRequestId}`);
     }
 
     this.validateTimeout(this.defaultTimeoutMs, "defaultTimeoutMs");
     this.validateTimeout(this.closeTimeoutMs, "closeTimeoutMs");
+    this.validateTimeout(this.sigkillTimeoutMs, "sigkillTimeoutMs");
   }
 
   get state(): PiRpcClientState {
@@ -206,10 +218,16 @@ export class PiRpcClient {
     await this.connect();
   }
 
-  /** Gracefully close stdin, then terminate the process with a kill fallback. */
+  /**
+   * Close stdin and wait for Pi to exit on its own, escalating to the
+   * configured signal (SIGTERM by default) after a bounded grace period and
+   * retaining a shorter SIGKILL fallback only if the process does not stop.
+   */
   async close(options: PiRpcCloseOptions = {}): Promise<void> {
-    const timeoutMs = options.timeoutMs ?? this.closeTimeoutMs;
-    this.validateTimeout(timeoutMs, "close timeoutMs");
+    const graceTimeoutMs = options.timeoutMs ?? this.closeTimeoutMs;
+    const sigkillTimeoutMs = options.sigkillTimeoutMs ?? this.sigkillTimeoutMs;
+    this.validateTimeout(graceTimeoutMs, "close timeoutMs");
+    this.validateTimeout(sigkillTimeoutMs, "close sigkillTimeoutMs");
 
     const connection = this.connectionPromise;
     if (connection && !this.activeTransport) {
@@ -237,8 +255,6 @@ export class PiRpcClient {
     this.setState("closing");
     this.rejectPending(new PiRpcClosedError());
 
-    const waitForTermination = this.waitForTermination(active, timeoutMs);
-
     try {
       const endResult = active.transport.stdin.end();
       void Promise.resolve(endResult).catch((error: unknown) => {
@@ -250,13 +266,22 @@ export class PiRpcClient {
       this.notifyError(this.asTransportError(error, "stdin"));
     }
 
-    try {
-      active.transport.kill?.(options.signal ?? "SIGTERM");
-    } catch (error: unknown) {
-      this.notifyError(this.asTransportError(error, "process"));
+    // Give Pi a bounded window to exit on its own after stdin EOF.
+    const exitedAfterEof = await this.waitForExit(active, graceTimeoutMs);
+
+    if (!exitedAfterEof) {
+      const escalationSignal = options.signal ?? "SIGTERM";
+      this.signalProcess(active, escalationSignal);
+
+      // Retain a shorter SIGKILL fallback only when escalation did not work.
+      if (escalationSignal !== "SIGKILL") {
+        const exitedAfterEscalation = await this.waitForExit(active, sigkillTimeoutMs);
+        if (!exitedAfterEscalation) {
+          this.signalProcess(active, "SIGKILL");
+        }
+      }
     }
 
-    await waitForTermination;
     this.setState("closed");
   }
 
@@ -289,6 +314,50 @@ export class PiRpcClient {
     options?: PiRpcRequestOptions,
   ): Promise<PiRpcSuccessResponse<TData>> {
     return this.request<TData>(command, options);
+  }
+
+  /**
+   * Write one JSONL command without registering a pending request or waiting
+   * for a response. Use this for uncorrelated outbound messages such as
+   * extension UI responses (`type: "extension_ui_response"`), which Pi does
+   * not answer on stdout.
+   *
+   * The command's `id` (if any) is preserved verbatim and is not registered
+   * as pending, so any response bearing it reaches unmatched response
+   * listeners. An id that is already pending in `request()` is rejected to
+   * protect correlation.
+   *
+   * Throws synchronously for invalid commands or unserializable values. When
+   * the transport is not ready the write is queued behind `connect()`; errors
+   * on that path surface through the error listeners.
+   */
+  write(command: PiRpcCommand): void {
+    const normalized = this.normalizeCommand(command);
+
+    if (normalized.id !== undefined) {
+      if (!isRpcRequestId(normalized.id)) {
+        throw new PiRpcError(
+          "INVALID_REQUEST_ID",
+          "Pi RPC request ids must be non-empty strings or finite numbers",
+        );
+      }
+      if (this.pendingRequests.has(normalized.id)) {
+        throw new PiRpcError(
+          "DUPLICATE_REQUEST_ID",
+          `Pi RPC request id is already pending: ${String(normalized.id)}`,
+        );
+      }
+    }
+
+    const frame = serializePiRpcCommand(normalized);
+    const ready = this.ensureReady();
+    if (ready instanceof Promise) {
+      ready
+        .then((active) => this.writeFrame(active, frame))
+        .catch(() => undefined);
+      return;
+    }
+    this.writeFrame(ready, frame);
   }
 
   onEvent(listener: PiRpcEventListener): () => void {
@@ -562,6 +631,25 @@ export class PiRpcClient {
     this.notifyError(error);
   }
 
+  private writeFrame(active: ActiveTransport, frame: string): void {
+    if (this.activeTransport !== active || this.stateValue !== "ready") {
+      // The transport went away between connect() and the write; the
+      // disconnect already notified error listeners.
+      return;
+    }
+
+    try {
+      const writeResult = active.transport.stdin.write(frame);
+      void Promise.resolve(writeResult).catch((error: unknown) => {
+        if (this.activeTransport === active) {
+          this.handleTransportFailure(active, error, "stdin");
+        }
+      });
+    } catch (error: unknown) {
+      this.handleTransportFailure(active, error, "stdin");
+    }
+  }
+
   private sendOnTransport<TData extends JsonValue>(
     active: ActiveTransport,
     command: PiRpcCommand,
@@ -582,7 +670,7 @@ export class PiRpcClient {
       return Promise.reject(error);
     }
 
-    const wireCommand = { ...command, id: requestId } as PiRpcCommand & { id: RpcRequestId };
+    const wireCommand = { ...command, id: requestId } as PiRpcWireCommand;
     let frame: string;
     try {
       frame = serializePiRpcCommand(wireCommand);
@@ -624,7 +712,7 @@ export class PiRpcClient {
 
   private normalizeCommand(
     commandOrType: PiRpcCommand | string,
-    fieldsOrOptions: JsonObject | PiRpcRequestOptions,
+    fieldsOrOptions: JsonObject | PiRpcRequestOptions = {},
   ): PiRpcCommand {
     if (typeof commandOrType !== "string") {
       if (typeof commandOrType.type !== "string" || commandOrType.type.length === 0) {
@@ -656,11 +744,24 @@ export class PiRpcClient {
     }
   }
 
-  private waitForTermination(active: ActiveTransport, timeoutMs: number): Promise<void> {
+  private signalProcess(active: ActiveTransport, signal: PiRpcProcessSignal): void {
+    try {
+      active.transport.kill?.(signal);
+    } catch (error: unknown) {
+      this.notifyError(this.asTransportError(error, "process"));
+    }
+  }
+
+  /**
+   * Resolve once the transport has ended, or after timeoutMs when it has not.
+   * Returns true when the process exited, false when the wait budget elapsed.
+   * With an infinite timeout the promise only resolves on exit.
+   */
+  private waitForExit(active: ActiveTransport, timeoutMs: number): Promise<boolean> {
     return new Promise((resolve) => {
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
-      const finish = () => {
+      const finish = (exited: boolean) => {
         if (settled) {
           return;
         }
@@ -668,34 +769,29 @@ export class PiRpcClient {
         if (timer !== undefined) {
           clearTimeout(timer);
         }
-        resolve();
+        resolve(exited);
       };
 
-      if (timeoutMs !== Infinity) {
-        timer = setTimeout(() => {
-          try {
-            active.transport.kill?.("SIGKILL");
-          } catch (error: unknown) {
-            this.notifyError(this.asTransportError(error, "process"));
-          }
-          finish();
-        }, timeoutMs);
-      }
-
       if (active.ended) {
-        finish();
+        finish(true);
         return;
       }
 
       try {
-        active.transport.on("exit", finish);
-        active.transport.on("close", finish);
+        active.transport.on("exit", () => finish(true));
+        active.transport.on("close", () => finish(true));
       } catch {
-        finish();
+        finish(active.ended);
+        return;
       }
 
       if (active.ended) {
-        finish();
+        finish(true);
+        return;
+      }
+
+      if (timeoutMs !== Infinity) {
+        timer = setTimeout(() => finish(false), timeoutMs);
       }
     });
   }

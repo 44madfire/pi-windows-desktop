@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useState, type ReactElement } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react';
 import type {
   DiagnosticCheck,
   DiagnosticsReport,
+  ExtensionUiResponse,
+  PiEvent,
   PiRuntimeSnapshot,
   RuntimeInfo,
   WslDistributionInfo,
@@ -9,6 +11,16 @@ import type {
 } from '../shared/ipc';
 import type { ConversationSnapshot } from '../shared/conversation';
 import { ConversationPanel } from './components/conversation';
+import {
+  ExtensionUiSurface,
+  getExtensionUiNotice,
+  isExtensionUiNoticeMethod,
+  parseExtensionUiRequest,
+  type ExtensionUiNotice,
+  type ExtensionUiNoticeTone,
+  type ExtensionUiRequest,
+} from './components/extension-ui/ExtensionUiSurface';
+import { WorkspaceProofCard } from './components/workspace/WorkspaceProofCard';
 
 type View = 'overview' | 'conversation' | 'diagnostics';
 
@@ -86,6 +98,33 @@ function App(): ReactElement {
   });
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [extensionRequest, setExtensionRequest] = useState<ExtensionUiRequest | null>(null);
+  const [extensionNotices, setExtensionNotices] = useState<ExtensionUiNotice[]>([]);
+  const [extensionRespondingId, setExtensionRespondingId] = useState<string | null>(null);
+  const extensionNoticeSequenceRef = useRef(0);
+  const extensionNoticeTimersRef = useRef<number[]>([]);
+
+  const showExtensionNotice = useCallback((message: string, tone: ExtensionUiNoticeTone): void => {
+    const trimmedMessage = message.trim();
+    if (!trimmedMessage) return;
+
+    const id = `extension-notice-${extensionNoticeSequenceRef.current}`;
+    extensionNoticeSequenceRef.current += 1;
+    setExtensionNotices((current) => [
+      ...current.slice(-3),
+      { id, message: trimmedMessage, tone },
+    ]);
+
+    const timer = window.setTimeout(() => {
+      setExtensionNotices((current) => current.filter((notice) => notice.id !== id));
+      extensionNoticeTimersRef.current = extensionNoticeTimersRef.current.filter((value) => value !== timer);
+    }, 7000);
+    extensionNoticeTimersRef.current.push(timer);
+  }, []);
+
+  useEffect(() => () => {
+    extensionNoticeTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+  }, []);
 
   const refresh = useCallback(async () => {
     setIsLoading(true);
@@ -117,10 +156,42 @@ function App(): ReactElement {
     void refresh();
   }, [refresh]);
 
-  useEffect(() => window.piDesktop.onPiEvent((event) => {
-    if (event.type === 'runtime') setPiStatus(event.snapshot);
-    if (event.type === 'conversation') setConversation(event.snapshot);
-  }), []);
+  const handlePiEvent = useCallback((event: PiEvent): void => {
+    if (event.type === 'runtime') {
+      setPiStatus(event.snapshot);
+      return;
+    }
+    if (event.type === 'conversation') {
+      setConversation(event.snapshot);
+      return;
+    }
+    if (event.type !== 'protocol') return;
+
+    const request = parseExtensionUiRequest(event.message);
+    if (!request) return;
+
+    const notice = getExtensionUiNotice(request);
+    if (isExtensionUiNoticeMethod(request)) {
+      if (notice) showExtensionNotice(notice.message, notice.tone);
+      return;
+    }
+
+    setExtensionRequest(request);
+  }, [showExtensionNotice]);
+
+  useEffect(() => window.piDesktop.onPiEvent(handlePiEvent), [handlePiEvent]);
+
+  const respondToExtensionUi = useCallback(async (response: ExtensionUiResponse): Promise<void> => {
+    setExtensionRespondingId(response.id);
+    try {
+      await window.piDesktop.sendExtensionUiResponse(response);
+      setExtensionRequest((current) => (current?.id === response.id ? null : current));
+    } catch {
+      showExtensionNotice('Pi could not accept that extension response. Try again.', 'error');
+    } finally {
+      setExtensionRespondingId(null);
+    }
+  }, [showExtensionNotice]);
 
   const inspectDistro = useCallback(async () => {
     if (!selectedDistro) return;
@@ -147,6 +218,7 @@ function App(): ReactElement {
   }, []);
 
   const reportStatus = diagnostics?.overall === 'ready' ? 'Ready' : 'M0 shell online';
+  const workspace = selectedDistro ? { distro: selectedDistro, linuxPath } : null;
 
   return (
     <div className="app-shell">
@@ -291,6 +363,7 @@ function App(): ReactElement {
                   View full report <span aria-hidden="true">→</span>
                 </button>
               </section>
+              <WorkspaceProofCard workspace={workspace} />
             </aside>
           </div>
         ) : (
@@ -326,6 +399,13 @@ function App(): ReactElement {
           </section>
         )}
       </main>
+      <ExtensionUiSurface
+        request={extensionRequest}
+        notices={extensionNotices}
+        isResponding={extensionRespondingId !== null}
+        onRespond={respondToExtensionUi}
+        onDismissNotice={(id) => setExtensionNotices((current) => current.filter((notice) => notice.id !== id))}
+      />
 
       <footer className="app-footer">
         <span>Pi Desktop M0</span>

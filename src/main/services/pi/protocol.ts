@@ -116,7 +116,7 @@ export function parsePiRpcLine(line: string): PiRpcMessage {
   return value as PiRpcEvent;
 }
 
-export function serializePiRpcCommand(command: PiRpcWireCommand): string {
+export function serializePiRpcCommand(command: PiRpcCommand): string {
   let serialized: string | undefined;
 
   try {

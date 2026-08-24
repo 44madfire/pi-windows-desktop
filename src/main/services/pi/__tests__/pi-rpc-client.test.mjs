@@ -42,6 +42,11 @@ class FakeWritable {
   ended = false;
   writeResult = true;
   writeHandler = undefined;
+  endHandler = undefined;
+
+  constructor(timeline = []) {
+    this.timeline = timeline;
+  }
 
   on(event, listener) {
     this.listeners[event].push(listener);
@@ -50,12 +55,15 @@ class FakeWritable {
 
   write(chunk) {
     this.writes.push(chunk);
+    this.timeline.push({ seq: this.timeline.length, op: `write:${chunk}` });
     this.writeHandler?.(chunk);
     return this.writeResult;
   }
 
   end() {
     this.ended = true;
+    this.timeline.push({ seq: this.timeline.length, op: "end" });
+    this.endHandler?.();
   }
 
   emitError(error) {
@@ -64,7 +72,8 @@ class FakeWritable {
 }
 
 class FakeTransport {
-  stdin = new FakeWritable();
+  timeline = [];
+  stdin = new FakeWritable(this.timeline);
   stdout = new FakeReadable();
   stderr = new FakeReadable();
   listeners = { error: [], exit: [], close: [] };
@@ -77,6 +86,7 @@ class FakeTransport {
 
   kill(signal = "SIGTERM") {
     this.killSignals.push(signal);
+    this.timeline.push({ seq: this.timeline.length, op: `kill:${signal}` });
     return true;
   }
 
@@ -94,6 +104,16 @@ class FakeTransport {
 }
 
 const flushMicrotasks = () => new Promise((resolve) => setImmediate(resolve));
+
+const waitFor = async (predicate, timeoutMs = 1_000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) {
+      throw new Error("timed out waiting for condition");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+};
 
 function responseFor(transport, index, data = {}) {
   const command = JSON.parse(transport.stdin.writes[index]);
@@ -249,19 +269,54 @@ test("rejects pending work on process failure and reconnects through the factory
   assert.deepEqual((await recovered).data, { recovered: true });
 });
 
-test("gracefully closes stdin, rejects pending work, and falls back to SIGKILL", async () => {
+test("close ends stdin first, then escalates to SIGTERM and finally SIGKILL", async () => {
   const transport = new FakeTransport();
-  const client = new PiRpcClient(() => transport, { closeTimeoutMs: 5, defaultTimeoutMs: 100 });
+  const client = new PiRpcClient(() => transport, {
+    closeTimeoutMs: 5,
+    sigkillTimeoutMs: 5,
+    defaultTimeoutMs: 100,
+  });
   await client.connect();
   const pending = client.send({ type: "during_close" });
 
   const closing = client.close();
+
+  // Pending work is rejected immediately, but no signal is sent yet: the
+  // process gets a bounded window to exit on its own after stdin EOF.
   await assert.rejects(pending, PiRpcClosedError);
   assert.equal(transport.stdin.ended, true);
-  assert.ok(transport.killSignals.includes("SIGTERM"));
+  assert.deepEqual(transport.killSignals, []);
+
+  // After the grace period the escalation signal fires first...
+  await waitFor(() => transport.killSignals.includes("SIGTERM"));
+  assert.equal(transport.killSignals[0], "SIGTERM");
+
+  // ...and only after the shorter fallback does SIGKILL follow.
+  await waitFor(() => transport.killSignals.includes("SIGKILL"));
   await closing;
   assert.equal(client.state, "closed");
-  assert.ok(transport.killSignals.includes("SIGKILL"));
+  assert.deepEqual(transport.killSignals, ["SIGTERM", "SIGKILL"]);
+
+  const byOp = (op) => transport.timeline.find((entry) => entry.op === op);
+  assert.ok(byOp("end").seq < byOp("kill:SIGTERM").seq, "stdin EOF precedes SIGTERM");
+  assert.ok(byOp("kill:SIGTERM").seq < byOp("kill:SIGKILL").seq, "SIGTERM precedes SIGKILL");
+});
+
+test("close waits for a natural exit after stdin EOF without escalating", async () => {
+  const transport = new FakeTransport();
+  const client = new PiRpcClient(() => transport, {
+    closeTimeoutMs: 1_000,
+    sigkillTimeoutMs: 100,
+    defaultTimeoutMs: 100,
+  });
+  // Pi exits on its own as soon as stdin reaches EOF.
+  transport.stdin.endHandler = () => transport.emitExit(0, null);
+  await client.connect();
+
+  await client.close();
+  assert.equal(client.state, "closed");
+  assert.equal(transport.stdin.ended, true);
+  assert.deepEqual(transport.killSignals, []);
 });
 
 test("clean process exit rejects pending work and leaves a reconnectable disconnected state", async () => {
@@ -278,4 +333,74 @@ test("clean process exit rejects pending work and leaves a reconnectable disconn
     return true;
   });
   assert.equal(client.state, "disconnected");
+});
+
+test("write sends a JSONL command without registering a pending request", async () => {
+  const transport = new FakeTransport();
+  const client = new PiRpcClient(() => transport, { defaultTimeoutMs: 100 });
+  const unmatched = [];
+  client.onUnmatchedResponse((message) => unmatched.push(message));
+  await client.connect();
+
+  client.write({ type: "extension_ui_response", id: "ui-1", confirmed: true });
+
+  assert.equal(transport.stdin.writes.length, 1);
+  const frame = transport.stdin.writes[0];
+  assert.ok(frame.endsWith("\n"), "write output is JSONL-framed");
+  assert.deepEqual(JSON.parse(frame), {
+    type: "extension_ui_response",
+    id: "ui-1",
+    confirmed: true,
+  });
+
+  // The write's id is not registered as pending, so its response arrives
+  // unmatched instead of resolving a request.
+  transport.stdout.emitData(
+    `${JSON.stringify({ type: "response", id: "ui-1", success: true, data: {} })}\n`,
+  );
+  await flushMicrotasks();
+  assert.equal(unmatched.length, 1);
+
+  // Normal request/response correlation is unaffected.
+  const request = client.send({ type: "get_state" });
+  transport.stdout.emitData(`${responseFor(transport, 1, { ready: true })}\n`);
+  assert.deepEqual((await request).data, { ready: true });
+});
+
+test("write rejects invalid commands, invalid ids, and ids already pending", async () => {
+  const transport = new FakeTransport();
+  const client = new PiRpcClient(() => transport, { defaultTimeoutMs: 100 });
+  await client.connect();
+
+  assert.throws(() => client.write({ type: "" }), (error) => error.code === "INVALID_COMMAND");
+
+  const pending = client.send({ type: "slow_command" });
+  pending.catch(() => undefined); // times out later; not awaited here
+  const pendingId = JSON.parse(transport.stdin.writes[0]).id;
+  assert.throws(
+    () => client.write({ type: "extension_ui_response", id: pendingId, value: "x" }),
+    (error) => error.code === "DUPLICATE_REQUEST_ID",
+  );
+  assert.throws(
+    () => client.write({ type: "extension_ui_response", id: { nested: true } }),
+    (error) => error.code === "INVALID_REQUEST_ID",
+  );
+});
+
+test("write queues behind connect() when the client is not yet ready", async () => {
+  const transport = new FakeTransport();
+  const client = new PiRpcClient(() => transport, { defaultTimeoutMs: 100 });
+
+  client.write({ type: "extension_ui_response", id: "ui-2", value: "ok" });
+
+  // connect() has not resolved yet, so the frame has not been written.
+  assert.equal(transport.stdin.writes.length, 0);
+  await waitFor(() => transport.stdin.writes.length === 1);
+  assert.equal(client.state, "ready");
+  assert.ok(transport.stdin.writes[0].endsWith("\n"));
+  assert.deepEqual(JSON.parse(transport.stdin.writes[0]), {
+    type: "extension_ui_response",
+    id: "ui-2",
+    value: "ok",
+  });
 });

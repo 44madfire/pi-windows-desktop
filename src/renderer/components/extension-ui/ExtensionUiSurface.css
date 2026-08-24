@@ -1,0 +1,302 @@
+.extension-ui-surface {
+  position: fixed;
+  z-index: 40;
+  inset: 0;
+  pointer-events: none;
+}
+
+.extension-notice-stack {
+  position: absolute;
+  top: 92px;
+  right: 28px;
+  display: grid;
+  width: min(370px, calc(100vw - 56px));
+  gap: 10px;
+  pointer-events: auto;
+}
+
+.extension-notice {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+  padding: 12px 13px;
+  border: 1px solid rgba(167, 191, 222, 0.18);
+  border-radius: 10px;
+  color: #cbd8e8;
+  background: rgba(20, 29, 42, 0.96);
+  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.26);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.extension-notice-info {
+  border-color: rgba(126, 212, 199, 0.3);
+}
+
+.extension-notice-warning {
+  border-color: rgba(219, 196, 138, 0.38);
+}
+
+.extension-notice-error {
+  border-color: rgba(241, 167, 167, 0.38);
+}
+
+.extension-notice-marker {
+  width: 7px;
+  height: 7px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: #7ed4c7;
+  box-shadow: 0 0 10px rgba(126, 212, 199, 0.6);
+}
+
+.extension-notice-warning .extension-notice-marker {
+  background: #dbc48a;
+  box-shadow: 0 0 10px rgba(219, 196, 138, 0.45);
+}
+
+.extension-notice-error .extension-notice-marker {
+  background: #f1a7a7;
+  box-shadow: 0 0 10px rgba(241, 167, 167, 0.45);
+}
+
+.extension-notice-message {
+  min-width: 0;
+}
+
+.extension-notice-dismiss {
+  padding: 0;
+  border: 0;
+  color: #8fa0b5;
+  background: transparent;
+  cursor: pointer;
+  font-size: 17px;
+  line-height: 1;
+}
+
+.extension-notice-dismiss:hover {
+  color: #e5edf7;
+}
+
+.extension-request-backdrop {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: rgba(5, 9, 15, 0.58);
+  pointer-events: auto;
+}
+
+.extension-request-dialog {
+  display: flex;
+  width: min(560px, 100%);
+  max-height: min(700px, calc(100vh - 56px));
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid rgba(167, 191, 222, 0.24);
+  border-radius: 16px;
+  background: linear-gradient(145deg, rgba(28, 39, 56, 0.98), rgba(15, 21, 32, 0.98));
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.4);
+}
+
+.extension-request-header,
+.extension-request-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.extension-request-header {
+  padding: 22px 24px 18px;
+  border-bottom: 1px solid rgba(167, 191, 222, 0.13);
+}
+
+.extension-request-eyebrow {
+  margin: 0 0 6px;
+  color: #71cbbf;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+
+.extension-request-header h2 {
+  margin: 0;
+  color: #edf3fa;
+  font-size: 20px;
+  font-weight: 500;
+  letter-spacing: -0.025em;
+}
+
+.extension-request-method {
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  border: 1px solid rgba(126, 212, 199, 0.22);
+  border-radius: 999px;
+  color: #86daca;
+  background: rgba(112, 210, 190, 0.08);
+  font: 10px "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+}
+
+.extension-request-body {
+  min-height: 0;
+  overflow: auto;
+  padding: 22px 24px;
+}
+
+.extension-request-message {
+  margin: 0;
+  color: #bac8d9;
+  font-size: 13px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+
+.extension-request-options {
+  display: grid;
+  gap: 9px;
+}
+
+.extension-option-button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  border: 1px solid rgba(167, 191, 222, 0.17);
+  border-radius: 9px;
+  color: #d8e4f2;
+  background: rgba(8, 13, 20, 0.46);
+  cursor: pointer;
+  font-size: 12px;
+  text-align: left;
+  transition: border-color 160ms ease, background 160ms ease;
+}
+
+.extension-option-button:hover:not(:disabled) {
+  border-color: rgba(126, 212, 199, 0.48);
+  background: rgba(104, 197, 185, 0.1);
+}
+
+.extension-option-button:disabled,
+.extension-request-input:disabled,
+.extension-request-editor:disabled,
+.extension-cancel-button:disabled,
+.extension-submit-button:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.extension-request-input,
+.extension-request-editor {
+  width: 100%;
+  border: 1px solid rgba(167, 191, 222, 0.18);
+  border-radius: 8px;
+  color: #dce7f4;
+  outline: none;
+  background: rgba(8, 13, 20, 0.55);
+  font: 12px "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+}
+
+.extension-request-input {
+  padding: 12px;
+}
+
+.extension-request-editor {
+  min-height: 220px;
+  padding: 12px;
+  resize: vertical;
+  line-height: 1.55;
+}
+
+.extension-request-input:focus,
+.extension-request-editor:focus {
+  border-color: rgba(126, 212, 199, 0.7);
+}
+
+.extension-request-muted {
+  margin: 0;
+  color: #8b9aae;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.extension-request-unsupported {
+  padding: 13px 14px;
+  border: 1px solid rgba(219, 196, 138, 0.26);
+  border-radius: 9px;
+  color: #ddcc9f;
+  background: rgba(219, 196, 138, 0.08);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.extension-request-unsupported strong {
+  display: block;
+  color: #ead9ad;
+  font-weight: 650;
+}
+
+.extension-request-unsupported p {
+  margin: 5px 0 0;
+}
+
+.extension-request-footer {
+  justify-content: flex-end;
+  padding: 15px 24px;
+  border-top: 1px solid rgba(167, 191, 222, 0.13);
+  background: rgba(8, 13, 20, 0.22);
+}
+
+.extension-cancel-button,
+.extension-submit-button {
+  padding: 10px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.extension-cancel-button {
+  border: 1px solid rgba(167, 191, 222, 0.2);
+  color: #a9b7c9;
+  background: transparent;
+}
+
+.extension-cancel-button:hover:not(:disabled) {
+  border-color: rgba(167, 191, 222, 0.38);
+  color: #e5edf7;
+}
+
+.extension-submit-button {
+  border: 1px solid rgba(141, 225, 213, 0.34);
+  color: #c4f2ea;
+  background: rgba(104, 197, 185, 0.16);
+}
+
+.extension-submit-button:hover:not(:disabled) {
+  background: rgba(104, 197, 185, 0.25);
+}
+
+@media (max-width: 720px) {
+  .extension-notice-stack {
+    top: 78px;
+    right: 18px;
+    width: min(370px, calc(100vw - 36px));
+  }
+
+  .extension-request-backdrop {
+    padding: 18px;
+  }
+
+  .extension-request-header,
+  .extension-request-body,
+  .extension-request-footer {
+    padding-right: 18px;
+    padding-left: 18px;
+  }
+}

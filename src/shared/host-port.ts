@@ -24,3 +24,15 @@ export function isHostPort(value: unknown): value is HostPortLike {
     typeof candidate.close === 'function'
   );
 }
+
+/**
+ * Resolve the target origin for the host-port transfer. The transferred
+ * MessagePort must never be broadcast to arbitrary origins (`*`). Electron
+ * file:// pages serialize their origin as "file://", while opaque origins
+ * (e.g. sandboxed data: documents) report the literal "null". Anything that
+ * is not a concrete application origin falls back to the packaged file
+ * origin instead of leaking the port.
+ */
+export function safeHostPortTargetOrigin(origin: string): string {
+  return origin && origin !== 'null' ? origin : 'file://';
+}
