@@ -35,6 +35,9 @@ const desktopApi: DesktopApi = {
   startPi: (workspace) => invoke(IPC_CHANNELS.startPi, workspace),
   stopPi: () => invoke(IPC_CHANNELS.stopPi),
   getPiStatus: () => invoke(IPC_CHANNELS.getPiStatus),
+  sendPrompt: (prompt) => invoke(IPC_CHANNELS.sendPrompt, { prompt }),
+  abortPrompt: () => invoke(IPC_CHANNELS.abortPrompt),
+  getConversation: () => invoke(IPC_CHANNELS.getConversation),
   onPiEvent: (listener: (event: PiEvent) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, payload: PiEvent) => listener(payload);
     ipcRenderer.on(IPC_CHANNELS.piEvent, handler);

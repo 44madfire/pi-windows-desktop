@@ -3,6 +3,8 @@ import { WslManager, type PiExecutableProbe } from '../../wsl/index.ts';
 import { PiRpcClient, type PiRpcEvent, type PiRpcTransport } from './index.ts';
 import { createWslPiTransport } from './wsl-process-transport.ts';
 import { SessionManager } from '../session/session-manager.ts';
+import { ConversationController } from '../conversation/index.ts';
+import type { ConversationSnapshot } from '../../../shared/conversation.ts';
 
 export interface PiRuntimeHandlers {
   onEvent?: (event: PiEvent) => void;
@@ -45,6 +47,7 @@ export class PiRuntimeController {
   private readonly createTransport: NonNullable<PiRuntimeOptions['createTransport']>;
   private readonly handlers: PiRuntimeHandlers;
   private client: PiRpcClient | null = null;
+  private conversation: ConversationController | null = null;
   private session: SessionManager | null = null;
   private snapshotValue: PiRuntimeSnapshot = {
     state: 'stopped',
@@ -83,6 +86,8 @@ export class PiRuntimeController {
         transportFactory: () => this.createTransport({ distro: workspace.distro, linuxPath: workspace.linuxPath, piExecutable }),
       });
       this.client = client;
+      this.conversation = new ConversationController(client);
+      this.conversation.onEvent((event) => this.handlers.onEvent?.(event));
       const session = SessionManager.fromSnapshot(
         {
           state: previousCursor ? 'disconnected' : 'new',
@@ -135,9 +140,31 @@ export class PiRuntimeController {
     const client = this.client;
     this.setSnapshot({ state: 'stopping' });
     this.client = null;
+    this.conversation = null;
     await client.close();
     this.setSnapshot({ state: 'stopped', workspace: null, piVersion: null });
     return this.snapshot;
+  }
+
+  get conversationSnapshot(): ConversationSnapshot {
+    return this.conversation?.snapshot ?? {
+      timeline: [],
+      executionState: 'idle',
+      queuedPromptCount: 0,
+      error: null,
+    };
+  }
+
+  async sendPrompt(prompt: string): Promise<ConversationSnapshot> {
+    if (!this.conversation) throw new Error('Pi is not running. Start Pi before sending a prompt.');
+    await this.conversation.sendPrompt(prompt);
+    return this.conversation.snapshot;
+  }
+
+  async abortPrompt(): Promise<ConversationSnapshot> {
+    if (!this.conversation) return this.conversationSnapshot;
+    await this.conversation.abort();
+    return this.conversation.snapshot;
   }
 
   private setSnapshot(patch: Partial<PiRuntimeSnapshot>): void {

@@ -65,6 +65,11 @@ function registerIpcHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.startPi, (_event, workspace: WslWorkspace) => piRuntime.start(workspace));
   ipcMain.handle(IPC_CHANNELS.stopPi, () => piRuntime.stop());
   ipcMain.handle(IPC_CHANNELS.getPiStatus, () => piRuntime.snapshot);
+  ipcMain.handle(IPC_CHANNELS.getConversation, () => piRuntime.conversationSnapshot);
+  ipcMain.handle(IPC_CHANNELS.sendPrompt, (_event, request: { prompt: string }) =>
+    piRuntime.sendPrompt(request.prompt),
+  );
+  ipcMain.handle(IPC_CHANNELS.abortPrompt, () => piRuntime.abortPrompt());
 }
 
 function createMainWindow(): BrowserWindow {

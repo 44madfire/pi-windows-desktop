@@ -1,3 +1,5 @@
+import type { ConversationEvent, ConversationSnapshot } from './conversation.ts';
+
 export const IPC_CHANNELS = {
   getRuntimeInfo: 'app:get-runtime-info',
   getDiagnostics: 'app:get-diagnostics',
@@ -7,6 +9,9 @@ export const IPC_CHANNELS = {
   stopPi: 'pi:stop',
   getPiStatus: 'pi:get-status',
   piEvent: 'pi:event',
+  sendPrompt: 'conversation:send-prompt',
+  abortPrompt: 'conversation:abort-prompt',
+  getConversation: 'conversation:get',
   hostPort: 'app:host-port',
 } as const;
 
@@ -75,6 +80,7 @@ export interface PiRuntimeSnapshot {
 export type PiEvent =
   | { type: 'runtime'; snapshot: PiRuntimeSnapshot }
   | { type: 'stderr'; text: string }
+  | ConversationEvent
   | { type: 'protocol'; message: unknown };
 
 export interface DesktopApi {
@@ -85,6 +91,9 @@ export interface DesktopApi {
   startPi: (workspace: WslWorkspace) => Promise<PiRuntimeSnapshot>;
   stopPi: () => Promise<PiRuntimeSnapshot>;
   getPiStatus: () => Promise<PiRuntimeSnapshot>;
+  sendPrompt: (prompt: string) => Promise<ConversationSnapshot>;
+  abortPrompt: () => Promise<ConversationSnapshot>;
+  getConversation: () => Promise<ConversationSnapshot>;
   onPiEvent: (listener: (event: PiEvent) => void) => () => void;
 }
 
@@ -116,6 +125,18 @@ export interface IpcContract {
   [IPC_CHANNELS.getPiStatus]: {
     request: undefined;
     response: PiRuntimeSnapshot;
+  };
+  [IPC_CHANNELS.sendPrompt]: {
+    request: { prompt: string };
+    response: ConversationSnapshot;
+  };
+  [IPC_CHANNELS.abortPrompt]: {
+    request: undefined;
+    response: ConversationSnapshot;
+  };
+  [IPC_CHANNELS.getConversation]: {
+    request: undefined;
+    response: ConversationSnapshot;
   };
 }
 

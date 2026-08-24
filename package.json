@@ -11,9 +11,10 @@
     "preview": "electron-vite preview",
     "start": "electron-vite preview",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.renderer.json",
-    "test": "npm run test:pi && npm run test:session && npm run test:shell && npm run test:wsl",
+    "test": "npm run test:pi && npm run test:session && npm run test:conversation && npm run test:shell && npm run test:wsl",
     "test:pi": "node --test --experimental-strip-types src/main/services/pi/__tests__/pi-rpc-client.test.mjs src/main/services/pi/wsl-process-transport.test.ts",
     "test:session": "node --test --experimental-strip-types src/main/services/session/session-manager.test.ts",
+    "test:conversation": "node --test --experimental-strip-types src/main/services/conversation/index.test.ts",
     "test:shell": "node --test --experimental-strip-types src/shared/ipc.test.ts src/shared/host-port.test.ts",
     "test:wsl": "node --test --experimental-strip-types src/main/wsl/index.test.ts",
     "package": "npm run build && electron-builder"

@@ -3,7 +3,7 @@ import test from 'node:test';
 import { createDiagnosticsReport } from './diagnostics.ts';
 import { IPC_CHANNELS, type RuntimeInfo } from './ipc.ts';
 
-test('M0 IPC channel names are unique and scoped to app capabilities', () => {
+test('IPC channel names are unique and scoped to app capabilities', () => {
   const channels = Object.values(IPC_CHANNELS);
 
   assert.equal(new Set(channels).size, channels.length);
@@ -16,6 +16,9 @@ test('M0 IPC channel names are unique and scoped to app capabilities', () => {
     'pi:stop',
     'pi:get-status',
     'pi:event',
+    'conversation:send-prompt',
+    'conversation:abort-prompt',
+    'conversation:get',
     'app:host-port',
   ]);
 });

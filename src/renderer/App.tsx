@@ -7,8 +7,10 @@ import type {
   WslDistributionInfo,
   WslProbeInfo,
 } from '../shared/ipc';
+import type { ConversationSnapshot } from '../shared/conversation';
+import { ConversationPanel } from './components/conversation';
 
-type View = 'overview' | 'diagnostics';
+type View = 'overview' | 'conversation' | 'diagnostics';
 
 function StatusMark({ status }: { status: DiagnosticCheck['status'] }): ReactElement {
   const symbol = status === 'pass' ? '✓' : status === 'fail' ? '!' : '•';
@@ -76,6 +78,12 @@ function App(): ReactElement {
   const [linuxPath, setLinuxPath] = useState('/home/user/src/project');
   const [probe, setProbe] = useState<WslProbeInfo | null>(null);
   const [piStatus, setPiStatus] = useState<PiRuntimeSnapshot | null>(null);
+  const [conversation, setConversation] = useState<ConversationSnapshot>({
+    timeline: [],
+    executionState: 'idle',
+    queuedPromptCount: 0,
+    error: null,
+  });
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -84,17 +92,19 @@ function App(): ReactElement {
     setError(null);
 
     try {
-      const [runtimeInfo, diagnosticReport, availableDistros, runtimeStatus] = await Promise.all([
+      const [runtimeInfo, diagnosticReport, availableDistros, runtimeStatus, conversationSnapshot] = await Promise.all([
         window.piDesktop.getRuntimeInfo(),
         window.piDesktop.getDiagnostics(),
         window.piDesktop.listWslDistributions(),
         window.piDesktop.getPiStatus(),
+        window.piDesktop.getConversation(),
       ]);
       setRuntime(runtimeInfo);
       setDiagnostics(diagnosticReport);
       setDistros(availableDistros);
       setSelectedDistro((current) => current || availableDistros[0]?.name || '');
       setPiStatus(runtimeStatus);
+      setConversation(conversationSnapshot);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : 'The desktop host did not respond.';
       setError(message);
@@ -109,6 +119,7 @@ function App(): ReactElement {
 
   useEffect(() => window.piDesktop.onPiEvent((event) => {
     if (event.type === 'runtime') setPiStatus(event.snapshot);
+    if (event.type === 'conversation') setConversation(event.snapshot);
   }), []);
 
   const inspectDistro = useCallback(async () => {
@@ -119,10 +130,20 @@ function App(): ReactElement {
   const startPi = useCallback(async () => {
     if (!selectedDistro) return;
     setPiStatus(await window.piDesktop.startPi({ distro: selectedDistro, linuxPath }));
+    setConversation(await window.piDesktop.getConversation());
   }, [linuxPath, selectedDistro]);
 
   const stopPi = useCallback(async () => {
     setPiStatus(await window.piDesktop.stopPi());
+    setConversation(await window.piDesktop.getConversation());
+  }, []);
+
+  const sendPrompt = useCallback(async (prompt: string) => {
+    setConversation(await window.piDesktop.sendPrompt(prompt));
+  }, []);
+
+  const abortPrompt = useCallback(async () => {
+    setConversation(await window.piDesktop.abortPrompt());
   }, []);
 
   const reportStatus = diagnostics?.overall === 'ready' ? 'Ready' : 'M0 shell online';
@@ -156,6 +177,13 @@ function App(): ReactElement {
           >
             Diagnostics
           </button>
+          <button
+            className={view === 'conversation' ? 'tab-button tab-active' : 'tab-button'}
+            onClick={() => setView('conversation')}
+            type="button"
+          >
+            Conversation
+          </button>
         </nav>
 
         <div className="header-status">
@@ -174,7 +202,18 @@ function App(): ReactElement {
           </div>
         )}
 
-        {view === 'overview' ? (
+        {view === 'conversation' ? (
+          <ConversationPanel
+            timeline={conversation.timeline}
+            executionState={conversation.executionState}
+            queuedPromptCount={conversation.queuedPromptCount}
+            streamingText={conversation.streamingText}
+            error={conversation.error}
+            onSendPrompt={sendPrompt}
+            onAbort={abortPrompt}
+            isLoading={isLoading}
+          />
+        ) : view === 'overview' ? (
           <div className="overview-layout">
             <section className="hero-card panel">
               <div className="hero-orbit orbit-one" aria-hidden="true" />
