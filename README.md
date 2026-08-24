@@ -11,7 +11,7 @@ A native Windows desktop workbench for the Pi coding agent, with Pi and project 
 
 ## Current milestone
 
-Development starts with M0: Windows/WSL/Pi substrate and reliable Pi JSONL RPC communication.
+M0 now includes the Windows/WSL/Pi substrate, WSL distro/workspace selection, Pi JSONL startup/status events, and a session cursor recovery seam.
 
 See the implementation plan provided with this project for the complete milestone sequence.
 

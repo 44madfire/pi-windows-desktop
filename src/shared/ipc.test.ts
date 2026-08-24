@@ -10,6 +10,12 @@ test('M0 IPC channel names are unique and scoped to app capabilities', () => {
   assert.deepEqual(channels, [
     'app:get-runtime-info',
     'app:get-diagnostics',
+    'wsl:list-distributions',
+    'wsl:probe-distribution',
+    'pi:start',
+    'pi:stop',
+    'pi:get-status',
+    'pi:event',
     'app:host-port',
   ]);
 });

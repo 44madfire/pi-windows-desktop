@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useState, type ReactElement } from 'react';
-import type { DiagnosticCheck, DiagnosticsReport, RuntimeInfo } from '../shared/ipc';
+import type {
+  DiagnosticCheck,
+  DiagnosticsReport,
+  PiRuntimeSnapshot,
+  RuntimeInfo,
+  WslDistributionInfo,
+  WslProbeInfo,
+} from '../shared/ipc';
 
 type View = 'overview' | 'diagnostics';
 
@@ -64,6 +71,11 @@ function App(): ReactElement {
   const [view, setView] = useState<View>('overview');
   const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
   const [diagnostics, setDiagnostics] = useState<DiagnosticsReport | null>(null);
+  const [distros, setDistros] = useState<WslDistributionInfo[]>([]);
+  const [selectedDistro, setSelectedDistro] = useState('');
+  const [linuxPath, setLinuxPath] = useState('/home/user/src/project');
+  const [probe, setProbe] = useState<WslProbeInfo | null>(null);
+  const [piStatus, setPiStatus] = useState<PiRuntimeSnapshot | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -72,12 +84,17 @@ function App(): ReactElement {
     setError(null);
 
     try {
-      const [runtimeInfo, diagnosticReport] = await Promise.all([
+      const [runtimeInfo, diagnosticReport, availableDistros, runtimeStatus] = await Promise.all([
         window.piDesktop.getRuntimeInfo(),
         window.piDesktop.getDiagnostics(),
+        window.piDesktop.listWslDistributions(),
+        window.piDesktop.getPiStatus(),
       ]);
       setRuntime(runtimeInfo);
       setDiagnostics(diagnosticReport);
+      setDistros(availableDistros);
+      setSelectedDistro((current) => current || availableDistros[0]?.name || '');
+      setPiStatus(runtimeStatus);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : 'The desktop host did not respond.';
       setError(message);
@@ -89,6 +106,24 @@ function App(): ReactElement {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => window.piDesktop.onPiEvent((event) => {
+    if (event.type === 'runtime') setPiStatus(event.snapshot);
+  }), []);
+
+  const inspectDistro = useCallback(async () => {
+    if (!selectedDistro) return;
+    setProbe(await window.piDesktop.probeWslDistribution(selectedDistro));
+  }, [selectedDistro]);
+
+  const startPi = useCallback(async () => {
+    if (!selectedDistro) return;
+    setPiStatus(await window.piDesktop.startPi({ distro: selectedDistro, linuxPath }));
+  }, [linuxPath, selectedDistro]);
+
+  const stopPi = useCallback(async () => {
+    setPiStatus(await window.piDesktop.stopPi());
+  }, []);
 
   const reportStatus = diagnostics?.overall === 'ready' ? 'Ready' : 'M0 shell online';
 
@@ -153,11 +188,30 @@ function App(): ReactElement {
                   A calm Windows home for Pi. Your workspace will stay close at hand while
                   the execution layer remains safely isolated in WSL.
                 </p>
-                <button className="primary-button" disabled type="button">
-                  <span>Choose a workspace</span>
-                  <span className="button-tag">Coming soon</span>
-                </button>
-                <p className="helper-copy">WSL distro and workspace discovery arrive in the next milestone.</p>
+                <div className="workspace-form">
+                  <label>
+                    <span>WSL distribution</span>
+                    <select value={selectedDistro} onChange={(event) => setSelectedDistro(event.target.value)}>
+                      <option value="">Select a distro</option>
+                      {distros.map((distro) => <option key={distro.name} value={distro.name}>{distro.name}</option>)}
+                    </select>
+                  </label>
+                  <label>
+                    <span>Linux workspace path</span>
+                    <input value={linuxPath} onChange={(event) => setLinuxPath(event.target.value)} spellCheck={false} />
+                  </label>
+                  <div className="workspace-actions">
+                    <button className="secondary-button" disabled={!selectedDistro} onClick={() => void inspectDistro()} type="button">Probe</button>
+                    <button className="primary-button" disabled={!selectedDistro || piStatus?.state === 'starting'} onClick={() => void startPi()} type="button">
+                      <span>{piStatus?.state === 'ready' ? 'Pi running' : 'Start Pi'}</span>
+                      <span className="button-tag">WSL RPC</span>
+                    </button>
+                    {piStatus?.state === 'ready' && <button className="text-button" onClick={() => void stopPi()} type="button">Stop</button>}
+                  </div>
+                  <p className="helper-copy">
+                    {probe ? `${probe.distribution}: ${probe.detail}` : 'Linux paths stay canonical inside Pi and Git.'}
+                  </p>
+                </div>
               </div>
               <div className="hero-footer">
                 <span className="footer-signal" aria-hidden="true">↗</span>

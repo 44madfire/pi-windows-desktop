@@ -1,12 +1,21 @@
-import type { DiagnosticsReport, RuntimeInfo } from './ipc.js';
+import type { DiagnosticsReport, PiRuntimeSnapshot, RuntimeInfo } from './ipc.js';
 
 export function createDiagnosticsReport(
   runtime: RuntimeInfo,
   checkedAt = new Date().toISOString(),
+  piRuntime?: PiRuntimeSnapshot,
 ): DiagnosticsReport {
+  const piCheck = piRuntime
+    ? piRuntime.state === 'ready'
+      ? { status: 'pass' as const, detail: `Pi RPC is connected${piRuntime.piVersion ? ` (${piRuntime.piVersion})` : ''}.` }
+      : piRuntime.state === 'failed' || piRuntime.state === 'disconnected'
+        ? { status: 'fail' as const, detail: piRuntime.lastError ?? `Pi RPC is ${piRuntime.state}.` }
+        : { status: 'pending' as const, detail: `Pi RPC is ${piRuntime.state}.` }
+    : { status: 'pending' as const, detail: 'Pi JSONL transport is not connected yet.' };
+
   return {
     checkedAt,
-    overall: 'pending',
+    overall: piCheck.status === 'pass' ? 'ready' : piCheck.status === 'fail' ? 'degraded' : 'pending',
     checks: [
       {
         id: 'host-process',
@@ -29,8 +38,8 @@ export function createDiagnosticsReport(
       {
         id: 'pi-transport',
         label: 'Pi transport',
-        status: 'pending',
-        detail: 'Pi JSONL transport will be added in a later milestone.',
+        status: piCheck.status,
+        detail: piCheck.detail,
       },
     ],
   };

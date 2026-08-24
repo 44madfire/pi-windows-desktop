@@ -2,12 +2,21 @@ import { app, BrowserWindow, ipcMain } from 'electron';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDiagnosticsReport } from '../shared/diagnostics.js';
-import { IPC_CHANNELS, type RuntimeInfo } from '../shared/ipc.js';
+import { IPC_CHANNELS, type RuntimeInfo, type WslWorkspace } from '../shared/ipc.js';
+import { PiRuntimeController } from './services/pi/pi-runtime.js';
+import { WslManager } from './wsl/index.js';
 
 const currentDirectory = dirname(fileURLToPath(import.meta.url));
 const rendererUrl = process.env.ELECTRON_RENDERER_URL;
 
 let mainWindow: BrowserWindow | undefined;
+const wsl = new WslManager();
+const piRuntime = new PiRuntimeController({
+  wsl,
+  handlers: {
+    onEvent: (event) => mainWindow?.webContents.send(IPC_CHANNELS.piEvent, event),
+  },
+});
 
 function getDesktopPlatform(platform: NodeJS.Platform): RuntimeInfo['platform'] {
   switch (platform) {
@@ -35,8 +44,27 @@ function getRuntimeInfo(): RuntimeInfo {
 function registerIpcHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.getRuntimeInfo, () => getRuntimeInfo());
   ipcMain.handle(IPC_CHANNELS.getDiagnostics, () =>
-    createDiagnosticsReport(getRuntimeInfo()),
+    createDiagnosticsReport(getRuntimeInfo(), new Date().toISOString(), piRuntime.snapshot),
   );
+  ipcMain.handle(IPC_CHANNELS.listWslDistributions, () => wsl.listDistributions());
+  ipcMain.handle(IPC_CHANNELS.probeWslDistribution, async (_event, request: { distribution: string }) => {
+    const probe = await wsl.probeDistribution(request.distribution);
+    return {
+      distribution: probe.distribution,
+      available: probe.available,
+      pi: probe.pi
+        ? { available: probe.pi.available, version: probe.pi.version }
+        : null,
+      detail: probe.available
+        ? probe.pi?.available
+          ? `Pi ${probe.pi.version ?? 'version unknown'} is available.`
+          : 'Pi was not found in this distribution.'
+        : probe.availability.stderr || 'The WSL distribution is unavailable.',
+    };
+  });
+  ipcMain.handle(IPC_CHANNELS.startPi, (_event, workspace: WslWorkspace) => piRuntime.start(workspace));
+  ipcMain.handle(IPC_CHANNELS.stopPi, () => piRuntime.stop());
+  ipcMain.handle(IPC_CHANNELS.getPiStatus, () => piRuntime.snapshot);
 }
 
 function createMainWindow(): BrowserWindow {
@@ -81,4 +109,8 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
   }
+});
+
+app.on('before-quit', () => {
+  void piRuntime.stop();
 });

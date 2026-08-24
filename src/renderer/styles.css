@@ -279,6 +279,45 @@ p {
   font-size: 11px;
 }
 
+.workspace-form {
+  display: grid;
+  max-width: 560px;
+  gap: 12px;
+}
+
+.workspace-form label {
+  display: grid;
+  gap: 6px;
+  color: #8392a7;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.workspace-form select,
+.workspace-form input {
+  min-width: 0;
+  padding: 11px 12px;
+  border: 1px solid rgba(167, 191, 222, 0.18);
+  border-radius: 8px;
+  color: #dce7f4;
+  outline: none;
+  background: rgba(8, 13, 20, 0.55);
+  font: 12px "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+}
+
+.workspace-form select:focus,
+.workspace-form input:focus {
+  border-color: rgba(126, 212, 199, 0.7);
+}
+
+.workspace-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .hero-footer {
   gap: 10px;
   color: #718197;
