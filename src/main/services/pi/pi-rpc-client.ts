@@ -659,23 +659,28 @@ export class PiRpcClient {
   private waitForTermination(active: ActiveTransport, timeoutMs: number): Promise<void> {
     return new Promise((resolve) => {
       let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const finish = () => {
         if (settled) {
           return;
         }
         settled = true;
-        clearTimeout(timer);
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
         resolve();
       };
 
-      const timer = setTimeout(() => {
-        try {
-          active.transport.kill?.("SIGKILL");
-        } catch (error: unknown) {
-          this.notifyError(this.asTransportError(error, "process"));
-        }
-        finish();
-      }, timeoutMs);
+      if (timeoutMs !== Infinity) {
+        timer = setTimeout(() => {
+          try {
+            active.transport.kill?.("SIGKILL");
+          } catch (error: unknown) {
+            this.notifyError(this.asTransportError(error, "process"));
+          }
+          finish();
+        }, timeoutMs);
+      }
 
       if (active.ended) {
         finish();
