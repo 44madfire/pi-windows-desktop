@@ -1,0 +1,12 @@
+appId: com.pi.desktop
+productName: Pi Desktop
+directories:
+  output: release
+files:
+  - out/**
+win:
+  target:
+    - nsis
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true

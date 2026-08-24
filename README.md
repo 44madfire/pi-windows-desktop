@@ -15,3 +15,4 @@ Development starts with M0: Windows/WSL/Pi substrate and reliable Pi JSONL RPC c
 
 See the implementation plan provided with this project for the complete milestone sequence.
 
+Reference architecture notes are tracked in [docs/reference-study.md](docs/reference-study.md). Local study checkouts, when present, live under the ignored `.reference-repos/` directory.
