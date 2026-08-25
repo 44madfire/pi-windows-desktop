@@ -4,6 +4,7 @@ import { test } from "node:test";
 
 import {
   createWslPiTransport,
+  WslPiProcessStdinAdapter,
   WslPiProcessTransportInputError,
   type WslPiProcessSpawn,
   type WslPiSpawnedChild,
@@ -14,10 +15,26 @@ class FakeReadable extends EventEmitter {}
 class FakeWritable extends EventEmitter {
   readonly writes: string[] = [];
   ended = false;
+  private readonly writeResult: boolean;
+  private readonly pendingWriteCallbacks: Array<(error?: Error | null) => void> = [];
 
-  write(chunk: string): boolean {
+  constructor(writeResult = true) {
+    super();
+    this.writeResult = writeResult;
+  }
+
+  write(chunk: string, callback?: (error?: Error | null) => void): boolean {
     this.writes.push(chunk);
-    return true;
+    if (callback) {
+      this.pendingWriteCallbacks.push(callback);
+    }
+    return this.writeResult;
+  }
+
+  /** Invoke the oldest pending write callback, settling the adapter's write promise. */
+  flushWrite(error?: Error): void {
+    const callback = this.pendingWriteCallbacks.shift();
+    callback?.(error);
   }
 
   end(): void {
@@ -26,10 +43,15 @@ class FakeWritable extends EventEmitter {
 }
 
 class FakeChild extends EventEmitter {
-  readonly stdin = new FakeWritable();
+  readonly stdin: FakeWritable;
   readonly stdout = new FakeReadable();
   readonly stderr = new FakeReadable();
   readonly killSignals: Array<string | undefined> = [];
+
+  constructor(stdin: FakeWritable = new FakeWritable()) {
+    super();
+    this.stdin = stdin;
+  }
 
   kill(signal?: string): boolean {
     this.killSignals.push(signal);
@@ -82,7 +104,10 @@ test("creates an argv-safe streaming WSL Pi transport", () => {
     },
   });
 
-  assert.equal(transport.stdin, child.stdin);
+  assert.ok(
+    transport.stdin instanceof WslPiProcessStdinAdapter,
+    "stdin must be the promise-based adapter, not the raw child stdin",
+  );
   assert.equal(transport.stdout, child.stdout);
   assert.equal(transport.stderr, child.stderr);
 
@@ -167,4 +192,67 @@ test("rejects invalid distro and non-canonical Linux workspace inputs before spa
   }
 
   assert.equal(spawnCalls, 0);
+});
+
+test("stdin write() returns a promise that stays pending until the writable callback fires", { timeout: 5000 }, async () => {
+  const stdin = new FakeWritable(false);
+  const child = new FakeChild(stdin);
+  const spawn: WslPiProcessSpawn = () => asSpawnedChild(child);
+  const transport = createWslPiTransport({
+    distro: "Ubuntu-24.04",
+    linuxPath: "/home/user/project",
+    spawn,
+  });
+
+  const writeResult = transport.stdin.write("{\"type\":\"prompt\"}\n");
+  assert.ok(
+    writeResult instanceof Promise,
+    "stdin write() must return a promise, not the immediate backpressure boolean",
+  );
+  const writePromise = writeResult as Promise<boolean | void>;
+
+  let outcome: "pending" | "fulfilled" | "rejected" = "pending";
+  writePromise.then(
+    () => {
+      outcome = "fulfilled";
+    },
+    () => {
+      outcome = "rejected";
+    },
+  );
+
+  // Give microtasks and a macrotask a chance: the child writable has not
+  // invoked its write callback yet, so the promise must still be pending.
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(
+    outcome,
+    "pending",
+    "write() promise must stay pending until the writable callback fires",
+  );
+
+  stdin.flushWrite();
+  await writePromise;
+  assert.equal(outcome, "fulfilled", "write() promise must settle once the writable callback fires");
+});
+
+test("stdin write() promise rejects when the writable callback reports an error", { timeout: 5000 }, async () => {
+  const stdin = new FakeWritable(false);
+  const child = new FakeChild(stdin);
+  const spawn: WslPiProcessSpawn = () => asSpawnedChild(child);
+  const transport = createWslPiTransport({
+    distro: "Ubuntu-24.04",
+    linuxPath: "/home/user/project",
+    spawn,
+  });
+
+  const writeResult = transport.stdin.write("{\"type\":\"prompt\"}\n");
+  assert.ok(
+    writeResult instanceof Promise,
+    "stdin write() must return a promise, not the immediate backpressure boolean",
+  );
+
+  const writeError = new Error("EPIPE: WSL pi process closed its stdin");
+  stdin.flushWrite(writeError);
+
+  await assert.rejects(writeResult, (error: unknown) => error === writeError);
 });
