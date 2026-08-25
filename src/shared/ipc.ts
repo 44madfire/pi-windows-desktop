@@ -90,6 +90,18 @@ export interface PiRuntimeSnapshot {
   workspace: WslWorkspace | null;
   piVersion: string | null;
   lastError: string | null;
+  /**
+   * Durable append-order cursor: the last entry id observed in a get_entries
+   * response, driving the next `since` catch-up. `lastEntryId` is a
+   * compatibility alias of this value.
+   */
+  lastSeenEntryId: string | null;
+  /**
+   * Current active leaf from the last get_entries response. The leaf pins
+   * the branch tip and may lag the append end; it is never a catch-up cursor.
+   */
+  leafId: string | null;
+  /** Compatibility alias equal to lastSeenEntryId (legacy name). */
   lastEntryId: string | null;
   /** Logical Pi session identifier from the latest get_state handshake. */
   sessionId: string | null;
