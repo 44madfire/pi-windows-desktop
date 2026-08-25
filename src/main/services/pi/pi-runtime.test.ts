@@ -156,7 +156,8 @@ class FakeTransport implements PiRpcTransport {
     return this.writes.map((frame) => JSON.parse(frame) as WireCommand);
   }
 
-  private emitExit(code: number, signal: string | null): void {
+  /** Simulate the Pi process terminating (transport exit event). */
+  emitExit(code: number, signal: string | null): void {
     this.exitCount += 1;
     this.lifecycle.emit("exit", code, signal);
   }
@@ -315,12 +316,97 @@ function fakeStore(pointer: SessionPointer | null): SessionStore & { saved: Sess
 }
 
 test("a restored runtime resumes switch_session, catches up from the cursor, and hydrates", async () => {
+  const forwarded: PiEvent[] = [];
   const transport = new FakeTransport();
   const store = fakeStore({
     workspace: sessionWorkspaceKey(workspace),
     sessionFile,
     sessionId: "pi-session-1",
     lastEntryId: "entry-9",
+    leafId: "entry-1",
+  });
+  const runtime = new PiRuntimeController({
+    wsl: fakeWsl,
+    createTransport: () => transport,
+    sessionStore: store,
+    handlers: { onEvent: (event) => forwarded.push(event) },
+  });
+
+  const started = await runtime.start(workspace);
+
+  // The stored pointer round-trips both values: from the very first
+  // published snapshot, the runtime exposes the durable append cursor
+  // (`lastEntryId`) alongside the restored active leaf, until the
+  // authoritative catch-up response replaces the leaf.
+  const starting = forwarded.find(
+    (event): event is Extract<PiEvent, { type: "runtime" }> =>
+      event.type === "runtime" && event.snapshot.state === "starting",
+  );
+  assert.ok(starting, "a starting snapshot must be published");
+  assert.equal(starting.snapshot.lastEntryId, "entry-9");
+  assert.equal(starting.snapshot.leafId, "entry-1");
+
+  const commands = transport.writtenCommands();
+  assert.deepEqual(
+    commands.map((command) => command.type),
+    ["switch_session", "get_state", "get_entries"],
+  );
+  assert.equal(commands[0].sessionPath, sessionFile);
+  const getEntries = commands[2];
+  // The catch-up cursor is the durable append cursor — never the leaf.
+  assert.equal(getEntries.since, "entry-9");
+
+  // The persisted append cursor drove the catch-up; the recovered entries
+  // advance the append cursor to the last entry id in append order, while
+  // `leafId` is the current active leaf exposed separately — never the
+  // durable cursor.
+  assert.equal(started.state, "ready");
+  assert.equal(started.lastSeenEntryId, "user-1");
+  assert.equal(started.leafId, "entry-10");
+  assert.equal(started.lastEntryId, "user-1");
+  assert.equal(started.sessionId, "pi-session-1");
+  assert.equal(started.sessionFile, sessionFile);
+
+  // Recovered entries hydrated the conversation timeline before ready.
+  const timeline = runtime.conversationSnapshot.timeline;
+  assert.equal(timeline.length, 1);
+  assert.equal(timeline[0].type === "message" ? timeline[0].content : '', "recovered prompt");
+
+  // The resulting pointer was persisted (start + synchronization both save)
+  // with the durable append cursor, not the active leaf.
+  assert.ok(store.saved.length >= 1);
+  const persisted = store.saved[store.saved.length - 1];
+  assert.equal(persisted.workspace, sessionWorkspaceKey(workspace));
+  assert.equal(persisted.sessionFile, sessionFile);
+  assert.equal(persisted.lastEntryId, "user-1");
+
+  await runtime.stop();
+  const stopped = store.saved[store.saved.length - 1];
+  assert.equal(stopped.lastEntryId, "user-1");
+});
+
+test("a stored leaf and cursor round-trip; the next sync still requests since the cursor", async () => {
+  const transport = new FakeTransport((command) => {
+    switch (command.type) {
+      case "new_session":
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "get_state":
+        return { sessionId: "pi-session-1", sessionFile };
+      case "get_entries":
+        // The response carries no leafId key: it is not authoritative about
+        // the active leaf, so the restored leaf must be preserved.
+        return { entries: [] };
+      default:
+        return {};
+    }
+  });
+  const store = fakeStore({
+    workspace: sessionWorkspaceKey(workspace),
+    sessionFile,
+    sessionId: "pi-session-1",
+    lastEntryId: "entry-2",
+    leafId: "entry-1",
   });
   const runtime = new PiRuntimeController({
     wsl: fakeWsl,
@@ -330,36 +416,18 @@ test("a restored runtime resumes switch_session, catches up from the cursor, and
 
   const started = await runtime.start(workspace);
 
-  const commands = transport.writtenCommands();
-  assert.deepEqual(
-    commands.map((command) => command.type),
-    ["switch_session", "get_state", "get_entries"],
-  );
-  assert.equal(commands[0].sessionPath, sessionFile);
-  const getEntries = commands[2];
-  assert.equal(getEntries.since, "entry-9");
-
-  // The persisted cursor drove the catch-up; the new leafId is authoritative.
+  // Both stored values round-trip through startup: the next synchronization
+  // still requests the durable append cursor (`since: "entry-2"`), never the
+  // restored leaf, and the ready runtime exposes both the append cursor and
+  // the restored active leaf until an authoritative response replaces it.
+  const getEntries = transport.writtenCommands().find((command) => command.type === "get_entries");
+  assert.equal(getEntries?.since, "entry-2");
   assert.equal(started.state, "ready");
-  assert.equal(started.lastEntryId, "entry-10");
-  assert.equal(started.sessionId, "pi-session-1");
-  assert.equal(started.sessionFile, sessionFile);
-
-  // Recovered entries hydrated the conversation timeline before ready.
-  const timeline = runtime.conversationSnapshot.timeline;
-  assert.equal(timeline.length, 1);
-  assert.equal(timeline[0].type === "message" ? timeline[0].content : '', "recovered prompt");
-
-  // The resulting pointer was persisted (start + synchronization both save).
-  assert.ok(store.saved.length >= 1);
-  const persisted = store.saved[store.saved.length - 1];
-  assert.equal(persisted.workspace, sessionWorkspaceKey(workspace));
-  assert.equal(persisted.sessionFile, sessionFile);
-  assert.equal(persisted.lastEntryId, "entry-10");
+  assert.equal(started.lastSeenEntryId, "entry-2");
+  assert.equal(started.leafId, "entry-1");
+  assert.equal(started.lastEntryId, "entry-2");
 
   await runtime.stop();
-  const stopped = store.saved[store.saved.length - 1];
-  assert.equal(stopped.lastEntryId, "entry-10");
 });
 
 test("a missing or invalid pointer still starts a fresh session without crashing", async () => {
@@ -390,6 +458,7 @@ test("a cancelled resume propagates explicit null identity/cursor resets into ru
     sessionFile: staleSessionFile,
     sessionId: "stale-session",
     lastEntryId: "entry-9",
+    leafId: null,
   };
   const transport = new FakeTransport((command) => {
     switch (command.type) {
@@ -597,4 +666,266 @@ test("stop persists the session pointer before resolving", async () => {
   assert.equal(persisted.workspace, sessionWorkspaceKey(workspace));
   assert.equal(persisted.sessionId, "pi-session-1");
   assert.equal(persisted.sessionFile, sessionFile);
+});
+
+/**
+ * Pi behavior for the reconnect tests. The first `get_entries` (full
+ * history, no `since`) returns one append-ordered entry; a catch-up with a
+ * `since` cursor returns a newer entry while the active leaf lags the append
+ * end (leaf "entry-1", append tail "entry-2"), pinning that the append
+ * cursor — never the active leaf — drives the next catch-up.
+ */
+const reconnectResponses = (command: WireCommand): Record<string, unknown> => {
+  switch (command.type) {
+    case "new_session":
+    case "switch_session":
+      return { sessionId: "pi-session-1" };
+    case "get_state":
+      return { sessionId: "pi-session-1", sessionFile };
+    case "get_entries":
+      return command.since === undefined
+        ? {
+            entries: [
+              {
+                type: "message",
+                id: "entry-1",
+                parentId: null,
+                timestamp: "2026-01-01T00:00:00.000Z",
+                message: { role: "user", content: "first prompt" },
+              },
+            ],
+            leafId: "entry-1",
+          }
+        : {
+            entries: [
+              {
+                type: "message",
+                id: "entry-2",
+                parentId: "entry-1",
+                timestamp: "2026-01-01T00:00:01.000Z",
+                message: { role: "assistant", content: "first answer" },
+              },
+            ],
+            leafId: "entry-1",
+          };
+    default:
+      return {};
+  }
+};
+
+/**
+ * Build a runtime whose transport factory hands out the given transports in
+ * order (one per `connect()`/`reconnect()`), recording them as they are
+ * created so tests can drive each transport's lifecycle.
+ */
+function runtimeWithTransportSequence(
+  transports: FakeTransport[],
+  store: SessionStore | null = null,
+): { runtime: PiRuntimeController; transports: FakeTransport[] } {
+  const queue = [...transports];
+  const created: FakeTransport[] = [];
+  const runtime = new PiRuntimeController({
+    wsl: fakeWsl,
+    createTransport: () => {
+      const next = queue.shift() ?? new FakeTransport();
+      created.push(next);
+      return next;
+    },
+    sessionStore: store,
+  });
+  return { runtime, transports: created };
+}
+
+test("reconnect reruns the handshake, catches up from the append cursor, hydrates, and persists before ready", async () => {
+  const store = fakeStore(null);
+  const { runtime, transports } = runtimeWithTransportSequence(
+    [new FakeTransport(reconnectResponses), new FakeTransport(reconnectResponses)],
+    store,
+  );
+
+  const started = await runtime.start(workspace);
+  assert.equal(started.state, "ready");
+  assert.deepEqual(
+    transports[0].writtenCommands().map((command) => command.type),
+    ["new_session", "get_state", "get_entries"],
+  );
+
+  // The Pi process dies while the runtime is idle: the client and session
+  // are left disconnected with the append cursor intact.
+  transports[0].emitExit(1, "SIGTERM");
+  await flushMicrotasks();
+  assert.equal(runtime.snapshot.state, "disconnected");
+  assert.equal(runtime.snapshot.lastSeenEntryId, "entry-1");
+
+  // No ready snapshot is published before the reconnect handshake completes.
+  const reconnecting = runtime.reconnect();
+  assert.equal(runtime.snapshot.state, "starting");
+  await reconnecting;
+
+  // The replacement transport was bound to the existing session file
+  // (switch_session -> get_state), then caught up from the append cursor —
+  // never the active leaf — with no fresh session created.
+  const commands = transports[1].writtenCommands();
+  assert.deepEqual(
+    commands.map((command) => command.type),
+    ["switch_session", "get_state", "get_entries"],
+  );
+  assert.equal(commands[0].sessionPath, sessionFile);
+  assert.equal(commands[2].since, "entry-1");
+
+  // The append cursor advanced to the last entry id in append order while
+  // the lagging active leaf is exposed separately and never becomes the
+  // durable cursor.
+  assert.equal(runtime.snapshot.state, "ready");
+  assert.equal(runtime.snapshot.lastSeenEntryId, "entry-2");
+  assert.equal(runtime.snapshot.leafId, "entry-1");
+  assert.equal(runtime.snapshot.lastEntryId, "entry-2");
+
+  // Recovered entries hydrated the same conversation before ready.
+  assert.deepEqual(
+    runtime.conversationSnapshot.timeline.map((record) =>
+      record.type === "message" ? record.content : "",
+    ),
+    ["first prompt", "first answer"],
+  );
+
+  // The reconnect persisted the pointer with the durable append cursor and
+  // the transient active leaf.
+  const persisted = store.saved[store.saved.length - 1];
+  assert.equal(persisted.workspace, sessionWorkspaceKey(workspace));
+  assert.equal(persisted.sessionFile, sessionFile);
+  assert.equal(persisted.lastEntryId, "entry-2");
+  assert.equal(persisted.leafId, "entry-1");
+
+  await runtime.stop();
+});
+
+test("queued prompts are never sent before the handshake and resume only after ready", async () => {
+  const store = fakeStore(null);
+  const { runtime, transports } = runtimeWithTransportSequence(
+    [new FakeTransport(reconnectResponses), new FakeTransport(reconnectResponses)],
+    store,
+  );
+
+  await runtime.start(workspace);
+  transports[0].emitExit(1, "SIGTERM");
+  await flushMicrotasks();
+  assert.equal(runtime.snapshot.state, "disconnected");
+
+  // A prompt sent while disconnected is retained in the paused queue; no
+  // prompt command is written to any live transport.
+  await runtime.sendPrompt("queued prompt");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 1);
+  assert.ok(
+    transports[0].writtenCommands().every((command) => command.type !== "prompt"),
+    "no prompt command may be written while disconnected",
+  );
+
+  await runtime.reconnect();
+
+  // The prompt is the last command written: it follows the full handshake
+  // (switch_session, get_state, get_entries) and is dispatched only after
+  // the runtime published ready.
+  const commands = transports[1].writtenCommands();
+  assert.deepEqual(
+    commands.map((command) => command.type),
+    ["switch_session", "get_state", "get_entries", "prompt"],
+  );
+  const prompt = commands[3];
+  assert.equal(prompt.type, "prompt");
+  assert.equal(prompt.message, "queued prompt");
+  assert.equal(runtime.snapshot.state, "ready");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 0);
+
+  // The same conversation was reused: hydrated history and the queued prompt
+  // both appear in the timeline.
+  const contents = runtime.conversationSnapshot.timeline.map((record) =>
+    record.type === "message" ? record.content : "",
+  );
+  assert.ok(contents.includes("first prompt"));
+  assert.ok(contents.includes("first answer"));
+  assert.ok(contents.includes("queued prompt"));
+
+  await runtime.stop();
+});
+
+test("start on a same-workspace disconnected runtime delegates to the reconnect seam", async () => {
+  const store = fakeStore(null);
+  const { runtime, transports } = runtimeWithTransportSequence(
+    [new FakeTransport(reconnectResponses), new FakeTransport(reconnectResponses)],
+    store,
+  );
+
+  await runtime.start(workspace);
+  transports[0].emitExit(1, "SIGTERM");
+  await flushMicrotasks();
+  assert.equal(runtime.snapshot.state, "disconnected");
+
+  // Queue a prompt while disconnected: it must survive the start() call.
+  await runtime.sendPrompt("queued prompt");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 1);
+
+  const started = await runtime.start(workspace);
+  assert.equal(started.state, "ready");
+
+  // The existing conversation was reused and its queue resumed: the prompt
+  // was actually dispatched after the reconnect handshake. A fresh,
+  // unhandshaken second conversation would have dropped the queue and never
+  // sent this prompt.
+  const commands = transports[1].writtenCommands();
+  assert.deepEqual(
+    commands.map((command) => command.type),
+    ["switch_session", "get_state", "get_entries", "prompt"],
+  );
+  assert.equal(commands[3].message, "queued prompt");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 0);
+  assert.equal(runtime.snapshot.lastSeenEntryId, "entry-2");
+
+  await runtime.stop();
+});
+
+test("a failed reconnect closes the transport and preserves queued work for retry", async () => {
+  const store = fakeStore(null);
+  const { runtime, transports } = runtimeWithTransportSequence(
+    [
+      new FakeTransport(reconnectResponses),
+      new FakeTransport(reconnectResponses, { failCommands: { get_state: true } }),
+      new FakeTransport(reconnectResponses),
+    ],
+    store,
+  );
+
+  await runtime.start(workspace);
+  transports[0].emitExit(1, "SIGTERM");
+  await flushMicrotasks();
+  assert.equal(runtime.snapshot.state, "disconnected");
+
+  await runtime.sendPrompt("queued prompt");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 1);
+
+  // The failed handshake closes the replacement transport cleanly (stdin
+  // EOF) and leaves the runtime disconnected without dropping the queue.
+  await assert.rejects(runtime.reconnect(), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /get_state/);
+    return true;
+  });
+  assert.equal(runtime.snapshot.state, "disconnected");
+  assert.match(runtime.snapshot.lastError ?? "", /get_state/);
+  assert.equal(transports[1].stdinEndCount, 1);
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 1, "queued work must survive a failed reconnect");
+
+  // A later retry over a healthy transport completes the handshake and
+  // resumes the preserved queue.
+  await runtime.reconnect();
+  const commands = transports[2].writtenCommands();
+  assert.deepEqual(
+    commands.map((command) => command.type),
+    ["switch_session", "get_state", "get_entries", "prompt"],
+  );
+  assert.equal(commands[3].message, "queued prompt");
+  assert.equal(runtime.snapshot.state, "ready");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 0);
+
+  await runtime.stop();
 });
