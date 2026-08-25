@@ -306,7 +306,10 @@ export class PiRuntimeController {
       // The handshake is forced: a replacement transport is a new Pi process
       // that must be bound to the session file again even if the manager was
       // already ready when the transport died.
-      await session.openSession(session.sessionFile, { force: true });
+      await session.openSession(session.sessionFile, {
+        force: true,
+        fallbackToNewSession: false,
+      });
       const sync = await session.synchronize();
       conversation.hydrate(sync.entries);
       await this.persistPointer(workspaceKey, session);
