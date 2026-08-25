@@ -139,7 +139,13 @@ interface HydratedToolCall {
   readonly input?: string;
 }
 
-/** Collect assistant toolCall blocks so tool results carry their tool name/command. */
+/**
+ * Collect assistant toolCall blocks so tool results carry their tool
+ * name/command. Current Pi blocks carry `id`/`name`/`arguments` (bash command
+ * under `arguments.command`); legacy blocks carry `toolCallId`/`toolName`/
+ * `input`. Both shapes are accepted so hydrated history stays correct across
+ * Pi versions.
+ */
 function collectToolCalls(entries: readonly unknown[]): Map<string, HydratedToolCall> {
   const calls = new Map<string, HydratedToolCall>();
   for (const raw of entries) {
@@ -151,12 +157,12 @@ function collectToolCalls(entries: readonly unknown[]): Map<string, HydratedTool
     if (!blocks) continue;
     for (const { block } of blocks) {
       if (block.type !== "toolCall") continue;
-      const id = stringValue(block.toolCallId);
+      const id = stringValue(block.id) ?? stringValue(block.toolCallId);
       if (id === undefined) continue;
-      const input = objectValue(block.input);
+      const args = objectValue(block.arguments) ?? objectValue(block.input);
       calls.set(id, {
-        name: stringValue(block.toolName) ?? "Tool",
-        input: input && typeof input.command === "string" ? input.command : undefined,
+        name: stringValue(block.name) ?? stringValue(block.toolName) ?? "Tool",
+        input: args && typeof args.command === "string" ? args.command : undefined,
       });
     }
   }
@@ -241,6 +247,12 @@ export class ConversationController {
   private activePrompt: Prompt | null = null;
   /** Whether the active turn is being aborted by the user (affects tool settlement). */
   private abortRequested = false;
+  /**
+   * Auto-dispatch is paused after a transport/client failure. Prompts sent
+   * while paused stay queued; only the runtime reconnect handshake resumes
+   * dispatching via {@link resumeQueuedPrompts}.
+   */
+  private queuePaused = false;
   private activeToolId: string | null = null;
   private streamingState: StreamingAssistant | null = null;
   private snapshotValue: ConversationSnapshot = {
@@ -255,11 +267,15 @@ export class ConversationController {
     this.client.onEvent((event) => this.handleEvent(event));
     this.client.onError((error) => {
       const message = error instanceof Error ? error.message : String(error);
+      // A transport failure must not auto-dispatch the next queued prompt
+      // into a disconnected client: pause the queue and let the runtime
+      // reconnect handshake resume it explicitly.
+      this.pauseQueue();
       if (this.activePrompt) {
         // A transport/client failure while a turn is active must not leave
-        // the controller blocked with a stuck active prompt: fail the turn,
-        // publish a visible error state, and keep the queue moving so future
-        // sends can recover.
+        // the controller blocked with a stuck active prompt: fail the turn
+        // and publish a visible error state. The failed active prompt is
+        // never replayed; queued prompts wait for the resume seam.
         this.failActiveTurn(message);
       } else {
         this.setState('error', message);
@@ -329,6 +345,15 @@ export class ConversationController {
   }
 
   private async processNext(): Promise<void> {
+    // After a transport failure (or while the client is still disconnected)
+    // the queue stays paused: the prompt is retained and no command is sent
+    // until the runtime reconnect handshake resumes the queue. Sending into
+    // a disconnected client would only reject on the wire.
+    if (this.queuePaused || this.client.state === 'disconnected') {
+      if (this.client.state === 'disconnected') this.queuePaused = true;
+      this.publish();
+      return;
+    }
     const prompt = this.queue.shift();
     if (!prompt) {
       this.publish();
@@ -568,10 +593,13 @@ export class ConversationController {
 
   /**
    * Fail the active turn locally after a transport/client failure or a failed
-   * prompt/abort request. Clears the active prompt, publishes a visible error
-   * state, and keeps the queue moving so future sends are not blocked. A no-op
-   * when the turn was already failed (the transport error listener and the
-   * pending-request rejection can both surface the same failure).
+   * prompt/abort request. Clears the active prompt and publishes a visible
+   * error state. The failed active prompt is never replayed, and the queue is
+   * not auto-advanced here: transport failures pause the queue (see
+   * {@link pauseQueue}) and only the runtime reconnect handshake resumes it
+   * via {@link resumeQueuedPrompts}. A no-op when the turn was already failed
+   * (the transport error listener and the pending-request rejection can both
+   * surface the same failure).
    */
   private failActiveTurn(message: string): void {
     if (!this.activePrompt) return;
@@ -580,6 +608,29 @@ export class ConversationController {
     this.activePrompt = null;
     this.abortRequested = false;
     this.setState('error', message);
+  }
+
+  /**
+   * Pause auto-dispatch after a transport/client failure. Queued prompts are
+   * retained; sendPrompt still enqueues while paused but nothing is sent
+   * until {@link resumeQueuedPrompts} runs after the reconnect handshake.
+   */
+  private pauseQueue(): void {
+    this.queuePaused = true;
+  }
+
+  /**
+   * Resume dispatching queued prompts after the runtime reconnect handshake.
+   * Clears the paused flag and the visible transport error state, then
+   * dispatches the next queued prompt when the turn is idle. A prompt that
+   * was already accepted (or attempted) before the failure is never replayed;
+   * only still-queued prompts are dispatched from here. Safe to call
+   * defensively while a turn is active: it only unpauses in that case.
+   */
+  resumeQueuedPrompts(): void {
+    this.queuePaused = false;
+    if (this.activePrompt) return;
+    this.setState('idle', null);
     void this.processNext();
   }
 

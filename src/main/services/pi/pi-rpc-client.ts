@@ -142,7 +142,11 @@ export class PiRpcClient {
     return this.stderrText;
   }
 
-  /** Start one transport. Calling this after a clean close requires reconnect(). */
+  /**
+   * Start one transport. Auto-connection is only allowed from `idle`;
+   * calling this after a clean close or after a transport failure requires
+   * `reconnect()` to replace the transport explicitly.
+   */
   connect(): Promise<void> {
     if (this.stateValue === "ready") {
       return Promise.resolve();
@@ -158,6 +162,18 @@ export class PiRpcClient {
 
     if (this.stateValue === "closed") {
       return Promise.reject(new PiRpcClosedError("Pi RPC client is closed; call reconnect() to recover"));
+    }
+
+    if (this.stateValue === "disconnected") {
+      // Recovery is caller-owned: silently spawning a replacement transport
+      // behind the caller's back would replay commands into an unknown Pi
+      // session. Explicit reconnect() is the only transport replacement seam.
+      return Promise.reject(
+        new PiRpcTransportError(
+          "Pi RPC client is disconnected; call reconnect() to recover",
+          "process",
+        ),
+      );
     }
 
     const generation = ++this.lifecycleGeneration;
@@ -329,9 +345,11 @@ export class PiRpcClient {
    *
    * Throws synchronously for invalid commands, invalid ids, or unserializable
    * values. When the transport is not ready the write is queued behind
-   * `connect()`; readiness failures and asynchronous `stdin.write()` rejections
-   * reject the returned promise and also surface through the error listeners
-   * with the client transitioned to disconnected.
+   * `connect()`; a disconnected client rejects immediately (recovery is
+   * caller-owned via `reconnect()`), while readiness (factory) failures and
+   * asynchronous `stdin.write()` rejections reject the returned promise and
+   * also surface through the error listeners with the client transitioned to
+   * disconnected.
    */
   write(command: PiRpcCommand): Promise<void> {
     const normalized = this.normalizeCommand(command);
