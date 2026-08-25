@@ -4,7 +4,7 @@ import { PiRpcClient, type PiRpcTransport } from './index.ts';
 import { createWslPiTransport } from './wsl-process-transport.ts';
 import { SessionManager, type SessionSynchronizationResult } from '../session/session-manager.ts';
 import { type SessionPointer, type SessionStore } from '../session/session-store.ts';
-import { ConversationController } from '../conversation/index.ts';
+import { ConversationController, type ConversationEvent } from '../conversation/index.ts';
 import type { ConversationSnapshot } from '../../../shared/conversation.ts';
 
 export interface PiRuntimeHandlers {
@@ -194,6 +194,7 @@ export class PiRuntimeController {
         transportFactory: () => this.createTransport({ distro: workspace.distro, linuxPath: workspace.linuxPath, piExecutable }),
       });
       this.client = client;
+      const activeClient = client;
       const session = new SessionManager({
         sessionId: previousSessionId,
         sessionFile: previousSessionFile,
@@ -230,20 +231,21 @@ export class PiRuntimeController {
           }
         }
       });
-      const conversation = new ConversationController(client, {
+      let conversation: ConversationController;
+      conversation = new ConversationController(activeClient, {
         // After agent_settled completes a turn, synchronize get_entries from
         // the durable append cursor, reconcile the authoritative entries with
         // the live timeline, and persist the resulting pointer. The controller
         // keeps its queue paused until this resolves, so the next queued
         // prompt is never dispatched before the post-settled sync. The
         // lifecycle tail serializes this against start/stop/reconnect.
-        onSettle: () =>
+        onSettle: (): Promise<void> =>
           this.enqueueLifecycle(() =>
-            this.synchronizeAfterSettle(workspaceKey, client, session, conversation),
+            this.synchronizeAfterSettle(workspaceKey, activeClient, session, conversation),
           ),
       });
       this.conversation = conversation;
-      conversation.onEvent((event) => this.handlers.onEvent?.(event));
+      conversation.onEvent((event: ConversationEvent) => this.handlers.onEvent?.(event));
 
       client.onEvent((event) => {
         this.handlers.onEvent?.({ type: 'protocol', message: event });
@@ -260,7 +262,7 @@ export class PiRuntimeController {
       // catch-up, hydration, and pointer persistence have all completed.
       await session.openSession(previousSessionFile);
       const sync = await session.synchronize();
-      this.conversation.hydrate(sync.entries);
+      conversation.hydrate(sync.entries);
       await this.persistPointer(workspaceKey, session);
 
       this.setSnapshot({
