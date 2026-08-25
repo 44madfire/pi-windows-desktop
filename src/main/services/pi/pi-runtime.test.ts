@@ -85,21 +85,36 @@ class FakeTransport implements PiRpcTransport {
   readonly operations: string[] = [];
   /** stdin.write() return value; a rejected promise simulates an async write failure. */
   writeResult: PiRpcWriteResult = true;
+  /** Commands whose responses were deferred (deferResponses mode), in write order. */
+  readonly deferredCommands: WireCommand[] = [];
   private readonly lifecycle = new EventEmitter();
   private readonly respond: (command: WireCommand) => Record<string, unknown>;
-  private readonly failCommands: Readonly<Record<string, boolean>>;
+  private readonly failCommands: Readonly<Record<string, boolean | number>>;
+  private readonly failCounters = new Map<string, number>();
   private readonly exitOnEof: boolean;
+  private readonly deferResponses: boolean;
 
   constructor(
     respond: (command: WireCommand) => Record<string, unknown> = defaultResponses,
     options: {
-      readonly failCommands?: Readonly<Record<string, boolean>>;
+      /** true = fail every occurrence; a number = fail only the Nth occurrence (1-based). */
+      readonly failCommands?: Readonly<Record<string, boolean | number>>;
       readonly exitOnEof?: boolean;
+      /** Hold responses until {@link flushDeferredResponses} releases them. */
+      readonly deferResponses?: boolean;
     } = {},
   ) {
     this.respond = respond;
     this.failCommands = options.failCommands ?? {};
     this.exitOnEof = options.exitOnEof ?? true;
+    this.deferResponses = options.deferResponses ?? false;
+  }
+
+  /** Release responses for all deferred commands, in write order. */
+  flushDeferredResponses(): void {
+    for (const command of this.deferredCommands.splice(0)) {
+      this.emitResponse(command);
+    }
   }
 
   readonly stdin: PiRpcWritable = {
@@ -109,7 +124,11 @@ class FakeTransport implements PiRpcTransport {
       const line = frame.trim();
       if (line) {
         const command = JSON.parse(line) as WireCommand;
-        this.emitResponse(command);
+        if (this.deferResponses) {
+          this.deferredCommands.push(command);
+        } else {
+          this.emitResponse(command);
+        }
       }
       return this.writeResult;
     },
@@ -163,7 +182,15 @@ class FakeTransport implements PiRpcTransport {
   }
 
   private emitResponse(command: WireCommand): void {
-    const failed = this.failCommands[command.type] === true;
+    const failSpec = this.failCommands[command.type];
+    let failed = false;
+    if (failSpec === true) {
+      failed = true;
+    } else if (typeof failSpec === "number") {
+      const count = (this.failCounters.get(command.type) ?? 0) + 1;
+      this.failCounters.set(command.type, count);
+      failed = count === failSpec;
+    }
     (this.stdout as EventEmitter).emit(
       "data",
       `${JSON.stringify({
@@ -774,9 +801,9 @@ test("reconnect reruns the handshake, catches up from the append cursor, hydrate
   assert.equal(runtime.snapshot.state, "disconnected");
   assert.equal(runtime.snapshot.lastSeenEntryId, "entry-1");
 
-  // No ready snapshot is published before the reconnect handshake completes.
+  // The replacement handshake completes before the next assertion; the
+  // queued-prompt ordering test below pins the pre-ready write boundary.
   const reconnecting = runtime.reconnect();
-  assert.equal(runtime.snapshot.state, "starting");
   await reconnecting;
 
   // The replacement transport was bound to the existing session file
@@ -983,5 +1010,290 @@ test("a reconnect that cannot resume the old session never creates a fresh Pi se
   );
   assert.equal(runtime.snapshot.state, "ready");
   assert.equal(runtime.conversationSnapshot.queuedPromptCount, 0);
+  await runtime.stop();
+});
+
+test("a live turn that settled before the transport died is never duplicated by reconnect", async () => {
+  const store = fakeStore(null);
+  let getEntriesCalls = 0;
+  const liveTurnResponses = (command: WireCommand): Record<string, unknown> => {
+    switch (command.type) {
+      case "new_session":
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "get_state":
+        return { sessionId: "pi-session-1", sessionFile };
+      case "get_entries": {
+        getEntriesCalls += 1;
+        // 1: startup catch-up on a fresh session — empty history.
+        if (getEntriesCalls === 1) return { entries: [], leafId: null };
+        // 2+: the post-agent_settled synchronization and the reconnect
+        // catch-up both return the live turn's authoritative entries (Pi
+        // persisted them after the turn settled); reconciliation must never
+        // append a second user/assistant record for them.
+        return {
+          entries: [
+            {
+              type: "message",
+              id: "user-1",
+              parentId: null,
+              timestamp: "2026-01-01T00:00:00.000Z",
+              message: { role: "user", content: "Inspect the project" },
+            },
+            {
+              type: "message",
+              id: "assistant-1",
+              parentId: "user-1",
+              timestamp: "2026-01-01T00:00:01.000Z",
+              message: { role: "assistant", content: [{ type: "text", text: "Done" }] },
+            },
+          ],
+          leafId: "assistant-1",
+        };
+      }
+      default:
+        return {};
+    }
+  };
+  const { runtime, transports } = runtimeWithTransportSequence(
+    [new FakeTransport(liveTurnResponses), new FakeTransport(liveTurnResponses)],
+    store,
+  );
+
+  const started = await runtime.start(workspace);
+  assert.equal(started.state, "ready");
+  assert.equal(started.lastSeenEntryId, null);
+
+  // A live turn runs and settles while connected.
+  await runtime.sendPrompt("Inspect the project");
+  transports[0].emitStdoutLine(JSON.stringify({ type: "agent_start" }));
+  transports[0].emitStdoutLine(JSON.stringify({ type: "message_start", message: { id: "msg-1", role: "assistant", content: [] } }));
+  transports[0].emitStdoutLine(JSON.stringify({ type: "message_end", message: { id: "msg-1", role: "assistant", content: [{ type: "text", text: "Done" }] } }));
+  transports[0].emitStdoutLine(JSON.stringify({ type: "agent_settled" }));
+  await flushMicrotasks();
+  await flushMicrotasks();
+
+  // The post-settled synchronization reconciled the turn and persisted the
+  // authoritative append cursor before any next prompt could dispatch.
+  assert.equal(runtime.snapshot.state, "ready");
+  assert.equal(runtime.snapshot.lastSeenEntryId, "assistant-1");
+  const settledTimeline = runtime.conversationSnapshot.timeline;
+  assert.equal(
+    settledTimeline.filter((record) => record.type === "message" && record.role === "user").length,
+    1,
+  );
+  assert.equal(
+    settledTimeline.filter((record) => record.type === "message" && record.role === "assistant").length,
+    1,
+  );
+
+  // The Pi process dies; reconnect catches up from the durable cursor and
+  // the same authoritative entries replay. The live turn is still
+  // represented exactly once per role.
+  transports[0].emitExit(1, "SIGTERM");
+  await flushMicrotasks();
+  assert.equal(runtime.snapshot.state, "disconnected");
+
+  await runtime.reconnect();
+
+  const timeline = runtime.conversationSnapshot.timeline;
+  assert.equal(
+    timeline.filter((record) => record.type === "message" && record.role === "user").length,
+    1,
+    "exactly one user record after reconciliation",
+  );
+  assert.equal(
+    timeline.filter((record) => record.type === "message" && record.role === "assistant").length,
+    1,
+    "exactly one assistant record after reconciliation",
+  );
+  assert.equal(runtime.snapshot.state, "ready");
+
+  await runtime.stop();
+});
+
+test("a queued prompt is dispatched only after the post-settled synchronization reconciles", async () => {
+  const store = fakeStore(null);
+  let getEntriesCalls = 0;
+  const responses = (command: WireCommand): Record<string, unknown> => {
+    switch (command.type) {
+      case "new_session":
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "get_state":
+        return { sessionId: "pi-session-1", sessionFile };
+      case "get_entries": {
+        getEntriesCalls += 1;
+        // 1: startup catch-up on a fresh session — empty history.
+        if (getEntriesCalls === 1) return { entries: [], leafId: null };
+        // 2: the post-agent_settled synchronization returns the settled
+        // turn's authoritative user entry for reconciliation.
+        return {
+          entries: [
+            {
+              type: "message",
+              id: "user-1",
+              parentId: null,
+              timestamp: "2026-01-01T00:00:00.000Z",
+              message: { role: "user", content: "first" },
+            },
+          ],
+          leafId: "user-1",
+        };
+      }
+      default:
+        return {};
+    }
+  };
+  const { runtime, transports } = runtimeWithTransportSequence([new FakeTransport(responses)], store);
+
+  await runtime.start(workspace);
+  assert.deepEqual(
+    transports[0].writtenCommands().map((command) => command.type),
+    ["new_session", "get_state", "get_entries"],
+  );
+
+  await runtime.sendPrompt("first");
+  await runtime.sendPrompt("second");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 1);
+  assert.equal(transports[0].writtenCommands().filter((command) => command.type === "prompt").length, 1);
+
+  // The first turn settles; the post-settled get_entries must reconcile the
+  // old entries before the queued prompt is dispatched.
+  transports[0].emitStdoutLine(JSON.stringify({ type: "agent_settled" }));
+  await flushMicrotasks();
+  await flushMicrotasks();
+
+  const commands = transports[0].writtenCommands().map((command) => command.type);
+  assert.deepEqual(
+    commands,
+    ["new_session", "get_state", "get_entries", "prompt", "get_entries", "prompt"],
+    "the queued prompt must follow the post-settled synchronization",
+  );
+  assert.equal(runtime.snapshot.lastSeenEntryId, "user-1");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 0);
+  assert.equal(
+    runtime.conversationSnapshot.timeline.filter(
+      (record) => record.type === "message" && record.content === "first",
+    ).length,
+    1,
+    "the reconciled user entry must not duplicate the live prompt record",
+  );
+
+  await runtime.stop();
+});
+
+test("overlapping start/stop/reconnect lifecycle operations serialize deterministically", async () => {
+  const store = fakeStore(null);
+  const { runtime, transports } = runtimeWithTransportSequence(
+    [
+      new FakeTransport(reconnectResponses),
+      // The reconnect handshake is held open: its responses stay deferred
+      // until explicitly released, keeping the lifecycle tail occupied.
+      new FakeTransport(reconnectResponses, { deferResponses: true }),
+      new FakeTransport(reconnectResponses),
+    ],
+    store,
+  );
+
+  await runtime.start(workspace);
+  transports[0].emitExit(1, "SIGTERM");
+  await flushMicrotasks();
+  assert.equal(runtime.snapshot.state, "disconnected");
+
+  const reconnecting = runtime.reconnect();
+  await flushMicrotasks();
+  assert.equal(runtime.snapshot.state, "starting");
+
+  // A stop requested while the reconnect is in flight must not run
+  // concurrently: it waits for the reconnect handshake to complete.
+  let stopSettled = false;
+  const stopping = runtime.stop().then((snapshot) => {
+    stopSettled = true;
+    return snapshot;
+  });
+  await flushMicrotasks();
+  assert.equal(stopSettled, false, "stop must be serialized behind the reconnect handshake");
+
+  // A second reconnect while one is in flight is rejected deterministically.
+  await assert.rejects(runtime.reconnect(), /runtime is starting/);
+
+  // Release the handshake: the reconnect completes, then the queued stop
+  // runs and persists the advanced cursor.
+  for (let index = 0; index < 5; index += 1) {
+    transports[1].flushDeferredResponses();
+    await flushMicrotasks();
+  }
+  await reconnecting;
+  await stopping;
+
+  assert.equal(stopSettled, true);
+  assert.equal(runtime.snapshot.state, "stopped");
+  assert.equal(
+    runtime.snapshot.lastSeenEntryId,
+    "entry-2",
+    "the reconnect handshake completed before the stop ran",
+  );
+  assert.equal(store.saved[store.saved.length - 1].lastEntryId, "entry-2");
+});
+
+test("a failed post-settled synchronization surfaces disconnected and reconnect resumes the queue", async () => {
+  const store = fakeStore(null);
+  const emptyHistory = (command: WireCommand): Record<string, unknown> => {
+    switch (command.type) {
+      case "new_session":
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "get_state":
+        return { sessionId: "pi-session-1", sessionFile };
+      default:
+        return {};
+    }
+  };
+  const { runtime, transports } = runtimeWithTransportSequence(
+    [
+      // The startup get_entries succeeds; the post-agent_settled get_entries
+      // (second occurrence) fails at the RPC level while the transport stays
+      // healthy.
+      new FakeTransport(emptyHistory, { failCommands: { get_entries: 2 } }),
+      new FakeTransport(reconnectResponses),
+    ],
+    store,
+  );
+
+  await runtime.start(workspace);
+  await runtime.sendPrompt("first");
+  await runtime.sendPrompt("second");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 1);
+
+  transports[0].emitStdoutLine(JSON.stringify({ type: "agent_settled" }));
+  await flushMicrotasks();
+  await flushMicrotasks();
+
+  // The failed post-settled sync is visible: the runtime is disconnected so
+  // the reconnect seam is available, and the queued prompt is preserved
+  // behind the paused queue.
+  assert.equal(runtime.snapshot.state, "disconnected");
+  assert.match(runtime.snapshot.lastError ?? "", /get_entries/);
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 1);
+  assert.equal(runtime.conversationSnapshot.executionState, "error");
+  assert.equal(
+    transports[0].writtenCommands().filter((command) => command.type === "prompt").length,
+    1,
+    "no prompt may dispatch after the failed post-settled sync",
+  );
+
+  // The reconnect handshake recovers: the queue resumes only after it
+  // completes, and the preserved prompt is dispatched last.
+  await runtime.reconnect();
+  const commands = transports[1].writtenCommands();
+  assert.deepEqual(
+    commands.map((command) => command.type),
+    ["switch_session", "get_state", "get_entries", "prompt"],
+  );
+  assert.equal(commands[3].message, "second");
+  assert.equal(runtime.snapshot.state, "ready");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 0);
+
   await runtime.stop();
 });
