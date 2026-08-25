@@ -24,6 +24,7 @@ const pointer = (workspace: string, overrides: Partial<SessionPointer> = {}): Se
   sessionFile: `/home/pi/.pi/agent/sessions/${workspace}`,
   sessionId: `session-${workspace}`,
   lastEntryId: "entry-9",
+  leafId: "entry-8",
   ...overrides,
 });
 
@@ -36,6 +37,7 @@ test("save then load round-trips a workspace pointer", async () => {
       sessionFile: "/home/pi/.pi/agent/sessions/Ubuntu:/home/pi",
       sessionId: "session-Ubuntu:/home/pi",
       lastEntryId: "entry-9",
+      leafId: "entry-8",
     });
 
     const content = await readFile(filePath, "utf8");
@@ -227,5 +229,118 @@ test("pointer data is written with restrictive permissions where supported", asy
   await withStore(async (store, filePath) => {
     await store.save(pointer("ws-a"));
     assert.equal((await stat(filePath)).mode & 0o777, 0o600);
+  });
+});
+
+test("a stored append cursor and leaf round-trip both values; the leaf never displaces the cursor", async () => {
+  await withStore(async (store, filePath) => {
+    // Pi's get_entries distinguishes the current active leaf (`leafId`) from
+    // the append cursor (the last entry id observed in append order). A
+    // stored `{lastSeenEntryId, leafId}` record must restore both values as
+    // independent fields: the leaf is never mistaken for the catch-up
+    // cursor, which stays the durable append cursor.
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        "ws-leaf": {
+          sessionFile: "/home/pi/.pi/agent/sessions/ws-leaf",
+          sessionId: "session-ws-leaf",
+          lastSeenEntryId: "entry-2",
+          leafId: "entry-1",
+        },
+      }),
+      "utf8",
+    );
+
+    const loaded = await store.load("ws-leaf");
+    assert.deepEqual(loaded, {
+      workspace: "ws-leaf",
+      sessionFile: "/home/pi/.pi/agent/sessions/ws-leaf",
+      sessionId: "session-ws-leaf",
+      lastEntryId: "entry-2",
+      leafId: "entry-1",
+    });
+  });
+});
+
+test("legacy pointer records migrate lastEntryId into the durable append cursor", async () => {
+  await withStore(async (store, filePath) => {
+    // A file written by an older version persists the append cursor under
+    // the legacy `lastEntryId` key with no `lastSeenEntryId` and no
+    // `leafId`. Loading it must preserve that cursor as the durable append
+    // cursor and degrade the absent leaf to null.
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        "ws-legacy": {
+          sessionFile: "/home/pi/.pi/agent/sessions/ws-legacy",
+          sessionId: "session-ws-legacy",
+          lastEntryId: "entry-9",
+        },
+      }),
+      "utf8",
+    );
+
+    const loaded = await store.load("ws-legacy");
+    assert.deepEqual(loaded, {
+      workspace: "ws-legacy",
+      sessionFile: "/home/pi/.pi/agent/sessions/ws-legacy",
+      sessionId: "session-ws-legacy",
+      lastEntryId: "entry-9",
+      leafId: null,
+    });
+  });
+});
+
+test("canonical lastSeenEntryId wins over a legacy lastEntryId key", async () => {
+  await withStore(async (store, filePath) => {
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        "ws-canonical": {
+          sessionFile: "/home/pi/.pi/agent/sessions/ws-canonical",
+          sessionId: "session-ws-canonical",
+          lastSeenEntryId: "entry-3",
+          lastEntryId: "entry-2",
+        },
+      }),
+      "utf8",
+    );
+
+    const loaded = await store.load("ws-canonical");
+    assert.equal(loaded?.lastEntryId, "entry-3");
+  });
+});
+
+test("save persists the append cursor and the active leaf as separate keys", async () => {
+  await withStore(async (store, filePath) => {
+    await store.save({
+      workspace: "ws-save",
+      sessionFile: "/home/pi/.pi/agent/sessions/ws-save",
+      sessionId: "session-ws-save",
+      lastEntryId: "entry-5",
+      leafId: "entry-4",
+    });
+
+    // The file records the durable append cursor under the canonical
+    // `lastSeenEntryId` key plus the transient `leafId`; the legacy
+    // `lastEntryId` key is no longer written.
+    const content = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
+    const record = content["ws-save"] as Record<string, unknown>;
+    assert.equal(record.lastSeenEntryId, "entry-5");
+    assert.equal(record.leafId, "entry-4");
+    assert.equal(record.lastEntryId, undefined);
+
+    // Loading returns the compact compat shape: the durable append cursor
+    // under `lastEntryId` plus the active leaf restored as an independent
+    // field.
+    const loaded = await store.load("ws-save");
+    assert.deepEqual(loaded, {
+      workspace: "ws-save",
+      sessionFile: "/home/pi/.pi/agent/sessions/ws-save",
+      sessionId: "session-ws-save",
+      lastEntryId: "entry-5",
+      leafId: "entry-4",
+    });
   });
 });
