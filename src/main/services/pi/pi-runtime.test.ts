@@ -929,3 +929,42 @@ test("a failed reconnect closes the transport and preserves queued work for retr
 
   await runtime.stop();
 });
+test("a reconnect that cannot resume the old session never creates a fresh Pi session", async () => {
+  const store = fakeStore(null);
+  const cancelledResume = (command: WireCommand): Record<string, unknown> =>
+    command.type === "switch_session" ? { cancelled: true } : reconnectResponses(command);
+  const { runtime, transports } = runtimeWithTransportSequence(
+    [new FakeTransport(reconnectResponses), new FakeTransport(cancelledResume), new FakeTransport(reconnectResponses)],
+    store,
+  );
+
+  await runtime.start(workspace);
+  transports[0].emitExit(1, "SIGTERM");
+  await flushMicrotasks();
+  await runtime.sendPrompt("queued prompt");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 1);
+
+  await assert.rejects(runtime.reconnect(), /did not resume the existing session/);
+  assert.deepEqual(
+    transports[1].writtenCommands().map((command) => command.type),
+    ["switch_session"],
+  );
+  assert.equal(runtime.snapshot.state, "disconnected");
+  assert.equal(runtime.snapshot.sessionId, "pi-session-1");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 1);
+  assert.ok(
+    runtime.conversationSnapshot.timeline.some(
+      (record) => record.type === "message" && record.content === "first prompt",
+    ),
+    "the old conversation must remain visible when resume fails",
+  );
+
+  await runtime.reconnect();
+  assert.deepEqual(
+    transports[2].writtenCommands().map((command) => command.type),
+    ["switch_session", "get_state", "get_entries", "prompt"],
+  );
+  assert.equal(runtime.snapshot.state, "ready");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 0);
+  await runtime.stop();
+});
