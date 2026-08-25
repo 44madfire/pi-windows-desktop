@@ -271,8 +271,8 @@ export class PiRuntimeController {
    * Reconnect the existing disconnected client/session/conversation.
    *
    * Replaces the Pi transport (`client.reconnect()`), then re-runs the
-   * session handshake (`switch_session` with soft fallback, then
-   * `get_state`), catch-up from the durable append cursor (`get_entries`),
+   * session handshake (`switch_session` with strict resume semantics),
+   * `get_state`, catch-up from the durable append cursor (`get_entries`),
    * conversation hydration, and pointer persistence. `ready` is published
    * only after that handshake completes, and only then are prompts queued
    * while disconnected resumed — no prompt is sent before the handshake.
@@ -290,8 +290,8 @@ export class PiRuntimeController {
     if (!client || !session || !conversation || !workspace) {
       throw new Error('Pi is not running. Start Pi before reconnecting.');
     }
-    if (this.snapshotValue.state === 'stopping') {
-      throw new Error('Pi is stopping. Wait for it to stop before reconnecting.');
+    if (this.snapshotValue.state !== 'disconnected') {
+      throw new Error(`Cannot reconnect Pi while runtime is ${this.snapshotValue.state}`);
     }
 
     const workspaceKey = sessionWorkspaceKey(workspace);
