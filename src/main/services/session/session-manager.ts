@@ -141,13 +141,12 @@ export interface SessionOpenOptions {
    * persisted session file again before history catch-up.
    */
   readonly force?: boolean;
-}
-
-export interface SessionForkResult {
-  readonly sessionId: string | null;
-  readonly entryId: string;
-  readonly data: JsonValue | null;
-  readonly snapshot: SessionSnapshot;
+  /**
+   * Permit a failed/cancelled switch_session to create a fresh session.
+   * Initial startup permits this by default; reconnect callers disable it so
+   * an old conversation cannot be paired with a new Pi session.
+   */
+  readonly fallbackToNewSession?: boolean;
 }
 
 export type SessionManagerErrorCode =
@@ -156,7 +155,8 @@ export type SessionManagerErrorCode =
   | "INVALID_ENTRY_ID"
   | "INVALID_COMMAND"
   | "INVALID_RESPONSE"
-  | "RPC_FAILURE";
+  | "RPC_FAILURE"
+  | "SESSION_NOT_RESUMED";
 
 export class SessionManagerError extends Error {
   readonly code: SessionManagerErrorCode;
@@ -577,6 +577,13 @@ export class SessionManager {
       try {
         const resumed = target !== null ? await this.trySwitchSession(client, target) : false;
         if (!resumed) {
+          if (options.fallbackToNewSession === false) {
+            throw new SessionManagerError(
+              "SESSION_NOT_RESUMED",
+              "open",
+              "Pi did not resume the existing session",
+            );
+          }
           // The persisted session could not be resumed: drop the stale
           // identity and cursor before starting a fresh session so the
           // `new_session -> get_state -> get_entries` sequence sends no
