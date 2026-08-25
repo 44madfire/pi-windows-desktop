@@ -213,6 +213,23 @@ test("a fresh runtime opens new_session -> get_state -> get_entries before ready
   assert.equal(runtime.snapshot.state, "stopped");
   assert.equal(runtime.snapshot.lastEntryId, null);
 });
+test("reconnect rejects while ready or while another reconnect is active", async () => {
+  const { runtime, transports } = runtimeWithTransportSequence([
+    new FakeTransport(reconnectResponses),
+    new FakeTransport(reconnectResponses),
+  ]);
+
+  await runtime.start(workspace);
+  await assert.rejects(runtime.reconnect(), /runtime is ready/);
+
+  transports[0].emitExit(1, "SIGTERM");
+  await flushMicrotasks();
+  const reconnecting = runtime.reconnect();
+  await assert.rejects(runtime.reconnect(), /runtime is starting/);
+  await reconnecting;
+  await runtime.stop();
+});
+
 
 test("start rejects and terminates the transport when a post-connect handshake request fails", async () => {
   const transport = new FakeTransport(defaultResponses, {
