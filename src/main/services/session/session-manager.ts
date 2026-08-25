@@ -149,6 +149,13 @@ export interface SessionOpenOptions {
   readonly fallbackToNewSession?: boolean;
 }
 
+export interface SessionForkResult {
+  readonly sessionId: string | null;
+  readonly entryId: string;
+  readonly data: JsonValue | null;
+  readonly snapshot: SessionSnapshot;
+}
+
 export type SessionManagerErrorCode =
   | "NO_CLIENT"
   | "INVALID_STATE"
