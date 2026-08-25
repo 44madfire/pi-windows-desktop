@@ -558,11 +558,13 @@ export class SessionManager {
    * Open the Pi-owned session and read its authoritative identity.
    *
    * Handshake: when a persisted session file is supplied, `switch_session` is
-   * tried first; a cancellation (`cancelled: true`) or any failure degrades
-   * softly to `new_session`. The successful open is always followed by
-   * `get_state`, whose `sessionFile` (falling back to `sessionId`) is the
-   * authoritative session identity. Pi owns the session file; the caller
-   * persists only this pointer.
+   * tried first. By default, cancellation (`cancelled: true`) or any failure
+   * degrades softly to `new_session`; callers may set
+   * `fallbackToNewSession: false` to reject instead and preserve the old
+   * identity/cursor for strict reconnect. The successful open is always
+   * followed by `get_state`, whose `sessionFile` (falling back to `sessionId`)
+   * is the authoritative session identity. Pi owns the session file; the
+   * caller persists only this pointer.
    */
   openSession(sessionFile: string | null, options: SessionOpenOptions = {}): Promise<SessionOpenResult> {
     return this.enqueue(async () => {
@@ -736,11 +738,12 @@ export class SessionManager {
       }
     });
   }
-
   /**
    * Attempt `switch_session` against a persisted Pi session file. Returns
-   * true when Pi accepted it; cancellation and RPC failures degrade softly to
-   * false so the caller falls back to `new_session` without failing startup.
+   * true when Pi accepted it; cancellation and RPC failures return false so
+   * the caller can choose the default fresh-session fallback or reject for a
+   * strict reconnect. The original failure is intentionally normalized here;
+   * callers that need diagnostics receive the session-level error.
    */
   private async trySwitchSession(
     client: SessionPiRpcClient,
