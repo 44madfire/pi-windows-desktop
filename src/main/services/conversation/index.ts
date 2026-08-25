@@ -14,6 +14,17 @@ export type { ConversationEvent, ConversationSnapshot } from '../../../shared/co
 type Prompt = { id: number; message: string };
 type Listener = (event: ConversationEvent) => void;
 
+/**
+ * Optional post-settle hook wired by the runtime: after `agent_settled`
+ * completes the active turn, the controller keeps the queue paused while the
+ * hook runs (synchronize -> reconcile -> persist), and only then dispatches
+ * the next queued prompt. A rejected hook leaves the queue paused with a
+ * visible error state; the reconnect handshake resumes it.
+ */
+export interface ConversationControllerOptions {
+  readonly onSettle?: () => Promise<void>;
+}
+
 /** Streaming accumulation for the assistant message currently being produced. */
 interface StreamingAssistant {
   /** content-block index -> accumulated visible text */
@@ -170,6 +181,35 @@ function collectToolCalls(entries: readonly unknown[]): Map<string, HydratedTool
 }
 
 /**
+ * Stable identity match between a projected authoritative record and a live
+ * timeline record. Messages match by role plus identical content; tool/bash
+ * records match by tool identity (name, input/command, and output) when the
+ * two sides do not already share the Pi toolCallId.
+ */
+function recordMatches(
+  record: ConversationTimelineRecord,
+  candidate: ConversationTimelineRecord,
+): boolean {
+  if (record.type === 'message') {
+    return (
+      candidate.type === 'message' &&
+      candidate.role === record.role &&
+      candidate.content === record.content
+    );
+  }
+  if (candidate.type !== record.type) return false;
+  if (record.type === 'bash') {
+    if (candidate.type !== 'bash') return false;
+    return candidate.command === record.command && (candidate.output ?? '') === (record.output ?? '');
+  }
+  return (
+    candidate.name === record.name &&
+    (candidate.input ?? '') === (record.input ?? '') &&
+    (candidate.output ?? '') === (record.output ?? '')
+  );
+}
+
+/**
  * Project one raw Pi session entry into a timeline record. Entries that are
  * not user/assistant message entries or tool results (compactions, model
  * changes, custom entries, ...) project to null.
@@ -242,6 +282,9 @@ export class ConversationController {
   /** Entry/tool-call ids already projected by hydrate, for idempotent replays. */
   private readonly hydratedRecordIds = new Set<string>();
   private readonly hydratedToolCalls = new Map<string, HydratedToolCall>();
+  /** Live record ids already matched to an authoritative Pi entry. */
+  private readonly reconciledRecordIds = new Set<string>();
+  private readonly onSettle: (() => Promise<void>) | null;
   private promptId = 0;
   private recordId = 0;
   private activePrompt: Prompt | null = null;
@@ -262,8 +305,9 @@ export class ConversationController {
     error: null,
   };
 
-  constructor(client: PiRpcClient) {
+  constructor(client: PiRpcClient, options: ConversationControllerOptions = {}) {
     this.client = client;
+    this.onSettle = options.onSettle ?? null;
     this.client.onEvent((event) => this.handleEvent(event));
     this.client.onError((error) => {
       const message = error instanceof Error ? error.message : String(error);
@@ -297,28 +341,75 @@ export class ConversationController {
    * Project raw Pi session entries (the `entries` of a `get_entries` response)
    * into the same timeline the live reducer appends to.
    *
-   * Idempotent: records are keyed by their Pi entry/tool-call id, so replaying
+   * Idempotent: entries are keyed by their Pi entry/tool-call id, so replaying
    * the same entries (a second synchronize, a reconnection) never duplicates
-   * history, and a record already created by the live reducer is never
-   * clobbered. Hydration only appends records; it does not change execution
-   * state, the queue, or streaming state, and a later live message is a new
-   * record appended after the hydrated history.
+   * history. A live record created during this process that already represents
+   * an authoritative entry (same role/content or stable tool identity) is
+   * reconciled instead of appended: its Pi entry id is remembered as known and
+   * only genuinely new history is appended. Hydration does not change
+   * execution state, the queue, or streaming state, and a later live message
+   * is a new record appended after the hydrated history.
    */
   hydrate(entries: readonly unknown[]): void {
     const toolCalls = collectToolCalls(entries);
     for (const [id, call] of toolCalls) this.hydratedToolCalls.set(id, call);
+
+    // Live records claimed by an authoritative entry during this pass: a
+    // duplicate Pi entry must never claim the same live record twice.
+    const matchedLive = new Set<string>();
 
     let changed = false;
     for (const raw of entries) {
       const record = projectEntry(raw, this.hydratedToolCalls);
       if (!record) continue;
       if (this.hydratedRecordIds.has(record.id)) continue;
-      if (this.records.some((existing) => existing.id === record.id)) continue;
+
+      // An identical id is already on the timeline (live tool records share
+      // Pi's toolCallId; a previous hydrate appended the entry): the entry is
+      // known and must never append again.
+      if (this.records.some((existing) => existing.id === record.id)) {
+        this.hydratedRecordIds.add(record.id);
+        continue;
+      }
+
+      // A live record created during this process may already represent the
+      // authoritative entry (same role/content or stable tool identity):
+      // claim it, remember the Pi entry id, and never append a duplicate.
+      const live = this.findUnmatchedLiveRecord(record, matchedLive);
+      if (live) {
+        this.hydratedRecordIds.add(record.id);
+        this.reconciledRecordIds.add(live.id);
+        matchedLive.add(live.id);
+        continue;
+      }
+
+      // Genuinely new history: append and remember the Pi entry id.
       this.hydratedRecordIds.add(record.id);
       this.records.push(record);
       changed = true;
     }
     if (changed) this.publish();
+  }
+
+  /**
+   * Find the earliest live record that represents the same authoritative
+   * turn entry, so the entry is reconciled instead of appended. Only records
+   * that have not already been claimed by an authoritative entry (this pass
+   * or an earlier one) are eligible, so a replayed entry never matches
+   * twice and a duplicate entry with identical content cannot claim a record
+   * that already represents a different entry.
+   */
+  private findUnmatchedLiveRecord(
+    record: ConversationTimelineRecord,
+    matchedLive: Set<string>,
+  ): ConversationTimelineRecord | undefined {
+    for (const candidate of this.records) {
+      if (matchedLive.has(candidate.id)) continue;
+      if (this.reconciledRecordIds.has(candidate.id)) continue;
+      if (this.hydratedRecordIds.has(candidate.id)) continue;
+      if (recordMatches(record, candidate)) return candidate;
+    }
+    return undefined;
   }
 
   async sendPrompt(message: string): Promise<void> {
@@ -532,7 +623,31 @@ export class ConversationController {
     this.finishStreaming(status);
     this.activePrompt = null;
     this.setState('idle', null);
-    void this.processNext();
+    void this.settleThenDispatch();
+  }
+
+  /**
+   * Dispatch the next queued prompt only after the post-settled
+   * synchronization. The queue stays paused while the runtime's settle hook
+   * runs (synchronize -> reconcile -> persist); a rejected hook leaves the
+   * queue paused with a visible error state and the reconnect handshake is
+   * the recovery seam. Without a hook the pre-existing immediate dispatch is
+   * preserved.
+   */
+  private async settleThenDispatch(): Promise<void> {
+    const hook = this.onSettle;
+    if (!hook) {
+      void this.processNext();
+      return;
+    }
+    this.queuePaused = true;
+    try {
+      await hook();
+      this.queuePaused = false;
+      void this.processNext();
+    } catch (error) {
+      this.setState('error', error instanceof Error ? error.message : String(error));
+    }
   }
 
   private startTool(event: Record<string, unknown>): void {
