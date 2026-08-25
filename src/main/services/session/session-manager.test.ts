@@ -144,6 +144,50 @@ test("resume and synchronize use injectable command builders and keep Pi records
   assert.equal(manager.snapshot.lastError, null);
 });
 
+test("synchronize accepts an explicit since override while preserving the manager cursor", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ entries: [{ id: "entry-1" }, { id: "entry-2" }], leafId: "entry-2" });
+  const manager = new SessionManager({
+    client,
+    sessionId: "session-8",
+    lastEntryId: "entry-9",
+  });
+
+  // A cold start forces the full entry list (no `since` cursor) even though
+  // the manager holds a durable cursor; the override never mutates the
+  // in-memory cursor before the response.
+  const result = await manager.synchronize({ since: null });
+
+  assert.deepEqual(client.commands, [{ type: "get_entries" }]);
+  assert.equal(result?.requestedAfter, null);
+  assert.equal(result?.entryCount, 2);
+  assert.equal(manager.lastEntryId, "entry-2");
+
+  // The next request without an override stays incremental from the
+  // (re-anchored) durable cursor.
+  client.queueResponse({ entries: [{ id: "entry-3" }], leafId: "entry-3" });
+  const incremental = await manager.synchronize();
+
+  assert.deepEqual(client.commands, [
+    { type: "get_entries" },
+    { type: "get_entries", since: "entry-2" },
+  ]);
+  assert.equal(incremental?.requestedAfter, "entry-2");
+  assert.equal(manager.lastEntryId, "entry-3");
+});
+
+test("synchronize with an explicit cursor override requests exactly that cursor", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ entries: [{ id: "entry-5" }], leafId: "entry-5" });
+  const manager = new SessionManager({ client, sessionId: "session-9", lastEntryId: "entry-1" });
+
+  const result = await manager.synchronize({ since: "entry-4" });
+
+  assert.deepEqual(client.commands, [{ type: "get_entries", since: "entry-4" }]);
+  assert.equal(result?.requestedAfter, "entry-4");
+  assert.equal(manager.lastEntryId, "entry-5");
+});
+
 test("initial synchronization requests the full entry list without a since cursor", async () => {
   const client = new FakePiRpcClient();
   client.queueResponse({ entries: [{ id: "e1" }], leafId: "e1" });
