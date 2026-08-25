@@ -125,6 +125,19 @@ export interface SessionSynchronizationResult {
   readonly entryCount: number;
 }
 
+export interface SessionSynchronizeOptions {
+  /**
+   * Explicit `since` cursor for this request. `null` requests the full entry
+   * list (`get_entries` without a `since` cursor), overriding the manager's
+   * durable append cursor — used by a cold start that creates a fresh
+   * conversation with an empty timeline. Omitted keeps the incremental
+   * default (request after `lastSeenEntryId`). The override is request-scoped:
+   * it never mutates the in-memory cursor before the response, and the
+   * response re-anchors the cursor at the last observed append entry as usual.
+   */
+  readonly since?: SessionCursor;
+}
+
 /** Outcome of the open handshake: resume (switch) or fresh session plus state. */
 export interface SessionOpenResult {
   readonly sessionId: string | null;
@@ -656,13 +669,20 @@ export class SessionManager {
     });
   }
 
-  /** Request Pi-owned records after the current last-entry cursor. */
-  synchronize(): Promise<SessionSynchronizationResult> {
+  /**
+   * Request Pi-owned records after the current last-entry cursor. Pass
+   * `{ since: null }` to force the full entry list (no `since` cursor) —
+   * used by a cold start that creates a fresh conversation with an empty
+   * timeline — or `{ since: <cursor> }` for an explicit replay position.
+   * Without an override the durable append cursor (`lastSeenEntryId`) drives
+   * the incremental request.
+   */
+  synchronize(options: SessionSynchronizeOptions = {}): Promise<SessionSynchronizationResult> {
     return this.enqueue(async () => {
       this.assertState("synchronize", [...recoverableStates]);
       this.requireClient("synchronize");
       this.clearError();
-      return this.synchronizeInternal("synchronize");
+      return this.synchronizeInternal("synchronize", options.since);
     });
   }
 
@@ -783,9 +803,16 @@ export class SessionManager {
     };
   }
 
-  private synchronizeInternal(operation: "resume" | "reconnect" | "synchronize"): Promise<SessionSynchronizationResult> {
+  private synchronizeInternal(
+    operation: "resume" | "reconnect" | "synchronize",
+    requestedSince?: SessionCursor,
+  ): Promise<SessionSynchronizationResult> {
     const client = this.requireClient(operation);
-    const previousLastEntryId = this.lastSeenEntryIdValue;
+    // An explicit `since` override (including an explicit null for the full
+    // entry list) wins; otherwise the durable append cursor drives the
+    // incremental catch-up.
+    const previousLastEntryId =
+      requestedSince === undefined ? this.lastSeenEntryIdValue : requestedSince;
     this.setState("synchronizing");
 
     return this.request(

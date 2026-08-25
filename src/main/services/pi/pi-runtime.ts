@@ -24,11 +24,19 @@ export interface PiRuntimeOptions {
 }
 
 /**
- * Runtime snapshot including Pi session identity and cursor state. The shared
- * `PiRuntimeSnapshot` carries all fields via the host IPC slice; this local
- * alias keeps the session core self-contained either way.
+ * Runtime snapshot including Pi session identity and cursor state. The
+ * shared `PiRuntimeSnapshot` carries all fields via the host IPC slice; this
+ * local extension adds the non-fatal pointer-persistence warning so the
+ * session core can report it without widening the shared type.
  */
-export type PiRuntimeSessionSnapshot = PiRuntimeSnapshot;
+export interface PiRuntimeSessionSnapshot extends PiRuntimeSnapshot {
+  /**
+   * Last non-fatal runtime warning — currently a failed best-effort session
+   * pointer save. Never an error: the runtime stays ready and the queue
+   * keeps dispatching. Cleared by the next successful save.
+   */
+  lastWarning: string | null;
+}
 
 /** Stable workspace key used for session pointer persistence. */
 export function sessionWorkspaceKey(workspace: WslWorkspace): string {
@@ -111,6 +119,7 @@ export class PiRuntimeController {
     workspace: null,
     piVersion: null,
     lastError: null,
+    lastWarning: null,
     lastSeenEntryId: null,
     leafId: null,
     lastEntryId: null,
@@ -139,9 +148,10 @@ export class PiRuntimeController {
   /**
    * Handshake-based startup: load the persisted pointer, connect the
    * transport, open the Pi session (`switch_session` with soft fallback to
-   * `new_session`, then `get_state`), catch up from the durable cursor
-   * (`get_entries`), hydrate the conversation, persist the resulting pointer,
-   * and only then publish `ready`.
+   * `new_session`, then `get_state`), request the full entry list
+   * (`get_entries` without `since`) so the fresh conversation re-hydrates
+   * the complete history, persist the resulting pointer (best effort), and
+   * only then publish `ready`.
    */
   private async startInternal(workspace: WslWorkspace): Promise<PiRuntimeSnapshot> {
     if (this.snapshotValue.state === 'ready' || this.snapshotValue.state === 'starting') {
@@ -173,6 +183,7 @@ export class PiRuntimeController {
       state: 'starting',
       workspace,
       lastError: null,
+      lastWarning: null,
       lastSeenEntryId: previousCursor,
       lastEntryId: previousCursor,
       leafId: previousLeafId,
@@ -227,7 +238,7 @@ export class PiRuntimeController {
           this.setSnapshot(patch);
           if (sessionSnapshot.lastSeenEntryId !== null) {
             // Re-persist whenever a synchronization produces a durable cursor.
-            void this.persistPointer(workspaceKey, session).catch(() => undefined);
+            void this.persistPointer(workspaceKey, session);
           }
         }
       });
@@ -261,7 +272,13 @@ export class PiRuntimeController {
       // The Pi process is only "ready" after the session handshake, history
       // catch-up, hydration, and pointer persistence have all completed.
       await session.openSession(previousSessionFile);
-      const sync = await session.synchronize();
+      // A cold start creates a fresh ConversationController with an empty
+      // timeline: request the full entry list (no `since` cursor) so a clean
+      // restart re-hydrates the complete user/assistant history even when
+      // the persisted append cursor is at the tail. The override is
+      // request-scoped — the restored cursor stays in memory, and reconnect
+      // and post-settle synchronization keep catching up incrementally.
+      const sync = await session.synchronize({ since: null });
       conversation.hydrate(sync.entries);
       await this.persistPointer(workspaceKey, session);
 
@@ -349,7 +366,7 @@ export class PiRuntimeController {
     }
 
     const workspaceKey = sessionWorkspaceKey(workspace);
-    this.setSnapshot({ state: 'starting', workspace, lastError: null });
+    this.setSnapshot({ state: 'starting', workspace, lastError: null, lastWarning: null });
     try {
       // Replace the transport. Pending requests are rejected and are not
       // replayed: Pi may have accepted a command before the transport died.
@@ -453,7 +470,7 @@ export class PiRuntimeController {
       await client.close();
     } finally {
       if (session && workspace) {
-        await this.persistPointer(sessionWorkspaceKey(workspace), session).catch(() => undefined);
+        await this.persistPointer(sessionWorkspaceKey(workspace), session);
       }
       this.session = null;
       this.setSnapshot({ state: 'stopped', workspace: null, piVersion: null });
@@ -506,7 +523,15 @@ export class PiRuntimeController {
     }
   }
 
-  /** Persist the current session pointer. Failures are non-fatal: Pi remains authoritative. */
+  /**
+   * Persist the current session pointer. Persistence is best effort: Pi stays
+   * authoritative for the session, so a failed save never rejects the healthy
+   * startup, reconnect, or post-settle path. The failure is reported as a
+   * visible runtime warning (`lastWarning`, published via the runtime event
+   * channel) while the runtime keeps running and the queue keeps dispatching;
+   * the next successful save clears it. The in-memory cursor state is never
+   * affected.
+   */
   private async persistPointer(workspaceKey: string, session: SessionManager): Promise<void> {
     if (!this.sessionStore) return;
     const pointer: SessionPointer = {
@@ -518,7 +543,17 @@ export class PiRuntimeController {
       lastEntryId: session.lastSeenEntryId,
       leafId: session.leafId,
     };
-    await this.sessionStore.save(pointer);
+    try {
+      await this.sessionStore.save(pointer);
+    } catch (error) {
+      this.setSnapshot({
+        lastWarning: `Failed to persist the Pi session pointer: ${errorMessage(error)}`,
+      });
+      return;
+    }
+    if (this.snapshotValue.lastWarning !== null) {
+      this.setSnapshot({ lastWarning: null });
+    }
   }
 
   /**
