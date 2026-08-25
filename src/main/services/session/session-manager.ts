@@ -752,8 +752,14 @@ export class SessionManager {
     const command = validateCommand(this.commands.switchSession(sessionFile), "switch");
     try {
       const response = await this.request(client, command, "switch");
+      // A cancelled switch is a soft-fallback signal, not a successful
+      // resume: metadata Pi may attach even to a cancelled response
+      // (identity/cursor fields) must not be applied before the caller
+      // decides between fresh-session fallback and strict rejection, so the
+      // old identity and durable cursor survive a cancelled strict reconnect.
+      if (isCancelled(response)) return false;
       this.applyResponseMetadata(response);
-      return !isCancelled(response);
+      return true;
     } catch {
       return false;
     }

@@ -2,7 +2,7 @@ import type { PiEvent, PiRuntimeSnapshot, WslWorkspace } from '../../../shared/i
 import { WslManager, type PiExecutableProbe } from '../../wsl/index.ts';
 import { PiRpcClient, type PiRpcTransport } from './index.ts';
 import { createWslPiTransport } from './wsl-process-transport.ts';
-import { SessionManager } from '../session/session-manager.ts';
+import { SessionManager, type SessionSynchronizationResult } from '../session/session-manager.ts';
 import { type SessionPointer, type SessionStore } from '../session/session-store.ts';
 import { ConversationController } from '../conversation/index.ts';
 import type { ConversationSnapshot } from '../../../shared/conversation.ts';
@@ -97,6 +97,15 @@ export class PiRuntimeController {
   private client: PiRpcClient | null = null;
   private conversation: ConversationController | null = null;
   private session: SessionManager | null = null;
+  /**
+   * Serializes lifecycle mutations (start/stop/reconnect). Public lifecycle
+   * methods enqueue their internal bodies so overlapping calls run one at a
+   * time; internal cross-calls (start -> stop/reconnect) use the internal
+   * bodies directly so the tail never deadlocks on a nested enqueue.
+   */
+  private operationTail: Promise<void> = Promise.resolve();
+  /** Lifecycle operations currently enqueued or running, for immediate rejection. */
+  private lifecycleInFlight = 0;
   private snapshotValue: PiRuntimeSessionSnapshot = {
     state: 'stopped',
     workspace: null,
@@ -121,15 +130,22 @@ export class PiRuntimeController {
   }
 
   /**
+   * Serialized lifecycle entry: see {@link startInternal}.
+   */
+  start(workspace: WslWorkspace): Promise<PiRuntimeSnapshot> {
+    return this.enqueueLifecycle(() => this.startInternal(workspace));
+  }
+
+  /**
    * Handshake-based startup: load the persisted pointer, connect the
    * transport, open the Pi session (`switch_session` with soft fallback to
    * `new_session`, then `get_state`), catch up from the durable cursor
    * (`get_entries`), hydrate the conversation, persist the resulting pointer,
    * and only then publish `ready`.
    */
-  async start(workspace: WslWorkspace): Promise<PiRuntimeSnapshot> {
+  private async startInternal(workspace: WslWorkspace): Promise<PiRuntimeSnapshot> {
     if (this.snapshotValue.state === 'ready' || this.snapshotValue.state === 'starting') {
-      await this.stop();
+      await this.stopInternal();
     }
 
     const sameWorkspace =
@@ -141,7 +157,7 @@ export class PiRuntimeController {
     // reconnect seam; a fresh start would create a second, unhandshaken
     // conversation and lose the queue.
     if (this.snapshotValue.state === 'disconnected' && sameWorkspace) {
-      return this.reconnect();
+      return this.reconnectInternal();
     }
 
     const workspaceKey = sessionWorkspaceKey(workspace);
@@ -178,8 +194,6 @@ export class PiRuntimeController {
         transportFactory: () => this.createTransport({ distro: workspace.distro, linuxPath: workspace.linuxPath, piExecutable }),
       });
       this.client = client;
-      this.conversation = new ConversationController(client);
-      this.conversation.onEvent((event) => this.handlers.onEvent?.(event));
       const session = new SessionManager({
         sessionId: previousSessionId,
         sessionFile: previousSessionFile,
@@ -216,6 +230,21 @@ export class PiRuntimeController {
           }
         }
       });
+      const conversation = new ConversationController(client, {
+        // After agent_settled completes a turn, synchronize get_entries from
+        // the durable append cursor, reconcile the authoritative entries with
+        // the live timeline, and persist the resulting pointer. The controller
+        // keeps its queue paused until this resolves, so the next queued
+        // prompt is never dispatched before the post-settled sync. The
+        // lifecycle tail serializes this against start/stop/reconnect.
+        onSettle: () =>
+          this.enqueueLifecycle(() =>
+            this.synchronizeAfterSettle(workspaceKey, client, session, conversation),
+          ),
+      });
+      this.conversation = conversation;
+      conversation.onEvent((event) => this.handlers.onEvent?.(event));
+
       client.onEvent((event) => {
         this.handlers.onEvent?.({ type: 'protocol', message: event });
       });
@@ -268,6 +297,29 @@ export class PiRuntimeController {
   }
 
   /**
+   * Serialized lifecycle entry with an immediate deterministic guard: a
+   * reconnect is rejected at call time when the runtime is not disconnected
+   * or another lifecycle operation is still in flight, and is otherwise
+   * queued behind any running lifecycle operation. See {@link reconnectInternal}.
+   */
+  async reconnect(): Promise<PiRuntimeSnapshot> {
+    const workspace = this.snapshotValue.workspace;
+    if (!this.client || !this.session || !this.conversation || !workspace) {
+      throw new Error('Pi is not running. Start Pi before reconnecting.');
+    }
+    if (this.lifecycleInFlight > 0 || this.snapshotValue.state !== 'disconnected') {
+      const state = this.snapshotValue.state === 'disconnected' ? 'starting' : this.snapshotValue.state;
+      throw new Error(`Cannot reconnect Pi while runtime is ${state}`);
+    }
+    this.lifecycleInFlight += 1;
+    try {
+      return await this.enqueueLifecycle(() => this.reconnectInternal());
+    } finally {
+      this.lifecycleInFlight -= 1;
+    }
+  }
+
+  /**
    * Reconnect the existing disconnected client/session/conversation.
    *
    * Replaces the Pi transport (`client.reconnect()`), then re-runs the
@@ -282,7 +334,7 @@ export class PiRuntimeController {
    * and the durable cursor survive for a later retry via `reconnect()` or a
    * same-workspace `start()`.
    */
-  async reconnect(): Promise<PiRuntimeSnapshot> {
+  private async reconnectInternal(): Promise<PiRuntimeSnapshot> {
     const client = this.client;
     const session = this.session;
     const conversation = this.conversation;
@@ -341,8 +393,49 @@ export class PiRuntimeController {
     }
   }
 
+  /**
+   * Post-settle synchronization for the runtime wiring that created it:
+   * catch up get_entries from the durable cursor, reconcile the
+   * authoritative entries with the live timeline (idempotent), and persist
+   * the resulting pointer. Runs on the lifecycle tail so it never overlaps
+   * start/stop/reconnect. When the wiring is no longer live (the runtime was
+   * stopped) it rejects so the conversation keeps its queue paused instead
+   * of dispatching into a dead runtime.
+   */
+  private async synchronizeAfterSettle(
+    workspaceKey: string,
+    client: PiRpcClient,
+    session: SessionManager,
+    conversation: ConversationController,
+  ): Promise<void> {
+    if (this.client !== client || this.session !== session || this.conversation !== conversation) {
+      throw new Error('Pi runtime wiring changed before the post-settled synchronization');
+    }
+    let sync: SessionSynchronizationResult;
+    try {
+      sync = await session.synchronize();
+    } catch (error) {
+      // The post-settled catch-up failed (transport or RPC). The session is
+      // already marked disconnected by the manager; surface the same state
+      // here so the reconnect seam is the recovery path, and rethrow so the
+      // conversation keeps its queue paused with a visible error.
+      this.setSnapshot({ state: 'disconnected', lastError: errorMessage(error) });
+      throw error;
+    }
+    if (this.client !== client || this.session !== session) return;
+    conversation.hydrate(sync.entries);
+    await this.persistPointer(workspaceKey, session);
+  }
+
+  /**
+   * Serialized lifecycle entry: see {@link stopInternal}.
+   */
+  stop(): Promise<PiRuntimeSnapshot> {
+    return this.enqueueLifecycle(() => this.stopInternal());
+  }
+
   /** Persist the current session pointer before resolving, so quit awaits it. */
-  async stop(): Promise<PiRuntimeSnapshot> {
+  private async stopInternal(): Promise<PiRuntimeSnapshot> {
     if (!this.client) {
       this.setSnapshot({ state: 'stopped', workspace: null });
       return this.snapshot;
@@ -424,6 +517,20 @@ export class PiRuntimeController {
       leafId: session.leafId,
     };
     await this.sessionStore.save(pointer);
+  }
+
+  /**
+   * Serialize one lifecycle operation behind the tail. A rejected operation
+   * never blocks the next one, and the returned promise carries the
+   * rejection to the caller.
+   */
+  private enqueueLifecycle<T>(operation: () => Promise<T>): Promise<T> {
+    const next = this.operationTail.then(operation, operation);
+    this.operationTail = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
   }
 
   private setSnapshot(patch: Partial<PiRuntimeSessionSnapshot>): void {
