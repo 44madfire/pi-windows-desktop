@@ -327,11 +327,13 @@ export class PiRpcClient {
    * listeners. An id that is already pending in `request()` is rejected to
    * protect correlation.
    *
-   * Throws synchronously for invalid commands or unserializable values. When
-   * the transport is not ready the write is queued behind `connect()`; errors
-   * on that path surface through the error listeners.
+   * Throws synchronously for invalid commands, invalid ids, or unserializable
+   * values. When the transport is not ready the write is queued behind
+   * `connect()`; readiness failures and asynchronous `stdin.write()` rejections
+   * reject the returned promise and also surface through the error listeners
+   * with the client transitioned to disconnected.
    */
-  write(command: PiRpcCommand): void {
+  write(command: PiRpcCommand): Promise<void> {
     const normalized = this.normalizeCommand(command);
 
     if (normalized.id !== undefined) {
@@ -352,12 +354,9 @@ export class PiRpcClient {
     const frame = serializePiRpcCommand(normalized);
     const ready = this.ensureReady();
     if (ready instanceof Promise) {
-      ready
-        .then((active) => this.writeFrame(active, frame))
-        .catch(() => undefined);
-      return;
+      return ready.then((active) => this.writeFrame(active, frame));
     }
-    this.writeFrame(ready, frame);
+    return this.writeFrame(ready, frame);
   }
 
   onEvent(listener: PiRpcEventListener): () => void {
@@ -631,22 +630,29 @@ export class PiRpcClient {
     this.notifyError(error);
   }
 
-  private writeFrame(active: ActiveTransport, frame: string): void {
+  private writeFrame(active: ActiveTransport, frame: string): Promise<void> {
     if (this.activeTransport !== active || this.stateValue !== "ready") {
       // The transport went away between connect() and the write; the
       // disconnect already notified error listeners.
-      return;
+      return Promise.reject(
+        new PiRpcTransportError("Pi RPC transport is no longer ready", "process"),
+      );
     }
 
     try {
       const writeResult = active.transport.stdin.write(frame);
-      void Promise.resolve(writeResult).catch((error: unknown) => {
-        if (this.activeTransport === active) {
-          this.handleTransportFailure(active, error, "stdin");
-        }
-      });
+      return Promise.resolve(writeResult).then(
+        () => undefined,
+        (error: unknown) => {
+          if (this.activeTransport === active) {
+            this.handleTransportFailure(active, error, "stdin");
+          }
+          throw this.asTransportError(error, "stdin");
+        },
+      );
     } catch (error: unknown) {
       this.handleTransportFailure(active, error, "stdin");
+      return Promise.reject(this.asTransportError(error, "stdin"));
     }
   }
 

@@ -62,6 +62,35 @@ function isBashTool(name: string, event: Record<string, unknown>): boolean {
   return name.toLowerCase() === 'bash' || name.toLowerCase() === 'shell' || Boolean(event.command);
 }
 
+/**
+ * Typed adapter for current Pi tool-execution events. Current records carry
+ * the call arguments under `args` (bash -> `{ command }`), the in-flight
+ * output as `partialResult`, and the authoritative final output as
+ * `result.content` with a top-level `isError` status. Legacy records put
+ * `command`/`output`/`exitCode` at the top level; callers fall back to those.
+ */
+interface CurrentToolEvent {
+  readonly toolCallId: string | undefined;
+  readonly toolName: string | undefined;
+  readonly command: string | undefined;
+  readonly partialOutput: string;
+  readonly resultOutput: string;
+  readonly isError: boolean;
+}
+
+function currentToolEvent(event: Record<string, unknown>): CurrentToolEvent {
+  const args = objectValue(event.args);
+  const command = args && typeof args.command === 'string' ? args.command : undefined;
+  return {
+    toolCallId: stringValue(event.toolCallId),
+    toolName: stringValue(event.toolName),
+    command,
+    partialOutput: messageText(event.partialResult),
+    resultOutput: messageText(event.result),
+    isError: event.isError === true,
+  };
+}
+
 /** Assistant message content blocks with their array positions. */
 function contentBlocks(value: unknown): Array<{ index: number; block: Record<string, unknown> }> | null {
   // Session entries carry `message.content` as the bare block array; live
@@ -339,8 +368,13 @@ export class ConversationController {
         break;
       }
       case 'message_update': {
+        // Current Pi emits delta-only updates (`usage` + `assistantMessageEvent`)
+        // with no top-level `message`; legacy updates carry an assistant
+        // `message` with a cumulative content snapshot. Either shape feeds
+        // the streaming reducer; user-role echoes are ignored.
         const message = objectValue(record.message);
-        if (message?.role === 'assistant') {
+        const ame = objectValue(record.assistantMessageEvent);
+        if (message?.role === 'assistant' || ame) {
           this.applyAssistantDelta(record);
           this.setState('streaming', null);
         }
@@ -409,10 +443,27 @@ export class ConversationController {
       }
     }
 
-    // Deltas are the fallback channel: they are applied only while no
-    // cumulative snapshot text of that kind is visible yet.
+    // Deltas address the streamed content block. Current Pi events carry a
+    // `contentIndex` and no snapshot at all; legacy events omit it and are
+    // applied only while no cumulative snapshot text of that kind is visible.
     if (ame) {
-      if (ame.type === 'text_delta' && typeof ame.delta === 'string' && ame.delta.length > 0 && !hasText) {
+      const index = numberValue(ame.contentIndex);
+      if (index !== undefined) {
+        // Deltas are incremental chunks: append literally (a re-sent chunk is
+        // still new stream text). End content is the block's cumulative text,
+        // so it stays grow-only.
+        if (ame.type === 'text_delta' && typeof ame.delta === 'string' && ame.delta.length > 0) {
+          state.textByIndex.set(index, (state.textByIndex.get(index) ?? '') + ame.delta);
+        } else if (ame.type === 'thinking_delta' && typeof ame.delta === 'string' && ame.delta.length > 0) {
+          state.thinkingByIndex.set(index, (state.thinkingByIndex.get(index) ?? '') + ame.delta);
+        } else if (ame.type === 'text_end' && typeof ame.content === 'string' && ame.content.length > 0) {
+          state.textByIndex.set(index, mergeBlockSnapshot(state.textByIndex.get(index) ?? '', ame.content));
+        } else if (ame.type === 'thinking_end' && typeof ame.content === 'string' && ame.content.length > 0) {
+          state.thinkingByIndex.set(index, mergeBlockSnapshot(state.thinkingByIndex.get(index) ?? '', ame.content));
+        }
+        // text_start/thinking_start are markers for a new block; nothing to
+        // accumulate until a delta arrives.
+      } else if (ame.type === 'text_delta' && typeof ame.delta === 'string' && ame.delta.length > 0 && !hasText) {
         state.pendingText += ame.delta;
       } else if (ame.type === 'thinking_delta' && typeof ame.delta === 'string' && ame.delta.length > 0 && !hasThinking) {
         state.pendingThinking += ame.delta;
@@ -460,14 +511,23 @@ export class ConversationController {
   }
 
   private startTool(event: Record<string, unknown>): void {
-    const id = stringValue(event.toolCallId) ?? this.nextRecordId();
-    const name = stringValue(event.toolName) ?? stringValue(event.name) ?? 'Tool';
+    const tool = currentToolEvent(event);
+    const id = tool.toolCallId ?? this.nextRecordId();
+    const name = tool.toolName ?? stringValue(event.name) ?? 'Tool';
     const base = { id, name, status: 'running' as const, createdAt: now() };
     if (isBashTool(name, event)) {
-      const record: ConversationBashRecord = { ...base, type: 'bash', command: stringValue(event.command) ?? stringValue(event.input) ?? name };
+      const record: ConversationBashRecord = {
+        ...base,
+        type: 'bash',
+        command: stringValue(event.command) ?? stringValue(event.input) ?? tool.command ?? name,
+      };
       this.records.push(record);
     } else {
-      const record: ConversationToolRecord = { ...base, type: 'tool', input: stringValue(event.input) ?? stringValue(event.args) };
+      const record: ConversationToolRecord = {
+        ...base,
+        type: 'tool',
+        input: stringValue(event.input) ?? tool.command ?? (typeof event.args === 'string' ? event.args : undefined),
+      };
       this.records.push(record);
     }
     this.activeToolId = id;
@@ -475,27 +535,32 @@ export class ConversationController {
   }
 
   private updateTool(event: Record<string, unknown>): void {
-    const id = stringValue(event.toolCallId) ?? this.activeToolId;
+    const tool = currentToolEvent(event);
+    const id = tool.toolCallId ?? this.activeToolId;
     const target = this.records.find((record) => record.id === id);
     if (!target || (target.type !== 'tool' && target.type !== 'bash')) return;
-    const output = stringValue(event.output) ?? stringValue(event.message) ?? messageText(event.partialResult);
-    if (target.type === 'tool') target.output = output;
-    else target.output = output;
+    const output = stringValue(event.output) ?? stringValue(event.message) ?? tool.partialOutput;
+    if (output) target.output = output;
     this.publish();
   }
 
   private endTool(event: Record<string, unknown>): void {
-    const id = stringValue(event.toolCallId) ?? this.activeToolId;
+    const tool = currentToolEvent(event);
+    const id = tool.toolCallId ?? this.activeToolId;
     const target = this.records.find((record) => record.id === id);
     if (!target || (target.type !== 'tool' && target.type !== 'bash')) return;
     // An end event landing after an abort was requested means the tool was
     // still active when the user cancelled the turn: settle it as cancelled
     // rather than completed/failed.
-    target.status = this.abortRequested ? 'cancelled' : event.isError || event.error ? 'failed' : 'completed';
+    target.status = this.abortRequested ? 'cancelled' : tool.isError || stringValue(event.error) ? 'failed' : 'completed';
     if (target.type === 'bash') {
       const exitCode = Number(event.exitCode);
       if (Number.isFinite(exitCode)) target.exitCode = exitCode;
     }
+    // result.content (current Pi) or a top-level output is the authoritative
+    // final tool output; only overwrite the accumulated partial when present.
+    const finalOutput = stringValue(event.output) ?? tool.resultOutput;
+    if (finalOutput) target.output = finalOutput;
     target.error = stringValue(event.error);
     this.activeToolId = null;
     this.publish();

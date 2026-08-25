@@ -13,7 +13,7 @@ import { WorkspaceInputError } from './workspace.ts';
  * runner.
  */
 export interface WorkspaceFileReader {
-  readFile(input: unknown): Promise<WorkspaceFileReadResult>;
+  readFile(input: unknown, relativePath: string): Promise<WorkspaceFileReadResult>;
 }
 
 export interface WorkspaceGitReader {
@@ -29,9 +29,10 @@ export interface WorkspaceGitReader {
 export async function readWorkspaceFileEnvelope(
   fileService: WorkspaceFileReader,
   input: unknown,
+  relativePath: string,
 ): Promise<WorkspaceFileReadResponse> {
   try {
-    const result = await fileService.readFile(input);
+    const result = await fileService.readFile(input, relativePath);
     return {
       ok: true,
       workspace: result.workspace,

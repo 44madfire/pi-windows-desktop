@@ -480,6 +480,17 @@ export class SessionManager {
       try {
         const resumed = target !== null ? await this.trySwitchSession(client, target) : false;
         if (!resumed) {
+          // The persisted session could not be resumed: drop the stale
+          // identity and cursor before starting a fresh session so the
+          // `new_session -> get_state -> get_entries` sequence sends no
+          // `since` cursor from the abandoned Pi session and adopts the new
+          // authoritative identity.  The reset is published as an explicit
+          // snapshot so observers (e.g. runtime snapshot forwarding) never
+          // retain the abandoned session's pointer data.
+          this.sessionIdValue = null;
+          this.sessionFileValue = null;
+          this.lastEntryIdValue = null;
+          this.emitSnapshot();
           const command = validateCommand(this.commands.create(this.sessionIdValue), "create");
           const response = await this.request(client, command, "create");
           this.applyResponseMetadata(response);

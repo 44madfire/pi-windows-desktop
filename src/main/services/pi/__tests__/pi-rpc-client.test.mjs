@@ -404,3 +404,35 @@ test("write queues behind connect() when the client is not yet ready", async () 
     value: "ok",
   });
 });
+
+test("write surfaces asynchronous stdin write failures to the caller and error path", async () => {
+  const transport = new FakeTransport();
+  const client = new PiRpcClient(() => transport, { defaultTimeoutMs: 100 });
+  const errors = [];
+  client.onError((error) => errors.push(error));
+  await client.connect();
+
+  // Make the underlying stdin.write() fail asynchronously, the way a real
+  // child-process pipe does when the peer disappears mid-write.
+  const writeError = new Error("pipe broken");
+  transport.stdin.writeResult = Promise.reject(writeError);
+
+  // The caller's promise must reject with the transport error...
+  await assert.rejects(
+    client.write({ type: "extension_ui_response", id: "ui-3", value: "ok" }),
+    (error) => {
+      assert.ok(error instanceof PiRpcTransportError);
+      assert.equal(error.source, "stdin");
+      assert.equal(error.cause, writeError);
+      return true;
+    },
+  );
+
+  // ...while the client still funnels the same failure through its error path.
+  await flushMicrotasks();
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].source, "stdin");
+  assert.equal(errors[0].cause, writeError);
+  assert.equal(client.state, "disconnected");
+  assert.ok(transport.killSignals.includes("SIGTERM"));
+});

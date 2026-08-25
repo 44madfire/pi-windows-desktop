@@ -38,6 +38,33 @@
   white-space: nowrap;
 }
 
+.workspace-proof-file-field {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.workspace-proof-file-field span {
+  color: #9aabbe;
+  font-size: 11px;
+}
+
+.workspace-proof-file-field input {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid rgba(167, 191, 222, 0.16);
+  border-radius: 7px;
+  color: #dce7f4;
+  background: rgba(8, 13, 20, 0.48);
+  font: 11px "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+}
+
+.workspace-proof-file-field input:focus {
+  outline: none;
+  border-color: rgba(139, 205, 196, 0.55);
+}
+
 .workspace-proof-button {
   width: 100%;
   justify-content: center;

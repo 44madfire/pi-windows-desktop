@@ -119,9 +119,23 @@ function registerIpcHandlers(): void {
     return piRuntime.sendPrompt(payload.prompt);
   });
   ipcMain.handle(IPC_CHANNELS.abortPrompt, () => piRuntime.abortPrompt());
-  ipcMain.handle(IPC_CHANNELS.readWorkspaceFile, (_event, request: WslWorkspace) =>
-    readWorkspaceFileEnvelope(workspaceFiles, request),
-  );
+  ipcMain.handle(IPC_CHANNELS.readWorkspaceFile, (_event, request: unknown) => {
+    const payload = requireInvokeObject(IPC_CHANNELS.readWorkspaceFile, request);
+    if (
+      payload.workspace === null ||
+      typeof payload.workspace !== 'object' ||
+      Array.isArray(payload.workspace) ||
+      typeof payload.relativePath !== 'string'
+    ) {
+      throw new Error(
+        `Invalid IPC request on "${IPC_CHANNELS.readWorkspaceFile}": "workspace" and "relativePath" are required.`,
+      );
+    }
+    // The workspace root and the relative path are re-validated inside the
+    // service before any WSL command runs; invalid inputs become typed
+    // {ok:false,...} envelopes instead of reaching the runner.
+    return readWorkspaceFileEnvelope(workspaceFiles, payload.workspace, payload.relativePath);
+  });
   ipcMain.handle(IPC_CHANNELS.gitStatus, (_event, request: WslWorkspace) =>
     gitStatusEnvelope(workspaceGit, request),
   );

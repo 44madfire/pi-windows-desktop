@@ -152,13 +152,16 @@ export class PiRuntimeController {
       piVersion: null,
     });
 
+    // Hoisted so the failure path can terminate the client it created before
+    // dropping the runtime references.
+    let client: PiRpcClient | null = null;
     try {
       const probe = await this.wsl.probeDistribution(workspace.distro);
       if (!probe.available) throw new Error(`WSL distribution is unavailable: ${workspace.distro}`);
       if (!probe.pi?.available) throw new Error(`Pi was not found in ${workspace.distro}`);
 
       const piExecutable = probe.pi.executable;
-      const client = new PiRpcClient({
+      client = new PiRpcClient({
         transportFactory: () => this.createTransport({ distro: workspace.distro, linuxPath: workspace.linuxPath, piExecutable }),
       });
       this.client = client;
@@ -173,10 +176,19 @@ export class PiRuntimeController {
       this.session = session;
       session.onStateChange((sessionSnapshot) => {
         if (this.client !== client) return;
+        // Propagate identity/cursor unconditionally, including explicit nulls:
+        // a cancelled resume must reset the runtime snapshot instead of
+        // retaining stale session fields alongside a new identity.
         const patch: Partial<PiRuntimeSessionSnapshot> = {};
-        if (sessionSnapshot.lastEntryId !== null) patch.lastEntryId = sessionSnapshot.lastEntryId;
-        if (sessionSnapshot.sessionId !== null) patch.sessionId = sessionSnapshot.sessionId;
-        if (sessionSnapshot.sessionFile !== null) patch.sessionFile = sessionSnapshot.sessionFile;
+        if (sessionSnapshot.lastEntryId !== this.snapshotValue.lastEntryId) {
+          patch.lastEntryId = sessionSnapshot.lastEntryId;
+        }
+        if (sessionSnapshot.sessionId !== this.snapshotValue.sessionId) {
+          patch.sessionId = sessionSnapshot.sessionId;
+        }
+        if (sessionSnapshot.sessionFile !== this.snapshotValue.sessionFile) {
+          patch.sessionFile = sessionSnapshot.sessionFile;
+        }
         if (Object.keys(patch).length > 0) {
           this.setSnapshot(patch);
           if (sessionSnapshot.lastEntryId !== null) {
@@ -214,6 +226,18 @@ export class PiRuntimeController {
       });
       return this.snapshot;
     } catch (error) {
+      // Any failure after the client was created must not leak the Pi
+      // process: terminate the transport (stdin EOF, then escalation) before
+      // dropping references and surfacing the rejection. A cleanup failure
+      // never masks the original startup failure.
+      if (client) {
+        try {
+          await client.close();
+        } catch {
+          // The references are dropped below regardless, so the failed
+          // client cannot be double-closed by a later stop().
+        }
+      }
       this.client = null;
       this.conversation = null;
       this.session = null;
@@ -279,7 +303,7 @@ export class PiRuntimeController {
     if (!this.client) {
       throw new Error('Pi is not running. Start Pi before responding to an extension UI request.');
     }
-    this.client.write(validateExtensionUiResponse(response));
+    await this.client.write(validateExtensionUiResponse(response));
   }
 
   /** Tolerate a missing or corrupt store: startup degrades to a fresh session. */

@@ -32,6 +32,7 @@ function wslResult(stdout = '', stderr = '', exitCode: number | null = 0): WslCo
 function fileReadResult(overrides: Partial<WorkspaceFileReadResult> = {}): WorkspaceFileReadResult {
   return {
     workspace: WORKSPACE,
+    relativePath: 'README.md',
     content: 'export const x = 1;\n',
     byteLength: 18,
     result: wslResult('export const x = 1;\n'),
@@ -42,7 +43,7 @@ function fileReadResult(overrides: Partial<WorkspaceFileReadResult> = {}): Works
 test('file read envelope carries content and byteLength but never the WslCommandResult', async () => {
   const reader: WorkspaceFileReader = { readFile: async () => fileReadResult() };
 
-  const envelope = await readWorkspaceFileEnvelope(reader, WORKSPACE);
+  const envelope = await readWorkspaceFileEnvelope(reader, WORKSPACE, 'README.md');
 
   assert.deepEqual(envelope, {
     ok: true,
@@ -58,13 +59,37 @@ test('file read envelope carries content and byteLength but never the WslCommand
   }
 });
 
+test('file read envelope forwards the relative path and keeps it off the wire', async () => {
+  let seenRelativePath: string | null = null;
+  const reader: WorkspaceFileReader = {
+    readFile: async (_input, relativePath) => {
+      seenRelativePath = relativePath;
+      return fileReadResult({ relativePath });
+    },
+  };
+
+  const envelope = await readWorkspaceFileEnvelope(reader, WORKSPACE, 'src/notes.md');
+
+  assert.equal(seenRelativePath, 'src/notes.md');
+  assert.deepEqual(envelope, {
+    ok: true,
+    workspace: WORKSPACE,
+    content: 'export const x = 1;\n',
+    byteLength: 18,
+  });
+  // The relative path addresses the read but is not echoed on the wire; the
+  // workspace root stays the identity of the result.
+  assert.equal(JSON.stringify(envelope).includes('notes.md'), false);
+  assert.equal(JSON.stringify(envelope).includes('README.md'), false);
+});
+
 test('file read preserves the canonical Linux workspace path', async () => {
   const canonical: LinuxWorkspace = { distro: UBUNTU, linuxPath: '/home/dev/src/app.ts' };
   const reader: WorkspaceFileReader = {
     readFile: async () => fileReadResult({ workspace: canonical, content: '// hi\n', byteLength: 6 }),
   };
 
-  const envelope = await readWorkspaceFileEnvelope(reader, canonical);
+  const envelope = await readWorkspaceFileEnvelope(reader, canonical, 'README.md');
 
   assert.deepEqual(envelope, {
     ok: true,
@@ -82,7 +107,7 @@ test('file read maps not-found and is-directory failures to typed envelopes', as
       });
     },
   };
-  assert.deepEqual(await readWorkspaceFileEnvelope(notFound, WORKSPACE), {
+  assert.deepEqual(await readWorkspaceFileEnvelope(notFound, WORKSPACE, 'README.md'), {
     ok: false,
     reason: 'not-found',
     message: 'Failed to read /home/dev/project (not-found): cat: /home/dev/project: No such file or directory',
@@ -95,7 +120,7 @@ test('file read maps not-found and is-directory failures to typed envelopes', as
       });
     },
   };
-  assert.deepEqual(await readWorkspaceFileEnvelope(isDirectory, WORKSPACE), {
+  assert.deepEqual(await readWorkspaceFileEnvelope(isDirectory, WORKSPACE, 'README.md'), {
     ok: false,
     reason: 'is-directory',
     message: 'Failed to read /home/dev/project (is-directory): cat: /home/dev/project: Is a directory',
@@ -108,7 +133,7 @@ test('file read maps invalid workspace input and command failure to typed envelo
       throw new WorkspaceInputError('linuxPath must be an absolute POSIX path: C:\\dev\\x');
     },
   };
-  assert.deepEqual(await readWorkspaceFileEnvelope(invalidInput, WORKSPACE), {
+  assert.deepEqual(await readWorkspaceFileEnvelope(invalidInput, WORKSPACE, 'README.md'), {
     ok: false,
     reason: 'invalid-workspace',
     message: 'linuxPath must be an absolute POSIX path: C:\\dev\\x',
@@ -121,7 +146,7 @@ test('file read maps invalid workspace input and command failure to typed envelo
       });
     },
   };
-  assert.deepEqual(await readWorkspaceFileEnvelope(commandFailed, WORKSPACE), {
+  assert.deepEqual(await readWorkspaceFileEnvelope(commandFailed, WORKSPACE, 'README.md'), {
     ok: false,
     reason: 'command-failed',
     message: 'Failed to read /home/dev/project (command-failed): cat: permission denied',
@@ -136,7 +161,10 @@ test('unexpected file read errors propagate instead of masquerading as workspace
     },
   };
 
-  await assert.rejects(readWorkspaceFileEnvelope(reader, WORKSPACE), (error: unknown) => error === boom);
+  await assert.rejects(
+    readWorkspaceFileEnvelope(reader, WORKSPACE, 'README.md'),
+    (error: unknown) => error === boom,
+  );
 });
 
 function gitStatusOk(overrides: Partial<Extract<WorkspaceGitStatus, { kind: 'ok' }>> = {}): WorkspaceGitStatus {

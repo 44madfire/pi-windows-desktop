@@ -9,6 +9,7 @@ import './WorkspaceProofCard.css';
 
 type WorkspaceProofState = {
   workspaceKey: string | null;
+  fileKey: string | null;
   file: WorkspaceFileReadResponse | null;
   git: WorkspaceGitStatusResponse | null;
   isLoading: boolean;
@@ -18,6 +19,8 @@ type WorkspaceProofState = {
 function workspaceKey(workspace: WslWorkspace | null): string | null {
   return workspace ? `${workspace.distro}\u0000${workspace.linuxPath}` : null;
 }
+
+const DEFAULT_RELATIVE_PATH = 'README.md';
 
 // Wire failure messages can include command details; render only typed reason mappings.
 function fileFailureLabel(reason: Extract<WorkspaceFileReadResponse, { ok: false }>['reason']): string {
@@ -147,8 +150,11 @@ function GitProof({ result }: { result: WorkspaceGitStatusResponse | null }): Re
 
 export function WorkspaceProofCard({ workspace }: { workspace: WslWorkspace | null }): ReactElement {
   const currentWorkspaceKey = workspaceKey(workspace);
+  const [relativePath, setRelativePath] = useState(DEFAULT_RELATIVE_PATH);
+  const currentFileKey = currentWorkspaceKey ? `${currentWorkspaceKey}\u0000${relativePath}` : null;
   const [proof, setProof] = useState<WorkspaceProofState>(() => ({
     workspaceKey: currentWorkspaceKey,
+    fileKey: null,
     file: null,
     git: null,
     isLoading: false,
@@ -158,12 +164,23 @@ export function WorkspaceProofCard({ workspace }: { workspace: WslWorkspace | nu
   useEffect(() => {
     setProof({
       workspaceKey: currentWorkspaceKey,
+      fileKey: null,
       file: null,
       git: null,
       isLoading: false,
       requestError: false,
     });
   }, [currentWorkspaceKey]);
+
+  // Changing the selected file invalidates the previous file proof; the Git
+  // proof is bound to the workspace root and stays current.
+  useEffect(() => {
+    setProof((current) =>
+      current.fileKey === currentFileKey
+        ? current
+        : { ...current, fileKey: currentFileKey, file: null },
+    );
+  }, [currentFileKey]);
 
   const runProof = useCallback(async () => {
     if (!workspace) return;
@@ -173,9 +190,11 @@ export function WorkspaceProofCard({ workspace }: { workspace: WslWorkspace | nu
       linuxPath: workspace.linuxPath,
     };
     const requestKey = workspaceKey(requestWorkspace);
+    const requestFileKey = `${requestKey}\u0000${relativePath}`;
     setProof((current) => ({
       ...current,
       workspaceKey: requestKey,
+      fileKey: requestFileKey,
       file: null,
       git: null,
       isLoading: true,
@@ -184,22 +203,22 @@ export function WorkspaceProofCard({ workspace }: { workspace: WslWorkspace | nu
 
     try {
       const [file, git] = await Promise.all([
-        window.piDesktop.readWorkspaceFile(requestWorkspace),
+        window.piDesktop.readWorkspaceFile({ workspace: requestWorkspace, relativePath }),
         window.piDesktop.gitStatus(requestWorkspace),
       ]);
-      setProof((current) => current.workspaceKey === requestKey
+      setProof((current) => current.workspaceKey === requestKey && current.fileKey === requestFileKey
         ? { ...current, file, git, isLoading: false }
         : current);
     } catch {
-      setProof((current) => current.workspaceKey === requestKey
+      setProof((current) => current.workspaceKey === requestKey && current.fileKey === requestFileKey
         ? { ...current, isLoading: false, requestError: true }
         : current);
     }
-  }, [workspace]);
+  }, [relativePath, workspace]);
 
   const hasWorkspace = Boolean(workspace);
   const showingCurrentWorkspace = proof.workspaceKey === currentWorkspaceKey;
-  const file = showingCurrentWorkspace ? proof.file : null;
+  const file = showingCurrentWorkspace && proof.fileKey === currentFileKey ? proof.file : null;
   const git = showingCurrentWorkspace ? proof.git : null;
   const requestError = showingCurrentWorkspace && proof.requestError;
 
@@ -219,6 +238,16 @@ export function WorkspaceProofCard({ workspace }: { workspace: WslWorkspace | nu
         <span>{workspace?.distro || 'No WSL distribution selected'}</span>
         <code>{workspace?.linuxPath || 'Select a Linux path above'}</code>
       </div>
+
+      <label className="workspace-proof-file-field">
+        <span>File to read</span>
+        <input
+          value={relativePath}
+          onChange={(event) => setRelativePath(event.target.value)}
+          spellCheck={false}
+          placeholder={DEFAULT_RELATIVE_PATH}
+        />
+      </label>
 
       <button
         className="secondary-button workspace-proof-button"

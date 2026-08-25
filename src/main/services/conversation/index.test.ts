@@ -201,6 +201,97 @@ test('accumulates text and thinking deltas by content index without losing strea
   assert.equal(firstAssistant?.type === 'message' ? firstAssistant.content : '', 'Hello world!');
 });
 
+test('streams delta-only message updates with contentIndex (current Pi shapes) and settles on agent_settled', async () => {
+  const mock = createClient();
+  const controller = new ConversationController(mock.client);
+  const prompt = controller.sendPrompt('Inspect the project');
+  // Current Pi `message_update` records carry usage plus a delta-only
+  // `assistantMessageEvent`: no top-level `message`, no `partial` snapshot,
+  // and `contentIndex` addresses the content block being streamed.
+  const usage = {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+
+  mock.emit({ type: 'agent_start' });
+  mock.emit({ type: 'message_start', message: { id: 'msg-1', role: 'assistant', content: [] } });
+  mock.emit({ type: 'message_update', usage, assistantMessageEvent: { type: 'text_start', contentIndex: 0 } });
+  mock.emit({ type: 'message_update', usage, assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: 'Hello' } });
+  assert.equal(controller.snapshot.streamingText, 'Hello');
+
+  // A thinking block streaming in parallel must not leak into visible text.
+  mock.emit({ type: 'message_update', usage, assistantMessageEvent: { type: 'thinking_delta', contentIndex: 1, delta: 'hidden' } });
+  assert.equal(controller.snapshot.streamingText, 'Hello');
+
+  // A second text block is assembled in content order via its own index.
+  mock.emit({ type: 'message_update', usage, assistantMessageEvent: { type: 'text_start', contentIndex: 2 } });
+  mock.emit({ type: 'message_update', usage, assistantMessageEvent: { type: 'text_delta', contentIndex: 2, delta: ' world' } });
+  assert.equal(controller.snapshot.streamingText, 'Hello world');
+  // text_end carries the block's final text.
+  mock.emit({ type: 'message_update', usage, assistantMessageEvent: { type: 'text_end', contentIndex: 2, content: ' world' } });
+  assert.equal(controller.snapshot.streamingText, 'Hello world');
+
+  // The prompt RPC response only acknowledges acceptance; the turn stays active.
+  mock.resolvePrompt();
+  await prompt;
+  assert.equal(controller.snapshot.executionState, 'streaming');
+  assert.equal(mock.calls.length, 1);
+
+  // message_end carries the authoritative assistant message.
+  mock.emit({
+    type: 'message_end',
+    message: { id: 'msg-1', role: 'assistant', content: [{ type: 'text', text: 'Hello world' }] },
+  });
+  // agent_settled completes the run.
+  mock.emit({ type: 'agent_settled' });
+
+  assert.equal(controller.snapshot.executionState, 'idle');
+  const assistant = controller.snapshot.timeline.filter((record) => record.type === 'message' && record.role === 'assistant');
+  assert.equal(assistant.length, 1);
+  assert.equal(assistant[0]?.type === 'message' ? assistant[0].content : '', 'Hello world');
+});
+
+test('concatenates repeated text_delta chunks at the same contentIndex literally', async () => {
+  const mock = createClient();
+  const controller = new ConversationController(mock.client);
+  void controller.sendPrompt('repeat');
+  const usage = {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+
+  mock.emit({ type: 'agent_start' });
+  mock.emit({ type: 'message_start', message: { id: 'msg-1', role: 'assistant', content: [] } });
+
+  // Current Pi `text_delta` chunks are incremental stream slices, not
+  // cumulative snapshots: an identical chunk at the same contentIndex is a
+  // second slice and must concatenate literally, never be deduplicated.
+  mock.emit({ type: 'message_update', usage, assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: 'ab' } });
+  mock.emit({ type: 'message_update', usage, assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: 'ab' } });
+  assert.equal(controller.snapshot.streamingText, 'abab');
+
+  // A delta that is a strict prefix of the accumulated text is still a new
+  // chunk: 'a' after 'ab' must extend the stream, not be swallowed.
+  mock.emit({ type: 'message_update', usage, assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: 'a' } });
+  assert.equal(controller.snapshot.streamingText, 'ababa');
+
+  // agent_settled completes the turn with the literal concatenation.
+  mock.emit({ type: 'agent_settled' });
+
+  assert.equal(controller.snapshot.executionState, 'idle');
+  const assistant = controller.snapshot.timeline.filter((record) => record.type === 'message' && record.role === 'assistant');
+  assert.equal(assistant.length, 1);
+  assert.equal(assistant[0]?.type === 'message' ? assistant[0].content : '', 'ababa');
+});
+
 test('transport failure while streaming fails the turn and leaves a recoverable error state', async () => {
   const mock = createClient();
   const controller = new ConversationController(mock.client);
@@ -319,6 +410,72 @@ test('abort request failure fails the turn instead of deadlocking', async () => 
   mock.resolvePrompt();
   await second;
   mock.emit({ type: 'agent_settled' });
+  assert.equal(controller.snapshot.executionState, 'idle');
+});
+
+test('tracks current-shape tool events: args.command, partialResult, and result.content', async () => {
+  const mock = createClient();
+  const controller = new ConversationController(mock.client);
+  const prompt = controller.sendPrompt('run pwd');
+  mock.resolvePrompt();
+  await prompt;
+
+  mock.emit({ type: 'agent_start' });
+  // Current Pi: tool call arguments live under `args` (bash -> { command }).
+  mock.emit({ type: 'tool_execution_start', toolCallId: 'tool-1', toolName: 'bash', args: { command: 'pwd' } });
+  let bash = controller.snapshot.timeline.find((record) => record.id === 'tool-1');
+  assert.equal(bash?.type === 'bash' ? bash.command : '', 'pwd');
+
+  // partialResult carries the accumulated output as a tool-result object.
+  mock.emit({
+    type: 'tool_execution_update',
+    toolCallId: 'tool-1',
+    toolName: 'bash',
+    args: { command: 'pwd' },
+    partialResult: { content: [{ type: 'text', text: 'Building...' }], details: undefined },
+  });
+  bash = controller.snapshot.timeline.find((record) => record.id === 'tool-1');
+  assert.equal(bash?.type === 'bash' ? bash.output : '', 'Building...');
+
+  // result.content is the authoritative final output; isError is top-level.
+  mock.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'tool-1',
+    toolName: 'bash',
+    result: { content: [{ type: 'text', text: 'C:/project' }], details: undefined },
+    isError: false,
+  });
+  mock.emit({ type: 'agent_settled' });
+
+  assert.equal(controller.snapshot.executionState, 'idle');
+  bash = controller.snapshot.timeline.find((record) => record.id === 'tool-1');
+  assert.equal(bash?.type === 'bash' ? bash.command : '', 'pwd');
+  assert.equal(bash?.type === 'bash' ? bash.output : '', 'C:/project');
+  assert.equal(bash?.type === 'bash' ? bash.status : '', 'completed');
+});
+
+test('settles current-shape failed tools from result.content and isError', async () => {
+  const mock = createClient();
+  const controller = new ConversationController(mock.client);
+  const prompt = controller.sendPrompt('run false');
+  mock.resolvePrompt();
+  await prompt;
+
+  mock.emit({ type: 'agent_start' });
+  mock.emit({ type: 'tool_execution_start', toolCallId: 'tool-9', toolName: 'bash', args: { command: 'false' } });
+  mock.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'tool-9',
+    toolName: 'bash',
+    result: { content: [{ type: 'text', text: 'Command exited with code 1' }], details: {} },
+    isError: true,
+  });
+  mock.emit({ type: 'agent_settled' });
+
+  const bash = controller.snapshot.timeline.find((record) => record.id === 'tool-9');
+  assert.equal(bash?.type === 'bash' ? bash.command : '', 'false');
+  assert.equal(bash?.type === 'bash' ? bash.output : '', 'Command exited with code 1');
+  assert.equal(bash?.type === 'bash' ? bash.status : '', 'failed');
   assert.equal(controller.snapshot.executionState, 'idle');
 });
 

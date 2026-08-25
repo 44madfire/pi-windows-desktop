@@ -95,8 +95,8 @@ test('every invoke channel is wired to a typed DesktopApi method', () => {
     sendPrompt: async () => ({ timeline: [], executionState: 'idle', queuedPromptCount: 0, error: null }),
     abortPrompt: async () => ({ timeline: [], executionState: 'idle', queuedPromptCount: 0, error: null }),
     getConversation: async () => ({ timeline: [], executionState: 'idle', queuedPromptCount: 0, error: null }),
-    readWorkspaceFile: async () => ({ ok: false, reason: 'invalid-workspace', message: '' }),
-    gitStatus: async () => ({ ok: false, reason: 'invalid-workspace', message: '' }),
+    readWorkspaceFile: async (_request) => ({ ok: false, reason: 'invalid-workspace', message: '' }),
+    gitStatus: async (_workspace) => ({ ok: false, reason: 'invalid-workspace', message: '' }),
     onPiEvent: () => () => undefined,
   };
 
@@ -127,6 +127,20 @@ test('IpcResponse resolves typed results for the new channels', () => {
   assert.deepEqual(JSON.parse(JSON.stringify(okRead)), okRead);
   assert.deepEqual(JSON.parse(JSON.stringify(okGit)), okGit);
   assert.deepEqual(Object.keys(okGit).sort(), ['branch', 'entries', 'ok', 'workspace']);
+
+  // A file read addresses a workspace root plus a relative POSIX path; Git
+  // status keeps receiving only the root.
+  const readRequest: IpcContract[typeof IPC_CHANNELS.readWorkspaceFile]['request'] = {
+    workspace: { distro: 'Ubuntu', linuxPath: '/home/dev/project' },
+    relativePath: 'README.md',
+  };
+  const gitRequest: IpcContract[typeof IPC_CHANNELS.gitStatus]['request'] = {
+    distro: 'Ubuntu',
+    linuxPath: '/home/dev/project',
+  };
+  assert.deepEqual(JSON.parse(JSON.stringify(readRequest)), readRequest);
+  assert.deepEqual(JSON.parse(JSON.stringify(gitRequest)), gitRequest);
+  assert.deepEqual(Object.keys(readRequest).sort(), ['relativePath', 'workspace']);
 
   // The extension response channel is the only renderer-to-Pi command
   // boundary besides prompts; its discriminant is fixed.

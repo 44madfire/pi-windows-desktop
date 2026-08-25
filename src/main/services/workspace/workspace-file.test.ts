@@ -53,14 +53,14 @@ function result(stdout = '', stderr = '', exitCode: number | null = 0): WslComma
   };
 }
 
-test('reads a workspace file via cat with the exact Linux path argv', async () => {
+test('reads a workspace file via cat with the exact joined path argv', async () => {
   const runner = new FakeWorkspaceRunner(result('export const x = 1;\n'));
   const service = new WorkspaceFileService(runner);
 
-  const read = await service.readFile({
-    distro: UBUNTU,
-    linuxPath: '/home/dev/project/src/app.ts',
-  });
+  const read = await service.readFile(
+    { distro: UBUNTU, linuxPath: '/home/dev/project' },
+    'src/app.ts',
+  );
 
   assert.deepEqual(runner.calls, [
     {
@@ -71,7 +71,8 @@ test('reads a workspace file via cat with the exact Linux path argv', async () =
   ]);
   assert.equal(read.content, 'export const x = 1;\n');
   assert.equal(read.byteLength, Buffer.byteLength('export const x = 1;\n', 'utf8'));
-  assert.deepEqual(read.workspace, { distro: UBUNTU, linuxPath: '/home/dev/project/src/app.ts' });
+  assert.deepEqual(read.workspace, { distro: UBUNTU, linuxPath: '/home/dev/project' });
+  assert.equal(read.relativePath, 'src/app.ts');
   assert.equal(read.result.ok, true);
 });
 
@@ -79,13 +80,94 @@ test('keeps a path with spaces as one argv entry without shell parsing', async (
   const runner = new FakeWorkspaceRunner(result('# heading\nbody\n'));
   const service = new WorkspaceFileService(runner);
 
-  const read = await service.readFile({
-    distro: UBUNTU,
-    linuxPath: '/home/dev/my project/notes.md',
-  });
+  const read = await service.readFile(
+    { distro: UBUNTU, linuxPath: '/home/dev/my project' },
+    'notes.md',
+  );
 
   assert.equal(read.content, '# heading\nbody\n');
   assert.deepEqual(runner.calls[0].args, ['--', '/home/dev/my project/notes.md']);
+});
+
+test('resolves a relative file path against the workspace root into one cat argv', async () => {
+  const runner = new FakeWorkspaceRunner(result('# Pi project\n'));
+  const service = new WorkspaceFileService(runner);
+
+  const read = await service.readFile(
+    { distro: UBUNTU, linuxPath: '/home/me/project' },
+    'README.md',
+  );
+  const nested = await service.readFile(
+    { distro: UBUNTU, linuxPath: '/home/me/project' },
+    'src/lib/pi.ts',
+  );
+
+  assert.equal(read.content, '# Pi project\n');
+  assert.equal(nested.content, '# Pi project\n');
+  assert.equal(read.byteLength, Buffer.byteLength('# Pi project\n', 'utf8'));
+  // The workspace identity stays the validated root; only the argv targets the joined file.
+  assert.deepEqual(read.workspace, { distro: UBUNTU, linuxPath: '/home/me/project' });
+  assert.deepEqual(runner.calls, [
+    {
+      distribution: UBUNTU,
+      executable: 'cat',
+      args: ['--', '/home/me/project/README.md'],
+    },
+    {
+      distribution: UBUNTU,
+      executable: 'cat',
+      args: ['--', '/home/me/project/src/lib/pi.ts'],
+    },
+  ]);
+});
+
+test('reads from the workspace root without doubling the separator in the cat argv', async () => {
+  const runner = new FakeWorkspaceRunner(result('# root readme\n'));
+  const service = new WorkspaceFileService(runner);
+
+  const read = await service.readFile({ distro: UBUNTU, linuxPath: '/' }, 'README.md');
+
+  // Root `/` joined with a relative file is `/README.md`, never `//README.md`.
+  assert.deepEqual(runner.calls, [
+    {
+      distribution: UBUNTU,
+      executable: 'cat',
+      args: ['--', '/README.md'],
+    },
+  ]);
+  assert.equal(read.content, '# root readme\n');
+  assert.equal(read.byteLength, Buffer.byteLength('# root readme\n', 'utf8'));
+  assert.deepEqual(read.workspace, { distro: UBUNTU, linuxPath: '/' });
+  assert.equal(read.relativePath, 'README.md');
+  assert.equal(read.result.ok, true);
+});
+
+test('rejects traversal and absolute escape attempts in the relative path before invoking the runner', async () => {
+  const runner = new FakeWorkspaceRunner(result(''));
+  const service = new WorkspaceFileService(runner);
+  const escapes = [
+    '',
+    '..',
+    '../README.md',
+    '../../etc/passwd',
+    'src/../../secret.md',
+    'src/..',
+    './README.md',
+    'src/./README.md',
+    '/etc/passwd',
+    '//etc/passwd',
+    'C:\\Users\\dev\\file.ts',
+    '..\\README.md',
+    'README.md\u0000',
+  ];
+
+  for (const relativePath of escapes) {
+    await assert.rejects(
+      service.readFile({ distro: UBUNTU, linuxPath: '/home/me/project' }, relativePath),
+      (error: unknown) => error instanceof WorkspaceInputError,
+    );
+  }
+  assert.deepEqual(runner.calls, []);
 });
 
 test('rejects invalid and Windows-style workspace paths before invoking the runner', async () => {
@@ -107,7 +189,7 @@ test('rejects invalid and Windows-style workspace paths before invoking the runn
 
   for (const linuxPath of invalidPaths) {
     await assert.rejects(
-      service.readFile({ distro: UBUNTU, linuxPath }),
+      service.readFile({ distro: UBUNTU, linuxPath }, 'README.md'),
       (error: unknown) => error instanceof WorkspaceInputError,
     );
   }
@@ -120,7 +202,20 @@ test('rejects invalid distribution names before invoking the runner', async () =
 
   for (const distro of ['bad distro', '-leading', '', 'Übuntu']) {
     await assert.rejects(
-      service.readFile({ distro, linuxPath: '/home/dev/a.ts' }),
+      service.readFile({ distro, linuxPath: '/home/dev/a.ts' }, 'README.md'),
+      (error: unknown) => error instanceof WorkspaceInputError,
+    );
+  }
+  assert.deepEqual(runner.calls, []);
+});
+
+test('rejects Windows drive-letter relative paths before invoking the runner', async () => {
+  const runner = new FakeWorkspaceRunner(result(''));
+  const service = new WorkspaceFileService(runner);
+
+  for (const relativePath of ['C:/Users/dev/file.ts', 'c:notes.md']) {
+    await assert.rejects(
+      service.readFile({ distro: UBUNTU, linuxPath: '/home/me/project' }, relativePath),
       (error: unknown) => error instanceof WorkspaceInputError,
     );
   }
@@ -134,14 +229,14 @@ test('maps a missing file to a typed not-found error that preserves stderr', asy
   const service = new WorkspaceFileService(runner);
 
   await assert.rejects(
-    service.readFile({ distro: UBUNTU, linuxPath: '/home/dev/missing.ts' }),
+    service.readFile({ distro: UBUNTU, linuxPath: '/home/dev' }, 'missing.ts'),
     (error: unknown) => {
       assert.ok(error instanceof WorkspaceFileError);
       if (!(error instanceof WorkspaceFileError)) return false;
       assert.equal(error.reason, 'not-found');
       assert.equal(error.result?.stderr, 'cat: /home/dev/missing.ts: No such file or directory');
       assert.equal(error.result?.exitCode, 1);
-      assert.deepEqual(error.workspace, { distro: UBUNTU, linuxPath: '/home/dev/missing.ts' });
+      assert.deepEqual(error.workspace, { distro: UBUNTU, linuxPath: '/home/dev' });
       return true;
     },
   );
@@ -152,7 +247,7 @@ test('classifies directory reads as is-directory', async () => {
   const service = new WorkspaceFileService(runner);
 
   await assert.rejects(
-    service.readFile({ distro: UBUNTU, linuxPath: '/home/dev/src' }),
+    service.readFile({ distro: UBUNTU, linuxPath: '/home/dev' }, 'src'),
     (error: unknown) => error instanceof WorkspaceFileError && error.reason === 'is-directory',
   );
 });
@@ -162,7 +257,7 @@ test('wraps unexpected command failures while preserving stderr', async () => {
   const service = new WorkspaceFileService(runner);
 
   await assert.rejects(
-    service.readFile({ distro: UBUNTU, linuxPath: '/home/dev/a.ts' }),
+    service.readFile({ distro: UBUNTU, linuxPath: '/home/dev' }, 'a.ts'),
     (error: unknown) => {
       assert.ok(error instanceof WorkspaceFileError);
       if (!(error instanceof WorkspaceFileError)) return false;
@@ -180,7 +275,7 @@ test('wraps process-launch failures with the original cause', async () => {
   const service = new WorkspaceFileService(runner);
 
   await assert.rejects(
-    service.readFile({ distro: UBUNTU, linuxPath: '/home/dev/a.ts' }),
+    service.readFile({ distro: UBUNTU, linuxPath: '/home/dev' }, 'a.ts'),
     (error: unknown) => {
       assert.ok(error instanceof WorkspaceFileError);
       if (!(error instanceof WorkspaceFileError)) return false;

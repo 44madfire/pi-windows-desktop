@@ -120,6 +120,16 @@ export type WorkspaceFileReadFailureReason =
   | 'command-failed';
 
 /**
+ * Payload for a workspace file read: the validated workspace root plus a
+ * relative POSIX file path inside it. The main process validates both before
+ * any WSL command runs; Git status continues to receive only the root.
+ */
+export interface WorkspaceFileReadRequest {
+  workspace: WslWorkspace;
+  relativePath: string;
+}
+
+/**
  * Wire result of a workspace file read. Internal process diagnostics
  * (WslCommandResult, raw stderr/stdout) are deliberately absent.
  */
@@ -174,7 +184,7 @@ export interface DesktopApi {
   sendPrompt: (prompt: string) => Promise<ConversationSnapshot>;
   abortPrompt: () => Promise<ConversationSnapshot>;
   getConversation: () => Promise<ConversationSnapshot>;
-  readWorkspaceFile: (workspace: WslWorkspace) => Promise<WorkspaceFileReadResponse>;
+  readWorkspaceFile: (request: WorkspaceFileReadRequest) => Promise<WorkspaceFileReadResponse>;
   gitStatus: (workspace: WslWorkspace) => Promise<WorkspaceGitStatusResponse>;
   onPiEvent: (listener: (event: PiEvent) => void) => () => void;
 }
@@ -225,7 +235,7 @@ export interface IpcContract {
     response: ConversationSnapshot;
   };
   [IPC_CHANNELS.readWorkspaceFile]: {
-    request: WslWorkspace;
+    request: WorkspaceFileReadRequest;
     response: WorkspaceFileReadResponse;
   };
   [IPC_CHANNELS.gitStatus]: {

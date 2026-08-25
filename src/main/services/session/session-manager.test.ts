@@ -316,6 +316,53 @@ test("a failed switch_session degrades softly to new_session", async () => {
   assert.equal(manager.snapshot.lastError, null);
 });
 
+test("a cancelled switch_session with a stale persisted cursor clears identity before fresh catch-up", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ cancelled: true }); // switch_session cancelled
+  client.queueResponse({ sessionId: "pi-session-new" }); // new_session
+  client.queueResponse({
+    sessionId: "pi-session-new",
+    sessionFile: "/sessions/pi-session-new",
+  }); // get_state
+  // Persisted manager state from a previous run: the stale session id, file,
+  // and cursor must not leak into the fallback fresh session.
+  const manager = new SessionManager({
+    client,
+    sessionId: "stale-session",
+    sessionFile: "/sessions/stale",
+    lastEntryId: "stale-entry-9",
+  });
+
+  const opened = await manager.openSession("/sessions/stale");
+
+  assert.deepEqual(client.commands, [
+    { type: "switch_session", sessionPath: "/sessions/stale" },
+    { type: "new_session" },
+    { type: "get_state" },
+  ]);
+  assert.equal(opened.resumed, false);
+  // The fresh session adopts Pi's authoritative identity, not the stale one.
+  assert.equal(manager.sessionId, "pi-session-new");
+  assert.equal(manager.sessionFile, "/sessions/pi-session-new");
+  // The stale cursor is cleared before the fresh-session catch-up.
+  assert.equal(manager.lastEntryId, null);
+  assert.equal(manager.state, "ready");
+
+  // Catch-up for the fresh session is the full entry list, never a `since`
+  // cursor borrowed from the abandoned persisted session.
+  client.queueResponse({ entries: [{ id: "fresh-1" }], leafId: "fresh-1" });
+  const synced = await manager.synchronize();
+
+  assert.deepEqual(client.commands, [
+    { type: "switch_session", sessionPath: "/sessions/stale" },
+    { type: "new_session" },
+    { type: "get_state" },
+    { type: "get_entries" },
+  ]);
+  assert.equal(synced.requestedAfter, null);
+  assert.equal(synced.lastEntryId, "fresh-1");
+});
+
 test("openSession fails when the new_session fallback also fails", async () => {
   const client = new FakePiRpcClient();
   client.queueError("switch rejected");

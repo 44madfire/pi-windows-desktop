@@ -12,7 +12,7 @@
     "start": "electron-vite preview",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.renderer.json",
     "test": "npm run test:pi && npm run test:session && npm run test:conversation && npm run test:workspace && npm run test:shell && npm run test:wsl",
-    "test:pi": "node --test --experimental-strip-types src/main/services/pi/__tests__/pi-rpc-client.test.mjs src/main/services/pi/wsl-process-transport.test.ts src/main/services/pi/pi-runtime.test.ts",
+    "test:pi": "node --test --experimental-strip-types src/main/services/pi/__tests__/pi-rpc-client.test.mjs src/main/services/pi/wsl-process-transport.test.ts src/main/services/pi/pi-runtime.test.ts src/main/services/pi/pi-rpc-contract.test.ts",
     "test:session": "node --test --experimental-strip-types src/main/services/session/session-manager.test.ts src/main/services/session/session-store.test.ts",
     "test:conversation": "node --test --experimental-strip-types src/main/services/conversation/index.test.ts",
     "test:workspace": "node --test --experimental-strip-types src/main/services/workspace/workspace-file.test.ts src/main/services/workspace/workspace-git.test.ts src/main/services/workspace/ipc-mapping.test.ts",
