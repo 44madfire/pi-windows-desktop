@@ -8,11 +8,13 @@ import test from "node:test";
  * Pins the authoritative wire shapes the desktop shell depends on:
  * - `get_state` answers `success: true` with a JSON `data` object carrying the
  *   session identity.
- * - `get_entries` answers `success: true` with `data.entries` (array) and the
- *   authoritative `data.leafId` cursor.
+ * - `get_entries` answers `success: true` with `data.entries` (array, in
+ *   append order) and `data.leafId`, the current active leaf — which may be
+ *   null. The append cursor is the last entry id, not `leafId`.
  * - `get_entries` with a stale `since` cursor answers `success: false`.
- * - Unrelated `extension_ui_request` events interleave with responses and are
- *   tolerated without breaking request/response correlation.
+ * - The suite never triggers extension UI requests; any
+ *   `extension_ui_request` events pi happens to interleave are tolerated
+ *   without breaking request/response correlation.
  *
  * The suite is inert unless `PI_RPC_INTEGRATION=1` (no prompt is sent and no
  * model credentials are required). `PI_RPC_BIN` overrides the executable;
@@ -266,7 +268,7 @@ class LivePiRpcClient {
 }
 
 test(
-  "live pi RPC answers get_state and get_entries with authoritative shapes and tolerates extension_ui_request events",
+  "live pi RPC answers get_state and get_entries with authoritative shapes and tolerates interleaved extension_ui_request events when observed",
   { skip, timeout: TEST_TIMEOUT_MS },
   async () => {
     const client = new LivePiRpcClient(PI_RPC_BIN);
@@ -289,18 +291,32 @@ test(
       assert.ok(entries.data !== null && typeof entries.data === "object");
       const entriesData = entries.data as Record<string, unknown>;
       assert.ok(Array.isArray(entriesData.entries));
-      for (const entry of entriesData.entries as unknown[]) {
+      const entryRecords = entriesData.entries as Array<Record<string, unknown>>;
+      for (const entry of entryRecords) {
         assert.ok(entry !== null && typeof entry === "object");
-        const entryRecord = entry as Record<string, unknown>;
-        assert.equal(typeof entryRecord.id, "string");
-        assert.ok((entryRecord.id as string).length > 0);
+        assert.equal(typeof entry.id, "string");
+        assert.ok((entry.id as string).length > 0);
       }
-      // `leafId` is the authoritative get_entries cursor.
-      assert.equal(typeof entriesData.leafId, "string");
-      assert.ok((entriesData.leafId as string).length > 0);
+      // `leafId` is the current active leaf, NOT the append cursor: it may be
+      // null (no active leaf) or a non-empty string (the active leaf id, which
+      // can point anywhere in the branch tree). The append cursor is the last
+      // entry id in append order, derived independently from the entries array.
+      if (entryRecords.length > 0) {
+        const appendCursor = entryRecords[entryRecords.length - 1].id as string;
+        assert.equal(typeof appendCursor, "string");
+        assert.ok(appendCursor.length > 0);
+        if (entriesData.leafId !== null) {
+          assert.equal(typeof entriesData.leafId, "string");
+          assert.ok((entriesData.leafId as string).length > 0);
+        }
+      } else {
+        // No entries: there is no active leaf, so `leafId` must be null.
+        assert.equal(entriesData.leafId, null);
+      }
 
       // The responses above correlated despite any interleaved events; the
-      // extension UI requests that did arrive must carry a well-formed shape.
+      // suite never triggers extension UI requests, but any that happen to
+      // arrive must carry a well-formed shape and remain tolerated.
       for (const event of client.events) {
         assert.equal(typeof event.type, "string");
         assert.ok((event.type as string).length > 0);
