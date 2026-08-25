@@ -198,11 +198,23 @@ function App(): ReactElement {
     setProbe(await window.piDesktop.probeWslDistribution(selectedDistro));
   }, [selectedDistro]);
 
-  const startPi = useCallback(async () => {
-    if (!selectedDistro) return;
-    setPiStatus(await window.piDesktop.startPi({ distro: selectedDistro, linuxPath }));
+  const startPi = useCallback(async (workspaceOverride?: { distro: string; linuxPath: string }) => {
+    const workspace = workspaceOverride ?? (selectedDistro ? { distro: selectedDistro, linuxPath } : null);
+    if (!workspace) return;
+    setPiStatus(await window.piDesktop.startPi(workspace));
     setConversation(await window.piDesktop.getConversation());
   }, [linuxPath, selectedDistro]);
+
+  const retryPi = useCallback(async () => {
+    const workspace = piStatus?.workspace;
+    if (!workspace) return;
+
+    try {
+      await startPi(workspace);
+    } catch {
+      await refresh();
+    }
+  }, [piStatus?.workspace, refresh, startPi]);
 
   const stopPi = useCallback(async () => {
     setPiStatus(await window.piDesktop.stopPi());
@@ -216,6 +228,11 @@ function App(): ReactElement {
   const abortPrompt = useCallback(async () => {
     setConversation(await window.piDesktop.abortPrompt());
   }, []);
+
+  const runtimeError =
+    piStatus && (piStatus.state === 'disconnected' || piStatus.state === 'failed')
+      ? piStatus.lastError ?? `Pi runtime is ${piStatus.state}.`
+      : null;
 
   const reportStatus = diagnostics?.overall === 'ready' ? 'Ready' : 'M0 shell online';
   const workspace = selectedDistro ? { distro: selectedDistro, linuxPath } : null;
@@ -271,6 +288,22 @@ function App(): ReactElement {
             <button onClick={() => void refresh()} type="button">
               Try again
             </button>
+          </div>
+        )}
+        {piStatus?.lastWarning && (
+          <div className="warning-banner" role="status">
+            <span>Runtime warning: {piStatus.lastWarning}</span>
+          </div>
+        )}
+
+        {!error && runtimeError && (
+          <div className="error-banner" role="alert">
+            <span>Pi runtime unavailable: {runtimeError}</span>
+            {piStatus?.workspace && (
+              <button onClick={() => void retryPi()} type="button">
+                Reconnect Pi
+              </button>
+            )}
           </div>
         )}
 
