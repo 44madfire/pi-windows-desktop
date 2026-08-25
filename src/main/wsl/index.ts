@@ -15,9 +15,10 @@ export const WSL_DISTRIBUTION_PATTERN = /^[A-Za-z0-9._-]+$/;
 export const PI_LOOKUP_MARKER = "__PI_DESKTOP_PI__";
 
 /**
- * Shell snippet used for both the non-login and login Pi lookups. It prints
- * the `command -v pi` result on a dedicated marker line; when `pi` is not on
- * PATH the marker line is still emitted with an empty value.
+ * Shell snippet used for the non-login, login, and interactive-login Pi
+ * lookups. It prints the `command -v pi` result on a dedicated marker line;
+ * when `pi` is not on PATH the marker line is still emitted with an empty
+ * value.
  */
 const PI_LOOKUP_COMMAND = `printf '${PI_LOOKUP_MARKER}%s\\n' "$(command -v pi)"`;
 
@@ -80,7 +81,8 @@ export interface WslDistributionProbe {
 export type PiProbeFailureReason =
   | "lookup-failed"
   | "not-found"
-  | "configured-executable-failed";
+  | "configured-executable-failed"
+  | "executable-version-failed";
 
 export type PiExecutableProbe =
   | {
@@ -101,6 +103,13 @@ export type PiExecutableProbe =
       readonly executable: null;
       readonly version: null;
       readonly reason: "configured-executable-failed";
+      readonly versionResult: WslCommandResult;
+    }
+  | {
+      readonly available: false;
+      readonly executable: null;
+      readonly version: null;
+      readonly reason: "executable-version-failed";
       readonly versionResult: WslCommandResult;
     };
 
@@ -456,14 +465,18 @@ export function createNodeProcessRunner(): ProcessRunner {
  * lookup entirely and probes that executable's version directly; a failing
  * probe makes the executable unavailable with reason
  * "configured-executable-failed". Otherwise it runs a non-login
- * `/bin/sh -c` lookup, then falls back to a profile-aware `/bin/bash -lc`
- * lookup when the first lookup fails or returns no path, so
- * nvm/fnm/profile-installed Pi executables are still discoverable. Both
- * lookups print the found path on a dedicated marker line
+ * `/bin/sh -c` lookup, then a profile-aware `/bin/bash -lc` lookup, and
+ * finally an interactive `/bin/bash -l -i -c` lookup, so nvm/fnm and other
+ * profile-initialized Pi executables are still discoverable. Every lookup
+ * prints the found path on a dedicated marker line
  * (`printf '<marker>%s\n' "$(command -v pi)"`) and only that line is parsed,
- * so login-shell profile output can never be mistaken for the executable.
- * Lookup and version commands always keep discrete argv entries; a
- * configured path is never interpolated into a shell command.
+ * so shell and profile output can never be mistaken for the executable.
+ * A version probe that fails makes the executable unavailable with reason
+ * "executable-version-failed" when discovered or
+ * "configured-executable-failed" when configured; lookup-failed/not-found
+ * are reported only after every fallback has been tried. Lookup and version
+ * commands always keep discrete argv entries; a configured path is never
+ * interpolated into a shell command.
  */
 export class DefaultPiExecutableLocator implements PiExecutableLocator {
   private readonly runInDistribution: RunInDistribution;
@@ -496,28 +509,41 @@ export class DefaultPiExecutableLocator implements PiExecutableLocator {
       "-c",
       PI_LOOKUP_COMMAND,
     ]);
-    if (!loginLookup.ok) {
+    const loginExecutable = loginLookup.ok ? parsePiLookupOutput(loginLookup.stdout) : null;
+    if (loginExecutable !== null) {
+      return this.probeVersion(distribution, loginExecutable, false);
+    }
+
+    // Profile-initialized tools (nvm, fnm, ...) only end up on PATH for
+    // interactive shells, so try an interactive login shell before giving up.
+    const interactiveLookup = await this.runInDistribution(distribution, "/bin/bash", [
+      "-l",
+      "-i",
+      "-c",
+      PI_LOOKUP_COMMAND,
+    ]);
+    if (!interactiveLookup.ok) {
       return {
         available: false,
         executable: null,
         version: null,
         reason: "lookup-failed",
-        lookupResult: loginLookup,
+        lookupResult: interactiveLookup,
       };
     }
 
-    const executable = parsePiLookupOutput(loginLookup.stdout);
-    if (executable === null) {
+    const interactiveExecutable = parsePiLookupOutput(interactiveLookup.stdout);
+    if (interactiveExecutable === null) {
       return {
         available: false,
         executable: null,
         version: null,
         reason: "not-found",
-        lookupResult: loginLookup,
+        lookupResult: interactiveLookup,
       };
     }
 
-    return this.probeVersion(distribution, executable, false);
+    return this.probeVersion(distribution, interactiveExecutable, false);
   }
 
   private async probeVersion(
@@ -526,21 +552,19 @@ export class DefaultPiExecutableLocator implements PiExecutableLocator {
     configured: boolean,
   ): Promise<PiExecutableProbe> {
     const versionResult = await this.runInDistribution(distribution, executable, ["--version"]);
-    if (!versionResult.ok && configured) {
+    if (!versionResult.ok) {
       return {
         available: false,
         executable: null,
         version: null,
-        reason: "configured-executable-failed",
+        reason: configured ? "configured-executable-failed" : "executable-version-failed",
         versionResult,
       };
     }
     return {
       available: true,
       executable,
-      version: versionResult.ok
-        ? firstNonEmptyLine(versionResult.stdout) ?? firstNonEmptyLine(versionResult.stderr)
-        : null,
+      version: firstNonEmptyLine(versionResult.stdout) ?? firstNonEmptyLine(versionResult.stderr),
       versionResult,
     };
   }

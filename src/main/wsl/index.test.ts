@@ -234,8 +234,9 @@ test("default Pi locator finds an executable and probes its version", async () =
   ]);
 });
 
-test("returns a typed not-found Pi probe when both lookups produce no path", async () => {
+test("returns a typed not-found Pi probe when every lookup produces no path", async () => {
   const fake = queuedRunner([
+    result(`${PI_LOOKUP_MARKER}\n`, ""),
     result(`${PI_LOOKUP_MARKER}\n`, ""),
     result(`${PI_LOOKUP_MARKER}\n`, ""),
   ]);
@@ -250,6 +251,7 @@ test("returns a typed not-found Pi probe when both lookups produce no path", asy
   assert.deepEqual(fake.calls.map((call) => call.args), [
     ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", PI_LOOKUP_SCRIPT],
     ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-i", "-c", PI_LOOKUP_SCRIPT],
   ]);
 });
 
@@ -358,10 +360,70 @@ test("falls back to a profile-aware lookup when the non-login lookup returns no 
   ]);
 });
 
-test("reports lookup-failed when both the non-login and login lookups fail", async () => {
+test("falls back to an interactive login lookup for profile-initialized PATHs", async () => {
+  const fake = queuedRunner([
+    result(`${PI_LOOKUP_MARKER}\n`, ""), // non-login lookup: no path
+    result("", "bash: pi: command not found", 1), // login lookup fails
+    result(
+      "Last login: Mon Aug 25 09:00:00 2026\n" +
+        "/usr/bin/echo\n" + // decoy: path-like line from profile output
+        `${PI_LOOKUP_MARKER}/home/user/.fnm/node-versions/v20.11.0/installation/bin/pi\n` +
+        "  System information as of Mon Aug 25 2026\n",
+      "bash: cannot set terminal process group (-1, 9)\n",
+    ),
+    result("pi 4.2.0\n", ""),
+  ]);
+  const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake));
+
+  const probe = await locator.locate("Ubuntu");
+
+  assert.equal(probe.available, true);
+  if (probe.available) {
+    assert.equal(probe.executable, "/home/user/.fnm/node-versions/v20.11.0/installation/bin/pi");
+    assert.equal(probe.version, "pi 4.2.0");
+  }
+  assert.deepEqual(fake.calls.map((call) => call.args), [
+    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-i", "-c", PI_LOOKUP_SCRIPT],
+    [
+      "--distribution",
+      "Ubuntu",
+      "--exec",
+      "/home/user/.fnm/node-versions/v20.11.0/installation/bin/pi",
+      "--version",
+    ],
+  ]);
+});
+
+test("reports an auto-discovered executable unavailable when its version probe fails", async () => {
+  const fake = queuedRunner([
+    result(`${PI_LOOKUP_MARKER}/usr/local/bin/pi\n`),
+    result("", "cannot execute: Exec format error", 126),
+  ]);
+  const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake));
+
+  const probe = await locator.locate("Ubuntu");
+
+  assert.equal(probe.available, false);
+  if (!probe.available && probe.reason === "executable-version-failed") {
+    assert.equal(probe.executable, null);
+    assert.equal(probe.version, null);
+    assert.equal(probe.versionResult.exitCode, 126);
+    assert.equal(probe.versionResult.stderr, "cannot execute: Exec format error");
+    assert.deepEqual(probe.versionResult.command, { executable: "/usr/local/bin/pi", args: ["--version"] });
+  }
+  assert.deepEqual(fake.calls.map((call) => call.args), [
+    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/usr/local/bin/pi", "--version"],
+  ]);
+});
+
+test("reports lookup-failed when every lookup fails", async () => {
   const fake = queuedRunner([
     result("", "sh: unavailable", 2),
     result("", "bash: unavailable", 2),
+    result("", "bash: interactive shell unavailable", 2),
   ]);
   const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake));
 
@@ -370,11 +432,12 @@ test("reports lookup-failed when both the non-login and login lookups fail", asy
   assert.equal(probe.available, false);
   if (!probe.available && probe.reason === "lookup-failed") {
     assert.equal(probe.lookupResult.exitCode, 2);
-    assert.equal(probe.lookupResult.stderr, "bash: unavailable");
+    assert.equal(probe.lookupResult.stderr, "bash: interactive shell unavailable");
   }
   assert.deepEqual(fake.calls.map((call) => call.args), [
     ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", PI_LOOKUP_SCRIPT],
     ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-i", "-c", PI_LOOKUP_SCRIPT],
   ]);
 });
 
