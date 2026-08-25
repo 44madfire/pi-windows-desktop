@@ -202,11 +202,14 @@ function recordMatches(
     if (candidate.type !== 'bash') return false;
     return candidate.command === record.command && (candidate.output ?? '') === (record.output ?? '');
   }
-  return (
-    candidate.name === record.name &&
-    (candidate.input ?? '') === (record.input ?? '') &&
-    (candidate.output ?? '') === (record.output ?? '')
-  );
+  if (record.type === 'tool' && candidate.type === 'tool') {
+    return (
+      candidate.name === record.name &&
+      (candidate.input ?? '') === (record.input ?? '') &&
+      (candidate.output ?? '') === (record.output ?? '')
+    );
+  }
+  return false;
 }
 
 /**
