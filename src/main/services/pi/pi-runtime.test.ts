@@ -379,6 +379,60 @@ function fakeStore(pointer: SessionPointer | null): SessionStore & { saved: Sess
   };
 }
 
+interface DeferredSave {
+  readonly pointer: SessionPointer;
+  resolve(): void;
+  reject(error: Error): void;
+}
+
+/**
+ * SessionStore whose saves stay pending until the test settles each one
+ * individually. Every save records its pointer in `saved` immediately, so
+ * ordering assertions can inspect what a scheduled save captured even while
+ * the write is still in flight.
+ */
+function deferredStore(): SessionStore & {
+  readonly saved: SessionPointer[];
+  readonly pending: DeferredSave[];
+  complete(save: DeferredSave): void;
+  fail(save: DeferredSave, error?: Error): void;
+} {
+  let current: SessionPointer | null = null;
+  const saved: SessionPointer[] = [];
+  const pending: DeferredSave[] = [];
+  return {
+    saved,
+    pending,
+    async load(workspaceKey: string): Promise<SessionPointer | null> {
+      return current && current.workspace === workspaceKey ? current : null;
+    },
+    save(pointer: SessionPointer): Promise<void> {
+      saved.push(pointer);
+      return new Promise<void>((resolve, reject) => {
+        const save: DeferredSave = {
+          pointer,
+          resolve: () => resolve(),
+          reject: (error: Error) => reject(error),
+        };
+        pending.push(save);
+      });
+    },
+    complete(save: DeferredSave): void {
+      const index = pending.indexOf(save);
+      if (index === -1) throw new Error("save already settled");
+      pending.splice(index, 1);
+      current = save.pointer;
+      save.resolve();
+    },
+    fail(save: DeferredSave, error: Error = new Error("disk full")): void {
+      const index = pending.indexOf(save);
+      if (index === -1) throw new Error("save already settled");
+      pending.splice(index, 1);
+      save.reject(error);
+    },
+  };
+}
+
 test("a restored runtime resumes switch_session, requests full history, and re-hydrates the fresh conversation", async () => {
   const forwarded: PiEvent[] = [];
   const transport = new FakeTransport((command) => {
@@ -1516,6 +1570,193 @@ test("a queued prompt is dispatched only after the post-settled synchronization 
   );
 
   await runtime.stop();
+});
+
+test("a deferred pointer save never holds the queued prompt after settle", async () => {
+  const store = deferredStore();
+  let getEntriesCalls = 0;
+  const responses = (command: WireCommand): Record<string, unknown> => {
+    switch (command.type) {
+      case "new_session":
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "get_state":
+        return { sessionId: "pi-session-1", sessionFile };
+      case "get_entries": {
+        getEntriesCalls += 1;
+        // 1: startup full-history catch-up on a fresh session — empty.
+        if (getEntriesCalls === 1) return { entries: [], leafId: null };
+        // 2: the post-agent_settled synchronization returns the settled
+        // turn's authoritative user entry for reconciliation.
+        return {
+          entries: [
+            {
+              type: "message",
+              id: "user-1",
+              parentId: null,
+              timestamp: "2026-01-01T00:00:00.000Z",
+              message: { role: "user", content: "first" },
+            },
+          ],
+          leafId: "user-1",
+        };
+      }
+      default:
+        return {};
+    }
+  };
+  const transport = new FakeTransport(responses);
+  const runtime = new PiRuntimeController({
+    wsl: fakeWsl,
+    createTransport: () => transport,
+    sessionStore: store,
+  });
+
+  // Startup still awaits its pointer save; release it so start completes.
+  const starting = runtime.start(workspace);
+  await flushMicrotasks();
+  assert.equal(store.pending.length, 1, "startup must await exactly one pointer save");
+  store.complete(store.pending[0]);
+  const started = await starting;
+  assert.equal(started.state, "ready");
+
+  await runtime.sendPrompt("first");
+  await runtime.sendPrompt("second");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 1);
+  assert.equal(
+    transport.writtenCommands().filter((command) => command.type === "prompt").length,
+    1,
+  );
+
+  // The first turn settles; the settle schedules its pointer saves without
+  // awaiting them, so the queue releases even though both writes are still
+  // in flight.
+  transport.emitStdoutLine(JSON.stringify({ type: "agent_settled" }));
+  await flushMicrotasks();
+  await flushMicrotasks();
+
+  assert.equal(store.pending.length, 2, "the settle scheduled two fire-and-forget saves");
+  assert.deepEqual(
+    transport.writtenCommands().map((command) => command.type),
+    [
+      "new_session",
+      "get_state",
+      "get_entries",
+      "prompt",
+      // The controlled settle refresh: get_entries catch-up, then the
+      // authoritative get_state, then a best-effort supported-levels read.
+      "get_entries",
+      "get_state",
+      "get_available_thinking_levels",
+      "prompt",
+    ],
+    "the queued prompt must dispatch while the pointer saves are still pending",
+  );
+  assert.equal(runtime.snapshot.state, "ready");
+  assert.equal(runtime.snapshot.lastSeenEntryId, "user-1");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 0);
+
+  // Releasing the deferred saves persists the settled pointer and never
+  // surfaces a warning.
+  for (const save of [...store.pending]) store.complete(save);
+  await flushMicrotasks();
+  assert.equal(store.saved[store.saved.length - 1].lastEntryId, "user-1");
+  assert.equal(runtime.snapshot.lastWarning, null);
+
+  const stopping = runtime.stop();
+  await flushMicrotasks();
+  assert.equal(store.pending.length, 1, "stop still awaits its pointer save");
+  store.complete(store.pending[0]);
+  await stopping;
+  assert.equal(runtime.snapshot.state, "stopped");
+});
+
+test("a stale deferred pointer save cannot publish warning state onto a stopped runtime", async () => {
+  const forwarded: PiEvent[] = [];
+  const store = deferredStore();
+  let getEntriesCalls = 0;
+  const responses = (command: WireCommand): Record<string, unknown> => {
+    switch (command.type) {
+      case "new_session":
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "get_state":
+        return { sessionId: "pi-session-1", sessionFile };
+      case "get_entries": {
+        getEntriesCalls += 1;
+        // 1: startup full-history catch-up on a fresh session — empty.
+        if (getEntriesCalls === 1) return { entries: [], leafId: null };
+        // 2: the post-agent_settled synchronization returns the settled
+        // turn's authoritative user entry for reconciliation.
+        return {
+          entries: [
+            {
+              type: "message",
+              id: "user-1",
+              parentId: null,
+              timestamp: "2026-01-01T00:00:00.000Z",
+              message: { role: "user", content: "first" },
+            },
+          ],
+          leafId: "user-1",
+        };
+      }
+      default:
+        return {};
+    }
+  };
+  const transport = new FakeTransport(responses);
+  const runtime = new PiRuntimeController({
+    wsl: fakeWsl,
+    createTransport: () => transport,
+    sessionStore: store,
+    handlers: { onEvent: (event) => forwarded.push(event) },
+  });
+
+  const starting = runtime.start(workspace);
+  await flushMicrotasks();
+  store.complete(store.pending[0]);
+  await starting;
+
+  await runtime.sendPrompt("first");
+  await runtime.sendPrompt("second");
+  transport.emitStdoutLine(JSON.stringify({ type: "agent_settled" }));
+  await flushMicrotasks();
+  await flushMicrotasks();
+
+  // The settle's two fire-and-forget saves are still in flight (deferred)
+  // while the queue already released; both carry the settled append cursor.
+  assert.equal(store.pending.length, 2);
+  const staleSaves = [...store.pending];
+  assert.equal(staleSaves[0].pointer.lastEntryId, "user-1");
+  assert.equal(staleSaves[1].pointer.lastEntryId, "user-1");
+
+  // Stop while those saves are pending. Stop still awaits its own save.
+  const stopping = runtime.stop();
+  await flushMicrotasks();
+  const stopSave = store.pending.find((save) => !staleSaves.includes(save));
+  assert.ok(stopSave, "stop must persist its own pointer");
+  store.complete(stopSave);
+  await stopping;
+  assert.equal(runtime.snapshot.state, "stopped");
+
+  // The stale saves now settle after the runtime was stopped: a failure
+  // must not publish a warning onto the stopped runtime, and a success must
+  // not clear anything either.
+  store.fail(staleSaves[0]);
+  store.complete(staleSaves[1]);
+  await flushMicrotasks();
+
+  assert.equal(runtime.snapshot.lastWarning, null);
+  const warned = forwarded.find(
+    (event): event is Extract<PiEvent, { type: "runtime" }> =>
+      event.type === "runtime" &&
+      (event.snapshot as PiRuntimeSessionSnapshot).lastWarning !== null,
+  );
+  assert.ok(
+    warned === undefined,
+    "a stale pointer save must not publish warning state onto the stopped runtime",
+  );
 });
 
 test("overlapping start/stop/reconnect lifecycle operations serialize deterministically", async () => {

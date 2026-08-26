@@ -324,10 +324,12 @@ export class PiRuntimeController {
       conversation = new ConversationController(activeClient, {
         // After agent_settled completes a turn, synchronize get_entries from
         // the durable append cursor, reconcile the authoritative entries with
-        // the live timeline, and persist the resulting pointer. The controller
-        // keeps its queue paused until this resolves, so the next queued
-        // prompt is never dispatched before the post-settled sync. The
-        // lifecycle tail serializes this against start/stop/reconnect.
+        // the live timeline, and schedule persistence of the resulting
+        // pointer (never awaited). The controller keeps its queue paused
+        // until this resolves, so the next queued prompt is never dispatched
+        // before the post-settled sync, while a slow local pointer write
+        // cannot delay it either. The lifecycle tail serializes this against
+        // start/stop/reconnect.
         onSettle: (): Promise<void> =>
           this.enqueueLifecycle(() =>
             this.synchronizeAfterSettle(workspaceKey, activeClient, session, conversation),
@@ -514,11 +516,18 @@ export class PiRuntimeController {
   /**
    * Post-settle synchronization for the runtime wiring that created it:
    * catch up get_entries from the durable cursor, reconcile the
-   * authoritative entries with the live timeline (idempotent), and persist
-   * the resulting pointer. Runs on the lifecycle tail so it never overlaps
-   * start/stop/reconnect. When the wiring is no longer live (the runtime was
-   * stopped) it rejects so the conversation keeps its queue paused instead
-   * of dispatching into a dead runtime.
+   * authoritative entries with the live timeline (idempotent), and schedule
+   * persistence of the resulting pointer. Runs on the lifecycle tail so it
+   * never overlaps start/stop/reconnect. When the wiring is no longer live
+   * (the runtime was stopped) it rejects so the conversation keeps its queue
+   * paused instead of dispatching into a dead runtime.
+   *
+   * The pointer write is deliberately NOT awaited: the conversation queue is
+   * released the moment this settle resolves, and a slow local save must not
+   * delay the next queued prompt. The save is scheduled only after the
+   * authoritative sync/hydrate/publication have all completed, and its
+   * warning outcome is guarded inside persistPointer, so a late completion
+   * cannot publish stale warning state onto a replaced or stopped runtime.
    *
    * The best-effort supported-levels catalog read is guarded by a post-read
    * transport boundary: a transport that died during (or right after) the
@@ -578,7 +587,6 @@ export class PiRuntimeController {
     }
     if (this.client !== client || this.session !== session) return;
     conversation.hydrate(sync.entries);
-    await this.persistPointer(workspaceKey, session);
     this.verifyRuntimeWiring(client, session);
     // A single post-settle snapshot: the effective agent state from the
     // authoritative refresh plus the model-specific supported levels. A
@@ -590,6 +598,12 @@ export class PiRuntimeController {
       thinkingLevel: session.thinkingLevel,
       availableThinkingLevels: levels ?? [],
     });
+    // Schedule the pointer persistence, never await it: the queue is
+    // released when this settle resolves, and a slow local write must not
+    // delay the next prompt. persistPointer is best effort and only
+    // publishes its warning/clear outcome while the runtime still owns this
+    // session, so a save that lands after a stop or restart stays silent.
+    void this.persistPointer(workspaceKey, session);
   }
 
   /**
@@ -850,6 +864,14 @@ export class PiRuntimeController {
    * channel) while the runtime keeps running and the queue keeps dispatching;
    * the next successful save clears it. The in-memory cursor state is never
    * affected.
+   *
+   * The warning/clear publication is guarded by the captured session
+   * identity: a save scheduled by a settled turn or a cursor change can
+   * complete after the runtime was stopped or restarted, and its outcome
+   * must then stay silent instead of painting warning state onto the
+   * replacement runtime. The save itself still runs — the pointer belongs to
+   * the captured session — but only a runtime that still owns that session
+   * publishes the result.
    */
   private async persistPointer(workspaceKey: string, session: SessionManager): Promise<void> {
     if (!this.sessionStore) return;
@@ -865,11 +887,17 @@ export class PiRuntimeController {
     try {
       await this.sessionStore.save(pointer);
     } catch (error) {
+      // A stale fire-and-forget save landing after the runtime was stopped
+      // or replaced must not publish its failure onto the live runtime.
+      if (this.session !== session) return;
       this.setSnapshot({
         lastWarning: `Failed to persist the Pi session pointer: ${errorMessage(error)}`,
       });
       return;
     }
+    // A stale successful save must not clear a warning the current runtime
+    // published in the meantime.
+    if (this.session !== session) return;
     if (this.snapshotValue.lastWarning !== null) {
       this.setSnapshot({ lastWarning: null });
     }
