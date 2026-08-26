@@ -42,6 +42,7 @@ const desktopApi: DesktopApi = {
   getPiStatus: () => invoke(IPC_CHANNELS.getPiStatus),
   sendExtensionUiResponse: (response) => invoke(IPC_CHANNELS.piExtensionUiResponse, { response }),
   getAvailableModels: () => invoke(IPC_CHANNELS.getAvailableModels),
+  getAvailableThinkingLevels: () => invoke(IPC_CHANNELS.getAvailableThinkingLevels),
   setModel: (provider, modelId) => invoke(IPC_CHANNELS.setModel, { provider, modelId }),
   setThinkingLevel: (level) => invoke(IPC_CHANNELS.setThinkingLevel, { level }),
   sendPrompt: (prompt) => invoke(IPC_CHANNELS.sendPrompt, { prompt }),

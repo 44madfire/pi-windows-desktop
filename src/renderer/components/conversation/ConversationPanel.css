@@ -79,6 +79,17 @@
   opacity: 0.58;
 }
 
+.agent-state-feedbacks {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.agent-state-feedback > span:not(.agent-state-feedback-icon) {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .agent-state-feedback {
   display: flex;
   min-height: 15px;

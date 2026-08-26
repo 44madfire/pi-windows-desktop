@@ -116,10 +116,12 @@ function registerIpcHandlers(): void {
     await piRuntime.sendExtensionUiResponse(payload.response);
   });
   // Agent-state selectors: the renderer only gets typed wrappers. Command
-  // shapes (get_available_models/set_model/set_thinking_level) are owned by
-  // the runtime, and the runtime re-validates identities before building any
-  // Pi command, so no raw Pi command or Node privilege crosses IPC.
+  // shapes (get_available_models/get_available_thinking_levels/set_model/
+  // set_thinking_level) are owned by the runtime, and the runtime re-validates
+  // identities before building any Pi command, so no raw Pi command or Node
+  // privilege crosses IPC.
   ipcMain.handle(IPC_CHANNELS.getAvailableModels, () => piRuntime.getAvailableModels());
+  ipcMain.handle(IPC_CHANNELS.getAvailableThinkingLevels, () => piRuntime.getAvailableThinkingLevels());
   ipcMain.handle(IPC_CHANNELS.setModel, (_event, request: unknown) => {
     const payload = requireInvokeObject(IPC_CHANNELS.setModel, request);
     if (typeof payload.provider !== 'string' || typeof payload.modelId !== 'string') {
