@@ -1,3 +1,8 @@
+import {
+  PI_THINKING_LEVELS,
+  type PiModel,
+  type PiThinkingLevel,
+} from "../../../shared/ipc.ts";
 import type {
   JsonObject,
   JsonValue,
@@ -52,6 +57,13 @@ export interface SessionSnapshot {
   /** Compatibility alias equal to lastSeenEntryId (legacy name). */
   readonly lastEntryId: SessionCursor;
   readonly lastError: string | null;
+  /**
+   * Active agent model projected from the authoritative `get_state`
+   * response (`model: {id, provider}`); null until Pi reports one.
+   */
+  readonly model: PiModel | null;
+  /** Active agent thinking level projected from `get_state`; null until Pi reports one. */
+  readonly thinkingLevel: PiThinkingLevel | null;
 }
 
 /** A structural subset of PiRpcClient used by the session service. */
@@ -96,6 +108,10 @@ export interface SessionManagerOptions {
   readonly leafId?: SessionCursor;
   /** Legacy alias for `lastSeenEntryId` accepted for restored pointers. */
   readonly lastEntryId?: SessionCursor;
+  /** Active agent model projected from `get_state`; null until Pi reports one. */
+  readonly model?: PiModel | null;
+  /** Active agent thinking level projected from `get_state`; null until Pi reports one. */
+  readonly thinkingLevel?: PiThinkingLevel | null;
   readonly initialSnapshot?: SessionSnapshot;
   readonly commands?: Partial<SessionCommandFactory>;
 }
@@ -311,6 +327,78 @@ function responseLeafId(response: PiRpcSuccessResponse): {
   return { present: false, value: null };
 }
 
+function parseModelValue(value: unknown): PiModel | null {
+  const record = asRecord(value);
+  if (!record) return null;
+  const id = nonEmptyString(record["id"]);
+  const provider = nonEmptyString(record["provider"]);
+  if (id === null || provider === null) return null;
+  const name = nonEmptyString(record["name"]);
+  return name === null ? { id, provider } : { id, provider, name };
+}
+
+/**
+ * Read the active agent model from a response (`model: {id, provider}`),
+ * looking at the root, `data`, and `data.session` like the other tolerant
+ * readers. Presence is reported separately from the value so an explicit
+ * `null` resets the projected model instead of retaining a stale one.
+ */
+function responseModel(response: PiRpcSuccessResponse): {
+  readonly present: boolean;
+  readonly value: PiModel | null;
+} {
+  const root = asRecord(response);
+  if (root !== null && recordHasKey(root, "model")) {
+    return { present: true, value: parseModelValue(root["model"]) };
+  }
+  const data = asRecord(response.data);
+  if (data !== null && recordHasKey(data, "model")) {
+    return { present: true, value: parseModelValue(data["model"]) };
+  }
+  const session = asRecord(data?.session);
+  if (session !== null && recordHasKey(session, "model")) {
+    return { present: true, value: parseModelValue(session["model"]) };
+  }
+  return { present: false, value: null };
+}
+
+function normalizeThinkingLevel(level: string): PiThinkingLevel | null {
+  return (PI_THINKING_LEVELS as readonly string[]).includes(level)
+    ? (level as PiThinkingLevel)
+    : null;
+}
+
+/**
+ * Read a thinking level from a record, honoring `thinkingLevel`/
+ * `thinking_level`. Presence is reported separately: an explicit `null` (or a
+ * value outside Pi's allowed levels) resets the projected level, while a
+ * missing key keeps the previous value.
+ */
+function readThinkingLevel(record: JsonObject | null): {
+  readonly present: boolean;
+  readonly value: PiThinkingLevel | null;
+} {
+  if (!record) return { present: false, value: null };
+  for (const key of ["thinkingLevel", "thinking_level"] as const) {
+    if (recordHasKey(record, key)) {
+      const level = nonEmptyString(record[key]);
+      return { present: true, value: level === null ? null : normalizeThinkingLevel(level) };
+    }
+  }
+  return { present: false, value: null };
+}
+
+function responseThinkingLevel(response: PiRpcSuccessResponse): {
+  readonly present: boolean;
+  readonly value: PiThinkingLevel | null;
+} {
+  const root = readThinkingLevel(asRecord(response));
+  if (root.present) return root;
+  const data = readThinkingLevel(asRecord(response.data));
+  if (data.present) return data;
+  return readThinkingLevel(asRecord(asRecord(response.data)?.session));
+}
+
 /**
  * Resolve the durable append-order cursor from a response.
  *
@@ -435,6 +523,26 @@ function validateCursor(cursor: SessionCursor | undefined): SessionCursor {
   return validateSessionId(cursor);
 }
 
+function validateModel(model: PiModel | null | undefined): PiModel | null {
+  if (model === undefined || model === null) return null;
+  const id = nonEmptyString(model.id);
+  const provider = nonEmptyString(model.provider);
+  if (id === null || provider === null) {
+    throw new TypeError("model requires non-empty id and provider strings");
+  }
+  const name = nonEmptyString(model.name);
+  return name === null ? { id, provider } : { id, provider, name };
+}
+
+function validateThinkingLevel(level: PiThinkingLevel | null | undefined): PiThinkingLevel | null {
+  if (level === undefined || level === null) return null;
+  const normalized = normalizeThinkingLevel(level);
+  if (normalized === null) {
+    throw new TypeError(`thinkingLevel must be one of: ${PI_THINKING_LEVELS.join(", ")}`);
+  }
+  return normalized;
+}
+
 /**
  * Owns logical session state and Pi-history catch-up, but not the Pi process.
  *
@@ -456,6 +564,8 @@ export class SessionManager {
   private lastSeenEntryIdValue: SessionCursor = null;
   private leafIdValue: SessionCursor = null;
   private lastErrorValue: string | null = null;
+  private modelValue: PiModel | null = null;
+  private thinkingLevelValue: PiThinkingLevel | null = null;
   private readonly commands: SessionCommandFactory;
   private readonly stateListeners = new Set<SessionSnapshotListener>();
   private operationTail: Promise<void> = Promise.resolve();
@@ -476,6 +586,10 @@ export class SessionManager {
     );
     this.leafIdValue = validateCursor(options.leafId ?? initial?.leafId);
     this.lastErrorValue = initial?.lastError ?? null;
+    this.modelValue = validateModel(options.model ?? initial?.model ?? null);
+    this.thinkingLevelValue = validateThinkingLevel(
+      options.thinkingLevel ?? initial?.thinkingLevel ?? null,
+    );
     this.commands = { ...defaultCommands, ...options.commands };
 
     if (options.client) {
@@ -519,6 +633,16 @@ export class SessionManager {
     return this.lastSeenEntryIdValue;
   }
 
+  /** Active agent model projected from the authoritative `get_state`. */
+  get model(): PiModel | null {
+    return this.modelValue;
+  }
+
+  /** Active agent thinking level projected from the authoritative `get_state`. */
+  get thinkingLevel(): PiThinkingLevel | null {
+    return this.thinkingLevelValue;
+  }
+
   /** Alias that makes the durable append cursor explicit as a synchronization cursor. */
   get cursor(): SessionCursor {
     return this.lastSeenEntryIdValue;
@@ -533,6 +657,8 @@ export class SessionManager {
       leafId: this.leafIdValue,
       lastEntryId: this.lastSeenEntryIdValue,
       lastError: this.lastErrorValue,
+      model: this.modelValue,
+      thinkingLevel: this.thinkingLevelValue,
     };
   }
 
@@ -617,6 +743,8 @@ export class SessionManager {
           this.sessionFileValue = null;
           this.lastSeenEntryIdValue = null;
           this.leafIdValue = null;
+          this.modelValue = null;
+          this.thinkingLevelValue = null;
           this.emitSnapshot();
           const command = validateCommand(this.commands.create(this.sessionIdValue), "create");
           const response = await this.request(client, command, "create");
@@ -855,6 +983,12 @@ export class SessionManager {
 
     const leaf = responseLeafId(response);
     if (leaf.present) this.leafIdValue = leaf.value;
+
+    const model = responseModel(response);
+    if (model.present) this.modelValue = model.value;
+
+    const thinkingLevel = responseThinkingLevel(response);
+    if (thinkingLevel.present) this.thinkingLevelValue = thinkingLevel.value;
 
     const cursor = responseAppendCursor(response, entries, this.lastSeenEntryIdValue);
     if (cursor !== null) this.lastSeenEntryIdValue = cursor;
