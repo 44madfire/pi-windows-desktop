@@ -90,6 +90,8 @@ export interface PiRuntimeSnapshot {
   workspace: WslWorkspace | null;
   piVersion: string | null;
   lastError: string | null;
+  /** Non-fatal runtime warning, such as a failed best-effort pointer save. */
+  lastWarning: string | null;
   /**
    * Durable append-order cursor: the last entry id observed in a get_entries
    * response, driving the next `since` catch-up. `lastEntryId` is a
