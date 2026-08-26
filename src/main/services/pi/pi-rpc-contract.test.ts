@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import test from "node:test";
 
+import { PI_THINKING_LEVELS } from "../../../shared/ipc.ts";
+
 /**
  * Opt-in contract suite against a live `pi --mode rpc --no-session` process.
  *
@@ -12,13 +14,21 @@ import test from "node:test";
  *   append order) and `data.leafId`, the current active leaf — which may be
  *   null. The append cursor is the last entry id, not `leafId`.
  * - `get_entries` with a stale `since` cursor answers `success: false`.
+ * - `set_thinking_level` answers `success: true` with no `data` (success-only
+ *   acknowledgement); the effective level is owned by the authoritative
+ *   `get_state` session state, never the requested value.
+ * - `set_model` answers `success: true` with `data` as a full Model object
+ *   (`{id, provider, name?}`) and the authoritative `get_state` session state
+ *   then reports the same identity. Without model credentials pi rejects the
+ *   command; the suite skips that case instead of failing on credential
+ *   absence.
  * - The suite never triggers extension UI requests; any
  *   `extension_ui_request` events pi happens to interleave are tolerated
  *   without breaking request/response correlation.
  *
- * The suite is inert unless `PI_RPC_INTEGRATION=1` (no prompt is sent and no
- * model credentials are required). `PI_RPC_BIN` overrides the executable;
- * the default is `pi` resolved from PATH.
+ * The suite is inert unless `PI_RPC_INTEGRATION=1` (no prompt is sent; the
+ * mutation tests skip when model credentials are absent). `PI_RPC_BIN`
+ * overrides the executable; the default is `pi` resolved from PATH.
  */
 
 const INTEGRATION_ENABLED = process.env.PI_RPC_INTEGRATION === "1";
@@ -381,6 +391,219 @@ test(
           assert.equal(typeof model.name, "string");
         }
       }
+    } finally {
+      await client.close();
+    }
+  },
+);
+
+test(
+  "live pi RPC answers get_available_thinking_levels with an authoritative model-specific levels array",
+  { skip, timeout: TEST_TIMEOUT_MS },
+  async () => {
+    // Thinking-level listing is a non-LLM catalog query: it must answer
+    // without credentials, pinning the shape `data.levels` of `{off, ...}`
+    // strings the shell's thinking selector depends on. Pi lists only the
+    // levels the current model supports; a non-reasoning model answers
+    // `["off"]`. The shell never substitutes the global enum.
+    const client = new LivePiRpcClient(PI_RPC_BIN);
+    try {
+      const response = await client.request({ type: "get_available_thinking_levels" });
+      assert.equal(response.type, "response");
+      assert.equal(response.command, "get_available_thinking_levels");
+      assert.equal(response.success, true);
+      assert.ok(Number.isFinite(response.id));
+      assert.ok(response.data !== null && typeof response.data === "object");
+      const data = response.data as Record<string, unknown>;
+      assert.ok(Array.isArray(data.levels));
+      const levels = data.levels as unknown[];
+      assert.ok(levels.length > 0, "every model supports at least one thinking level");
+      for (const level of levels) {
+        assert.equal(typeof level, "string");
+        assert.ok(
+          (PI_THINKING_LEVELS as readonly string[]).includes(level as string),
+          `level "${String(level)}" must be one of the known Pi thinking levels`,
+        );
+      }
+    } finally {
+      await client.close();
+    }
+  },
+);
+
+test(
+  "live pi RPC set_thinking_level answers success-only and get_state reports a valid effective level",
+  { skip, timeout: TEST_TIMEOUT_MS },
+  async (t) => {
+    // set_thinking_level is a credential-free mutation: Pi accepts it without
+    // model auth and may clamp the level to what the active model supports.
+    // The RPC response contract is success-only — no effective payload in
+    // `data` — so the effective level is owned by the authoritative get_state
+    // session state (`data.thinkingLevel`), never the requested value.
+    const client = new LivePiRpcClient(PI_RPC_BIN);
+    try {
+      const state = await client.request({ type: "get_state" });
+      assert.equal(state.type, "response");
+      assert.equal(state.command, "get_state");
+      assert.equal(state.success, true);
+      assert.ok(state.data !== null && typeof state.data === "object");
+      const stateData = state.data as Record<string, unknown>;
+
+      // Select the level to re-assert: the effective level the session state
+      // reports. A session-less process may report none; fall back to the
+      // first level the active model supports (a credential-free catalog
+      // read) rather than fabricating one.
+      let level: string;
+      if (
+        typeof stateData.thinkingLevel === "string" &&
+        (stateData.thinkingLevel as string).length > 0
+      ) {
+        level = stateData.thinkingLevel as string;
+      } else {
+        const levels = await client.request({ type: "get_available_thinking_levels" });
+        assert.equal(levels.type, "response");
+        assert.equal(levels.command, "get_available_thinking_levels");
+        assert.equal(levels.success, true);
+        assert.ok(levels.data !== null && typeof levels.data === "object");
+        const levelsData = levels.data as Record<string, unknown>;
+        assert.ok(Array.isArray(levelsData.levels));
+        const supported = levelsData.levels as unknown[];
+        assert.ok(supported.length > 0, "every model supports at least one thinking level");
+        assert.equal(typeof supported[0], "string");
+        level = supported[0] as string;
+      }
+
+      const response = await client.request({ type: "set_thinking_level", level });
+      assert.equal(response.type, "response");
+      assert.equal(response.command, "set_thinking_level");
+      assert.equal(response.success, true);
+      assert.ok(Number.isFinite(response.id));
+      // Success-only RPC response: `data` carries no effective payload. The
+      // effective level must be read back from the authoritative get_state
+      // session state below — never trusted from this acknowledgement.
+      assert.equal(response.data, undefined);
+
+      const after = await client.request({ type: "get_state" });
+      assert.equal(after.type, "response");
+      assert.equal(after.command, "get_state");
+      assert.equal(after.success, true);
+      assert.ok(after.data !== null && typeof after.data === "object");
+      const afterData = after.data as Record<string, unknown>;
+      // The session state must report a valid effective level: non-empty and
+      // one of the levels the shell's validation accepts.
+      assert.equal(typeof afterData.thinkingLevel, "string");
+      assert.ok((afterData.thinkingLevel as string).length > 0);
+      assert.ok(
+        (PI_THINKING_LEVELS as readonly string[]).includes(afterData.thinkingLevel as string),
+        `effective level "${String(afterData.thinkingLevel)}" must be one of the known Pi thinking levels`,
+      );
+    } finally {
+      await client.close();
+    }
+  },
+);
+
+test(
+  "live pi RPC set_model answers a full Model object and get_state reports matching identity",
+  { skip, timeout: TEST_TIMEOUT_MS },
+  async (t) => {
+    // set_model is the one mutation whose success RPC response carries the
+    // full Model object in `data` (`{id, provider, name?}`) — the selector's
+    // contract. Unlike the catalog reads it requires model auth: a
+    // credentials-less pi rejects it, which is an environment condition, not
+    // a contract failure. The effective model is owned by the authoritative
+    // get_state session state (`data.model`), which must report the same
+    // identity after the mutation.
+    const client = new LivePiRpcClient(PI_RPC_BIN);
+    try {
+      const modelsResponse = await client.request({ type: "get_available_models" });
+      assert.equal(modelsResponse.type, "response");
+      assert.equal(modelsResponse.command, "get_available_models");
+      assert.equal(modelsResponse.success, true);
+      assert.ok(modelsResponse.data !== null && typeof modelsResponse.data === "object");
+      const modelsData = modelsResponse.data as Record<string, unknown>;
+      assert.ok(Array.isArray(modelsData.models));
+      const models = modelsData.models as Array<Record<string, unknown>>;
+      for (const model of models) {
+        assert.ok(model !== null && typeof model === "object");
+        assert.equal(typeof model.id, "string");
+        assert.ok((model.id as string).length > 0);
+        assert.equal(typeof model.provider, "string");
+        assert.ok((model.provider as string).length > 0);
+      }
+      if (models.length === 0) {
+        t.skip("pi reports no available model to set; nothing to mutate");
+        return;
+      }
+
+      // Prefer re-asserting the current model (idempotent: never silently
+      // changes the user's selection); fall back to the first catalog entry
+      // when the session state reports no active model.
+      const state = await client.request({ type: "get_state" });
+      assert.equal(state.type, "response");
+      assert.equal(state.command, "get_state");
+      assert.equal(state.success, true);
+      assert.ok(state.data !== null && typeof state.data === "object");
+      const stateData = state.data as Record<string, unknown>;
+      let target: Record<string, unknown>;
+      if (stateData.model !== null && typeof stateData.model === "object") {
+        const current = stateData.model as Record<string, unknown>;
+        const matching = models.find(
+          (model) => model.id === current.id && model.provider === current.provider,
+        );
+        target = matching ?? (models[0] as Record<string, unknown>);
+      } else {
+        target = models[0] as Record<string, unknown>;
+      }
+
+      const response = await client.request({
+        type: "set_model",
+        provider: target.provider,
+        modelId: target.id,
+      });
+      assert.equal(response.type, "response");
+      assert.equal(response.command, "set_model");
+      if (response.success !== true) {
+        // A credentials-less environment (no API key/model auth configured)
+        // makes Pi reject set_model. That is not a contract failure: mark the
+        // case skipped with the rejection text as the explicit reason.
+        t.skip(
+          `pi rejected set_model; model auth not configured? (${String(response.error ?? "no error text")})`,
+        );
+        return;
+      }
+      assert.ok(Number.isFinite(response.id));
+      assert.ok(response.data !== null && typeof response.data === "object");
+      const data = response.data as Record<string, unknown>;
+      // The success `data` payload is a full Model object: stable identity
+      // fields id/provider plus an optional display name.
+      assert.equal(typeof data.id, "string");
+      assert.ok((data.id as string).length > 0);
+      assert.equal(typeof data.provider, "string");
+      assert.ok((data.provider as string).length > 0);
+      if (data.name !== undefined) {
+        assert.equal(typeof data.name, "string");
+      }
+
+      // The authoritative get_state session state must report the same model
+      // identity the set_model response echoed.
+      const after = await client.request({ type: "get_state" });
+      assert.equal(after.type, "response");
+      assert.equal(after.command, "get_state");
+      assert.equal(after.success, true);
+      assert.ok(after.data !== null && typeof after.data === "object");
+      const afterData = after.data as Record<string, unknown>;
+      assert.ok(afterData.model !== null && typeof afterData.model === "object");
+      const afterModel = afterData.model as Record<string, unknown>;
+      assert.equal(typeof afterModel.id, "string");
+      assert.ok((afterModel.id as string).length > 0);
+      assert.equal(typeof afterModel.provider, "string");
+      assert.ok((afterModel.provider as string).length > 0);
+      if (afterModel.name !== undefined) {
+        assert.equal(typeof afterModel.name, "string");
+      }
+      assert.equal(afterModel.id, data.id);
+      assert.equal(afterModel.provider, data.provider);
     } finally {
       await client.close();
     }
