@@ -89,6 +89,8 @@ export interface WslServiceOptions {
   readonly runner?: ProcessRunner;
   readonly wslExecutable?: string;
   readonly piLocator?: PiExecutableLocator;
+  /** Explicit Pi executable path inside a distro. When set, discovery skips the PATH lookup. */
+  readonly piExecutable?: string;
   readonly timeoutMs?: number;
   readonly maxBufferBytes?: number;
 }
@@ -404,41 +406,73 @@ export function createNodeProcessRunner(): ProcessRunner {
     });
 }
 
-/** Default discovery strategy for a Pi executable inside a selected distro. */
+/**
+ * Default discovery strategy for a Pi executable inside a selected distro.
+ *
+ * When a configured executable path is supplied, discovery skips the PATH
+ * lookup entirely and probes that executable's version directly. Otherwise it
+ * runs a non-login `/bin/sh -c command -v pi` lookup, then falls back to a
+ * profile-aware `/bin/bash -lc command -v pi` lookup when the first lookup
+ * fails or returns no path, so nvm/fnm/profile-installed Pi executables are
+ * still discoverable. Lookup and version commands always keep discrete argv
+ * entries; a configured path is never interpolated into a shell command.
+ */
 export class DefaultPiExecutableLocator implements PiExecutableLocator {
   private readonly runInDistribution: RunInDistribution;
+  private readonly configuredExecutable: string | null;
 
-  constructor(runInDistribution: RunInDistribution) {
+  constructor(runInDistribution: RunInDistribution, piExecutable?: string) {
     this.runInDistribution = runInDistribution;
+    if (piExecutable !== undefined) {
+      validateNonEmpty(piExecutable, "piExecutable");
+    }
+    this.configuredExecutable = piExecutable ?? null;
   }
 
   async locate(distribution: string): Promise<PiExecutableProbe> {
-    const lookupResult = await this.runInDistribution(distribution, "/bin/sh", [
+    if (this.configuredExecutable !== null) {
+      return this.probeVersion(distribution, this.configuredExecutable);
+    }
+
+    const shLookup = await this.runInDistribution(distribution, "/bin/sh", [
       "-c",
       "command -v pi",
     ]);
+    const shExecutable = shLookup.ok ? firstNonEmptyLine(shLookup.stdout) : null;
+    if (shExecutable !== null) {
+      return this.probeVersion(distribution, shExecutable);
+    }
 
-    const executable = lookupResult.ok ? firstNonEmptyLine(lookupResult.stdout) : null;
-    if (!lookupResult.ok) {
+    const loginLookup = await this.runInDistribution(distribution, "/bin/bash", [
+      "-l",
+      "-c",
+      "command -v pi",
+    ]);
+    if (!loginLookup.ok) {
       return {
         available: false,
         executable: null,
         version: null,
         reason: "lookup-failed",
-        lookupResult,
+        lookupResult: loginLookup,
       };
     }
 
+    const executable = firstNonEmptyLine(loginLookup.stdout);
     if (executable === null) {
       return {
         available: false,
         executable: null,
         version: null,
         reason: "not-found",
-        lookupResult,
+        lookupResult: loginLookup,
       };
     }
 
+    return this.probeVersion(distribution, executable);
+  }
+
+  private async probeVersion(distribution: string, executable: string): Promise<PiExecutableProbe> {
     const versionResult = await this.runInDistribution(distribution, executable, ["--version"]);
     return {
       available: true,
@@ -479,7 +513,7 @@ export class WslService {
 
     const runInDistribution: RunInDistribution = (distribution, executable, args = []) =>
       this.runInDistribution(distribution, executable, args);
-    this.piLocator = options.piLocator ?? new DefaultPiExecutableLocator(runInDistribution);
+    this.piLocator = options.piLocator ?? new DefaultPiExecutableLocator(runInDistribution, options.piExecutable);
   }
 
   async listDistributions(): Promise<readonly WslDistribution[]> {

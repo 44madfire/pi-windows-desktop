@@ -14,6 +14,7 @@ import {
   type PiExecutableLocator,
   type ProcessRequest,
   type ProcessResult,
+  type RunInDistribution,
 } from "./index.ts";
 
 interface FakeRunner {
@@ -45,6 +46,23 @@ function queuedRunner(results: ProcessResult[]): FakeRunner {
       }
       return next;
     },
+  };
+}
+
+function fakeRunInDistribution(fake: FakeRunner): RunInDistribution {
+  return async (distribution, executable, args = []) => {
+    const request: ProcessRequest = {
+      executable: "wsl-test.exe",
+      args: ["--distribution", distribution, "--exec", executable, ...args],
+    };
+    const processResult = await fake.run(request);
+    return {
+      ...processResult,
+      distribution,
+      command: { executable, args: [...args] },
+      request,
+      ok: processResult.exitCode === 0 && processResult.signal === null && processResult.failure === null,
+    };
   };
 }
 
@@ -183,26 +201,8 @@ test("reports an unavailable distro without attempting Pi discovery", async () =
 
 test("default Pi locator finds an executable and probes its version", async () => {
   const fake = queuedRunner([result("/usr/local/bin/pi\n"), result("pi 2.4.1\n", "")]);
-  const runInDistribution = async (
-    distribution: string,
-    executable: string,
-    args: readonly string[] = [],
-  ) => {
-    const request: ProcessRequest = {
-      executable: "wsl-test.exe",
-      args: ["--distribution", distribution, "--exec", executable, ...args],
-    };
-    const processResult = await fake.run(request);
-    return {
-      ...processResult,
-      distribution,
-      command: { executable, args: [...args] },
-      request,
-      ok: processResult.exitCode === 0 && processResult.signal === null && processResult.failure === null,
-    };
-  };
 
-  const probe = await new DefaultPiExecutableLocator(runInDistribution).locate("Ubuntu");
+  const probe = await new DefaultPiExecutableLocator(fakeRunInDistribution(fake)).locate("Ubuntu");
 
   assert.deepEqual(probe, {
     available: true,
@@ -229,24 +229,9 @@ test("default Pi locator finds an executable and probes its version", async () =
   ]);
 });
 
-test("returns a typed not-found Pi probe when lookup produces no path", async () => {
-  const fake = queuedRunner([result("\n", "")]);
-  const locator = new DefaultPiExecutableLocator(async (distribution, executable, args = []) => {
-    const processResult = await fake.run({
-      executable: "wsl-test.exe",
-      args: ["--distribution", distribution, "--exec", executable, ...args],
-    });
-    return {
-      ...processResult,
-      distribution,
-      command: { executable, args: [...args] },
-      request: {
-        executable: "wsl-test.exe",
-        args: ["--distribution", distribution, "--exec", executable, ...args],
-      },
-      ok: processResult.exitCode === 0 && processResult.signal === null && processResult.failure === null,
-    };
-  });
+test("returns a typed not-found Pi probe when both lookups produce no path", async () => {
+  const fake = queuedRunner([result("\n", ""), result("\n", "")]);
+  const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake));
 
   const probe = await locator.locate("Ubuntu");
 
@@ -255,6 +240,130 @@ test("returns a typed not-found Pi probe when lookup produces no path", async ()
     assert.equal(probe.reason, "not-found");
     assert.equal(probe.lookupResult.stderr, "");
   }
+  assert.deepEqual(fake.calls.map((call) => call.args), [
+    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", "command -v pi"],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", "command -v pi"],
+  ]);
+});
+
+test("configured Pi executable path skips PATH lookup and probes its version", async () => {
+  const fake = queuedRunner([result("pi 1.2.3\n", "")]);
+  const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake), "/opt/custom/pi");
+
+  const probe = await locator.locate("Ubuntu");
+
+  assert.equal(probe.available, true);
+  if (probe.available) {
+    assert.equal(probe.executable, "/opt/custom/pi");
+    assert.equal(probe.version, "pi 1.2.3");
+  }
+  assert.deepEqual(fake.calls.map((call) => call.args), [
+    ["--distribution", "Ubuntu", "--exec", "/opt/custom/pi", "--version"],
+  ]);
+});
+
+test("configured Pi executable reports unknown version when the version probe fails", async () => {
+  const fake = queuedRunner([result("", "cannot execute", 126)]);
+  const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake), "/opt/broken/pi");
+
+  const probe = await locator.locate("Ubuntu");
+
+  assert.equal(probe.available, true);
+  if (probe.available) {
+    assert.equal(probe.executable, "/opt/broken/pi");
+    assert.equal(probe.version, null);
+    assert.equal(probe.versionResult.exitCode, 126);
+  }
+  assert.equal(fake.calls.length, 1);
+});
+
+test("falls back to a profile-aware lookup when the non-login lookup fails", async () => {
+  const fake = queuedRunner([
+    result("", "sh: command not found", 1),
+    result("/home/user/.nvm/versions/node/v22/bin/pi\n"),
+    result("pi 3.0.0\n", ""),
+  ]);
+  const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake));
+
+  const probe = await locator.locate("Ubuntu");
+
+  assert.equal(probe.available, true);
+  if (probe.available) {
+    assert.equal(probe.executable, "/home/user/.nvm/versions/node/v22/bin/pi");
+    assert.equal(probe.version, "pi 3.0.0");
+  }
+  assert.deepEqual(fake.calls.map((call) => call.args), [
+    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", "command -v pi"],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", "command -v pi"],
+    ["--distribution", "Ubuntu", "--exec", "/home/user/.nvm/versions/node/v22/bin/pi", "--version"],
+  ]);
+});
+
+test("falls back to a profile-aware lookup when the non-login lookup returns no path", async () => {
+  const fake = queuedRunner([
+    result("\n", ""),
+    result("/opt/fnm/aliases/default/bin/pi\n"),
+    result("pi 0.9.0\n", ""),
+  ]);
+  const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake));
+
+  const probe = await locator.locate("Ubuntu");
+
+  assert.equal(probe.available, true);
+  if (probe.available) {
+    assert.equal(probe.executable, "/opt/fnm/aliases/default/bin/pi");
+    assert.equal(probe.version, "pi 0.9.0");
+  }
+  assert.deepEqual(fake.calls.map((call) => call.args), [
+    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", "command -v pi"],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", "command -v pi"],
+    ["--distribution", "Ubuntu", "--exec", "/opt/fnm/aliases/default/bin/pi", "--version"],
+  ]);
+});
+
+test("reports lookup-failed when both the non-login and login lookups fail", async () => {
+  const fake = queuedRunner([
+    result("", "sh: unavailable", 2),
+    result("", "bash: unavailable", 2),
+  ]);
+  const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake));
+
+  const probe = await locator.locate("Ubuntu");
+
+  assert.equal(probe.available, false);
+  if (!probe.available) {
+    assert.equal(probe.reason, "lookup-failed");
+    assert.equal(probe.lookupResult.exitCode, 2);
+    assert.equal(probe.lookupResult.stderr, "bash: unavailable");
+  }
+  assert.deepEqual(fake.calls.map((call) => call.args), [
+    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", "command -v pi"],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", "command -v pi"],
+  ]);
+});
+
+test("WslService applies a configured Pi executable through the default locator", async () => {
+  const fake = queuedRunner([result(), result("pi 0.5.0\n", "")]);
+  const service = new WslService({ runner: fake.run, piExecutable: "/opt/pi/bin/pi" });
+
+  const probe = await service.probeDistribution("Ubuntu");
+
+  assert.equal(probe.available, true);
+  assert.equal(probe.pi?.available, true);
+  assert.deepEqual(fake.calls.map((call) => call.args), [
+    ["--distribution", "Ubuntu", "--exec", "/bin/true"],
+    ["--distribution", "Ubuntu", "--exec", "/opt/pi/bin/pi", "--version"],
+  ]);
+});
+
+test("rejects an empty configured Pi executable path", () => {
+  assert.throws(() => new WslService({ piExecutable: "  " }), WslInputError);
+  assert.throws(
+    () => new DefaultPiExecutableLocator(async () => {
+      throw new Error("unused");
+    }, ""),
+    WslInputError,
+  );
 });
 
 test("validates distro names before invoking WSL", () => {
