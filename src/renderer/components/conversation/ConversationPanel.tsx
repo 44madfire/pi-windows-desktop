@@ -7,7 +7,7 @@ import {
   type KeyboardEvent,
   type ReactElement,
 } from 'react';
-import { PI_THINKING_LEVELS, type PiModel, type PiThinkingLevel } from '../../../shared/ipc';
+import { type PiModel, type PiThinkingLevel } from '../../../shared/ipc';
 
 import './ConversationPanel.css';
 
@@ -71,11 +71,16 @@ export type AgentStateSelectorProps = {
   model: PiModel | null;
   thinkingLevel: PiThinkingLevel | null;
   availableModels: readonly PiModel[];
+  availableThinkingLevels: readonly PiThinkingLevel[];
   runtimeReady: boolean;
   isLoadingModels: boolean;
+  isLoadingThinkingLevels: boolean;
   pendingControl: AgentStateControl | null;
-  error: string | null;
+  modelCatalogError: string | null;
+  thinkingLevelsError: string | null;
+  controlError: string | null;
   onRetryModels?: () => void | Promise<void>;
+  onRetryThinkingLevels?: () => void | Promise<void>;
   onSetModel: (provider: string, modelId: string) => void | Promise<void>;
   onSetThinkingLevel: (level: PiThinkingLevel) => void | Promise<void>;
 };
@@ -121,11 +126,16 @@ function AgentStateSelectors({
   model,
   thinkingLevel,
   availableModels,
+  availableThinkingLevels,
   runtimeReady,
   isLoadingModels,
+  isLoadingThinkingLevels,
   pendingControl,
-  error,
+  modelCatalogError,
+  thinkingLevelsError,
+  controlError,
   onRetryModels,
+  onRetryThinkingLevels,
   onSetModel,
   onSetThinkingLevel,
 }: AgentStateSelectorProps): ReactElement {
@@ -144,25 +154,47 @@ function AgentStateSelectors({
         : model
           ? 'Current model unavailable'
           : 'Choose a model';
-  const feedback = error
-    ? error
-    : pendingControl === 'model'
-      ? 'Updating model…'
-      : pendingControl === 'thinking'
-        ? 'Updating thinking level…'
-        : isLoadingModels
-          ? 'Loading available models…'
-          : !runtimeReady
-            ? 'Start Pi to adjust agent state.'
-            : availableModels.length === 0
-              ? 'Pi did not report any available models.'
-              : null;
+  const thinkingValue =
+    thinkingLevel !== null && availableThinkingLevels.includes(thinkingLevel)
+      ? thinkingLevel
+      : '';
+  const thinkingPlaceholder = isLoadingThinkingLevels
+    ? 'Loading thinking levels…'
+    : !runtimeReady
+      ? 'Start Pi to choose'
+      : availableThinkingLevels.length === 0
+        ? 'No supported levels'
+        : thinkingLevel === null
+          ? 'Unavailable'
+          : thinkingValue === ''
+            ? 'Current level unavailable'
+            : 'Select level';
   const modelDisabled =
     !runtimeReady || isLoadingModels || pendingControl !== null || availableModels.length === 0;
-  const thinkingDisabled = !runtimeReady || pendingControl !== null || thinkingLevel === null;
+  const thinkingDisabled =
+    !runtimeReady ||
+    isLoadingThinkingLevels ||
+    thinkingLevelsError !== null ||
+    pendingControl !== null ||
+    thinkingLevel === null ||
+    availableThinkingLevels.length === 0;
+  const hasFeedback = Boolean(
+    controlError ||
+    modelCatalogError ||
+    thinkingLevelsError ||
+    pendingControl ||
+    isLoadingModels ||
+    isLoadingThinkingLevels ||
+    !runtimeReady ||
+    (!isLoadingModels && availableModels.length === 0) ||
+    (!isLoadingThinkingLevels && availableThinkingLevels.length === 0),
+  );
 
   return (
-    <div className="agent-state-controls" aria-busy={isLoadingModels || pendingControl !== null}>
+    <div
+      className="agent-state-controls"
+      aria-busy={isLoadingModels || isLoadingThinkingLevels || pendingControl !== null}
+    >
       <div className="agent-state-fields">
         <label className="agent-state-field" htmlFor={`${feedbackId}-model`}>
           <span className="agent-state-label">Model</span>
@@ -180,7 +212,7 @@ function AgentStateSelectors({
               });
             }}
             disabled={modelDisabled}
-            aria-describedby={feedback ? feedbackId : undefined}
+            aria-describedby={hasFeedback ? feedbackId : undefined}
           >
             <option value="" disabled>{modelPlaceholder}</option>
             {modelOptions.map((availableModel) => (
@@ -196,51 +228,120 @@ function AgentStateSelectors({
           <select
             id={`${feedbackId}-thinking`}
             className="agent-state-select"
-            value={thinkingLevel ?? ''}
+            value={thinkingValue}
             onChange={(event) => {
               const level = event.target.value as PiThinkingLevel;
-              if (!level) return;
+              if (!level || !availableThinkingLevels.includes(level)) return;
               void Promise.resolve(onSetThinkingLevel(level)).catch(() => {
                 // The parent owns the visible command error state.
               });
             }}
             disabled={thinkingDisabled}
-            aria-describedby={feedback ? feedbackId : undefined}
+            aria-describedby={hasFeedback ? feedbackId : undefined}
           >
-            <option value="" disabled>
-              {thinkingLevel === null ? 'Unavailable' : 'Select level'}
-            </option>
-            {PI_THINKING_LEVELS.map((level) => (
+            <option value="" disabled>{thinkingPlaceholder}</option>
+            {availableThinkingLevels.map((level) => (
               <option key={level} value={level}>{THINKING_LEVEL_LABELS[level]}</option>
             ))}
           </select>
         </label>
       </div>
 
-      {feedback && (
-        <div
-          className={error ? 'agent-state-feedback agent-state-feedback-error' : 'agent-state-feedback'}
-          id={feedbackId}
-          role={error ? 'alert' : 'status'}
-          aria-live="polite"
-          aria-atomic="true"
-        >
-          <span className="agent-state-feedback-icon" aria-hidden="true">{error ? '!' : '•'}</span>
-          <span>{feedback}</span>
-          {error && onRetryModels && (
-            <button
-              className="agent-state-retry"
-              type="button"
-              onClick={() => {
-                void Promise.resolve(onRetryModels()).catch(() => {
-                  // The parent owns the visible model-loading error state.
-                });
-              }}
-              disabled={isLoadingModels || pendingControl !== null}
-            >
-              Try again
-            </button>
+      {hasFeedback && (
+        <div className="agent-state-feedbacks" id={feedbackId}>
+          {controlError && (
+            <div className="agent-state-feedback agent-state-feedback-error" role="alert" aria-live="polite" aria-atomic="true">
+              <span className="agent-state-feedback-icon" aria-hidden="true">!</span>
+              <span>{controlError}</span>
+            </div>
           )}
+
+          {modelCatalogError && (
+            <div className="agent-state-feedback agent-state-feedback-error" role="alert" aria-live="polite" aria-atomic="true">
+              <span className="agent-state-feedback-icon" aria-hidden="true">!</span>
+              <span>{modelCatalogError}</span>
+              {onRetryModels && (
+                <button
+                  className="agent-state-retry"
+                  type="button"
+                  onClick={() => {
+                    void Promise.resolve(onRetryModels()).catch(() => {
+                      // The parent owns the visible model-loading error state.
+                    });
+                  }}
+                  disabled={isLoadingModels || pendingControl !== null}
+                >
+                  Try again
+                </button>
+              )}
+            </div>
+          )}
+
+          {thinkingLevelsError && (
+            <div className="agent-state-feedback agent-state-feedback-error" role="alert" aria-live="polite" aria-atomic="true">
+              <span className="agent-state-feedback-icon" aria-hidden="true">!</span>
+              <span>{thinkingLevelsError}</span>
+              {onRetryThinkingLevels && (
+                <button
+                  className="agent-state-retry"
+                  type="button"
+                  onClick={() => {
+                    void Promise.resolve(onRetryThinkingLevels()).catch(() => {
+                      // The parent owns the visible thinking-level loading error state.
+                    });
+                  }}
+                  disabled={isLoadingThinkingLevels || pendingControl !== null}
+                >
+                  Try again
+                </button>
+              )}
+            </div>
+          )}
+
+          {!controlError && pendingControl && (
+            <div className="agent-state-feedback" role="status" aria-live="polite" aria-atomic="true">
+              <span className="agent-state-feedback-icon" aria-hidden="true">•</span>
+              <span>{pendingControl === 'model' ? 'Updating model…' : 'Updating thinking level…'}</span>
+            </div>
+          )}
+
+          {!controlError && !pendingControl && !modelCatalogError && isLoadingModels && (
+            <div className="agent-state-feedback" role="status" aria-live="polite" aria-atomic="true">
+              <span className="agent-state-feedback-icon" aria-hidden="true">•</span>
+              <span>Loading available models…</span>
+            </div>
+          )}
+
+          {!controlError && !pendingControl && !thinkingLevelsError && isLoadingThinkingLevels && (
+            <div className="agent-state-feedback" role="status" aria-live="polite" aria-atomic="true">
+              <span className="agent-state-feedback-icon" aria-hidden="true">•</span>
+              <span>Loading supported thinking levels…</span>
+            </div>
+          )}
+
+          {!controlError && !pendingControl && !modelCatalogError && !thinkingLevelsError &&
+            !isLoadingModels && !isLoadingThinkingLevels && !runtimeReady && (
+              <div className="agent-state-feedback" role="status" aria-live="polite" aria-atomic="true">
+                <span className="agent-state-feedback-icon" aria-hidden="true">•</span>
+                <span>Start Pi to adjust agent state.</span>
+              </div>
+            )}
+
+          {!controlError && !pendingControl && !modelCatalogError &&
+            !isLoadingModels && runtimeReady && availableModels.length === 0 && (
+              <div className="agent-state-feedback" role="status" aria-live="polite" aria-atomic="true">
+                <span className="agent-state-feedback-icon" aria-hidden="true">•</span>
+                <span>Pi did not report any available models.</span>
+              </div>
+            )}
+
+          {!controlError && !pendingControl && !thinkingLevelsError &&
+            !isLoadingThinkingLevels && runtimeReady && availableThinkingLevels.length === 0 && (
+              <div className="agent-state-feedback" role="status" aria-live="polite" aria-atomic="true">
+                <span className="agent-state-feedback-icon" aria-hidden="true">•</span>
+                <span>Pi did not report any supported thinking levels.</span>
+              </div>
+            )}
         </div>
       )}
     </div>

@@ -27,6 +27,7 @@ test('IPC channel names are unique and scoped to app capabilities', () => {
     'pi:event',
     'pi:extension-ui-response',
     'pi:get-available-models',
+    'pi:get-available-thinking-levels',
     'pi:set-model',
     'pi:set-thinking-level',
     'conversation:send-prompt',
@@ -68,6 +69,7 @@ test('every invoke channel is wired to a typed DesktopApi method', () => {
     [IPC_CHANNELS.getPiStatus]: 'getPiStatus',
     [IPC_CHANNELS.piExtensionUiResponse]: 'sendExtensionUiResponse',
     [IPC_CHANNELS.getAvailableModels]: 'getAvailableModels',
+    [IPC_CHANNELS.getAvailableThinkingLevels]: 'getAvailableThinkingLevels',
     [IPC_CHANNELS.setModel]: 'setModel',
     [IPC_CHANNELS.setThinkingLevel]: 'setThinkingLevel',
     [IPC_CHANNELS.sendPrompt]: 'sendPrompt',
@@ -100,6 +102,7 @@ test('every invoke channel is wired to a typed DesktopApi method', () => {
     model: null,
     thinkingLevel: null,
     availableModels: [],
+    availableThinkingLevels: [],
     lastWarning: null,
     lastSeenEntryId: null,
     leafId: null,
@@ -117,6 +120,7 @@ test('every invoke channel is wired to a typed DesktopApi method', () => {
     getPiStatus: async () => stoppedSnapshot,
     sendExtensionUiResponse: async () => undefined,
     getAvailableModels: async () => [],
+    getAvailableThinkingLevels: async () => [],
     setModel: async (_provider, _modelId) => ({ id: 'model-1', provider: 'anthropic' }),
     setThinkingLevel: async (level) => level,
     sendPrompt: async () => ({ timeline: [], executionState: 'idle', queuedPromptCount: 0, error: null }),
@@ -197,6 +201,11 @@ test('M1 agent-state selectors expose typed JSON-safe wire shapes', () => {
     bareModel,
   ];
   assert.deepEqual(JSON.parse(JSON.stringify(models)), models);
+  const thinkingLevels: IpcContract[typeof IPC_CHANNELS.getAvailableThinkingLevels]['response'] = [
+    'off',
+    'high',
+  ];
+  assert.deepEqual(JSON.parse(JSON.stringify(thinkingLevels)), thinkingLevels);
 
   // set_model accepts exactly the provider/modelId pair; nothing else may
   // reach Pi from the renderer.
@@ -233,8 +242,8 @@ test('PiThinkingLevel is a closed set and the runtime snapshot projects agent st
   assert.ok(PI_THINKING_LEVELS.includes(levelUnion));
 
   // The shared runtime snapshot carries the projected agent state: active
-  // model, thinking level, and the switchable model catalog. All fields are
-  // plain JSON across the IPC boundary.
+  // model, thinking level, and the model/thinking-level catalogs. All fields
+  // are plain JSON across the IPC boundary.
   const snapshot: IpcContract[typeof IPC_CHANNELS.getPiStatus]['response'] = {
     state: 'ready',
     workspace: { distro: 'Ubuntu', linuxPath: '/home/pi' },
@@ -243,6 +252,7 @@ test('PiThinkingLevel is a closed set and the runtime snapshot projects agent st
     model: { id: 'claude-sonnet-4-5', provider: 'anthropic', name: 'Claude Sonnet 4.5' },
     thinkingLevel: 'high',
     availableModels: [{ id: 'claude-sonnet-4-5', provider: 'anthropic' }],
+    availableThinkingLevels: ['off', 'high'],
     lastWarning: null,
     lastSeenEntryId: null,
     leafId: null,
@@ -255,6 +265,7 @@ test('PiThinkingLevel is a closed set and the runtime snapshot projects agent st
     Object.keys(snapshot).sort(),
     [
       'availableModels',
+      'availableThinkingLevels',
       'lastEntryId',
       'lastError',
       'lastSeenEntryId',
@@ -270,7 +281,7 @@ test('PiThinkingLevel is a closed set and the runtime snapshot projects agent st
     ],
   );
 
-  // The pre-ready snapshot projects null model/level and an empty catalog:
+  // The pre-ready snapshot projects null model/level and empty catalogs:
   // nothing is fabricated before Pi reports it.
   const stopped: IpcContract[typeof IPC_CHANNELS.getPiStatus]['response'] = {
     state: 'stopped',
@@ -280,6 +291,7 @@ test('PiThinkingLevel is a closed set and the runtime snapshot projects agent st
     model: null,
     thinkingLevel: null,
     availableModels: [],
+    availableThinkingLevels: [],
     lastWarning: null,
     lastSeenEntryId: null,
     leafId: null,

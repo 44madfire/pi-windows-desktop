@@ -11,6 +11,7 @@ export const IPC_CHANNELS = {
   piEvent: 'pi:event',
   piExtensionUiResponse: 'pi:extension-ui-response',
   getAvailableModels: 'pi:get-available-models',
+  getAvailableThinkingLevels: 'pi:get-available-thinking-levels',
   setModel: 'pi:set-model',
   setThinkingLevel: 'pi:set-thinking-level',
   sendPrompt: 'conversation:send-prompt',
@@ -121,16 +122,22 @@ export interface PiRuntimeSnapshot {
   lastError: string | null;
   /**
    * Active agent model, projected from the authoritative `get_state`
-   * handshake (start/reconnect) and refreshed by `set_model` responses and
-   * `model_change` events. Null until Pi reports one.
+   * handshake (start/reconnect) and refreshed after model mutations.
+   * Null until Pi reports one.
    */
   model: PiModel | null;
   /**
    * Active agent thinking level, projected from the authoritative
-   * `get_state` handshake and refreshed by `set_thinking_level` responses
-   * and `thinking_level_change` events. Null until Pi reports one.
+   * `get_state` handshake and refreshed after thinking-level mutations.
+   * Null until Pi reports one.
    */
   thinkingLevel: PiThinkingLevel | null;
+  /**
+   * Thinking levels Pi reports as supported by the active model, from
+   * `get_available_thinking_levels`. Empty until Pi reports one or the
+   * runtime stops.
+   */
+  availableThinkingLevels: PiThinkingLevel[];
   /**
    * Models Pi can switch to, from the `get_available_models` response.
    * Empty until the renderer calls `getAvailableModels()` after the runtime
@@ -243,6 +250,7 @@ export interface DesktopApi {
   getPiStatus: () => Promise<PiRuntimeSnapshot>;
   sendExtensionUiResponse: (response: ExtensionUiResponse) => Promise<void>;
   getAvailableModels: () => Promise<PiModel[]>;
+  getAvailableThinkingLevels: () => Promise<PiThinkingLevel[]>;
   setModel: (provider: string, modelId: string) => Promise<PiModel>;
   setThinkingLevel: (level: PiThinkingLevel) => Promise<PiThinkingLevel>;
   sendPrompt: (prompt: string) => Promise<ConversationSnapshot>;
@@ -289,6 +297,10 @@ export interface IpcContract {
   [IPC_CHANNELS.getAvailableModels]: {
     request: undefined;
     response: PiModel[];
+  };
+  [IPC_CHANNELS.getAvailableThinkingLevels]: {
+    request: undefined;
+    response: PiThinkingLevel[];
   };
   [IPC_CHANNELS.setModel]: {
     request: { provider: string; modelId: string };

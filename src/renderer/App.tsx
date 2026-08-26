@@ -97,6 +97,9 @@ function App(): ReactElement {
   const [probe, setProbe] = useState<WslProbeInfo | null>(null);
   const [piStatus, setPiStatus] = useState<PiRuntimeSnapshot | null>(null);
   const [modelsLoading, setModelsLoading] = useState(false);
+  const [thinkingLevelsLoading, setThinkingLevelsLoading] = useState(false);
+  const [thinkingLevelsError, setThinkingLevelsError] = useState<string | null>(null);
+  const [thinkingLevelsRefreshVersion, setThinkingLevelsRefreshVersion] = useState(0);
   const [modelsError, setModelsError] = useState<string | null>(null);
   const [agentControlPending, setAgentControlPending] = useState<AgentStateControl | null>(null);
   const [agentControlError, setAgentControlError] = useState<string | null>(null);
@@ -115,6 +118,13 @@ function App(): ReactElement {
   const extensionNoticeSequenceRef = useRef(0);
   const extensionNoticeTimersRef = useRef<number[]>([]);
   const modelsRequestRef = useRef(0);
+  const thinkingLevelsRequestRef = useRef(0);
+  const modelCatalogKeyRef = useRef<string | null>(null);
+  const modelCatalogInitializedRef = useRef(false);
+  const thinkingLevelsCatalogKeyRef = useRef<string | null>(null);
+  const thinkingLevelsCatalogVersionRef = useRef(-1);
+  const thinkingLevelsCatalogKnownRef = useRef(false);
+  const thinkingLevelsCatalogLengthRef = useRef<number | null>(null);
 
   const showExtensionNotice = useCallback((message: string, tone: ExtensionUiNoticeTone): void => {
     const trimmedMessage = message.trim();
@@ -168,6 +178,13 @@ function App(): ReactElement {
     void refresh();
   }, [refresh]);
 
+  const activeModelProvider = piStatus?.model?.provider;
+  const activeModelId = piStatus?.model?.id;
+  const activeModelKey =
+    activeModelProvider !== undefined && activeModelId !== undefined
+      ? `${activeModelProvider}\u0000${activeModelId}`
+      : null;
+
   const loadAvailableModels = useCallback(async (): Promise<void> => {
     const requestId = modelsRequestRef.current + 1;
     modelsRequestRef.current = requestId;
@@ -191,18 +208,111 @@ function App(): ReactElement {
     }
   }, []);
 
+  const loadAvailableThinkingLevels = useCallback(async (): Promise<void> => {
+    const requestId = thinkingLevelsRequestRef.current + 1;
+    thinkingLevelsRequestRef.current = requestId;
+    setThinkingLevelsLoading(true);
+    setThinkingLevelsError(null);
+
+    try {
+      const availableThinkingLevels = await window.piDesktop.getAvailableThinkingLevels();
+      if (thinkingLevelsRequestRef.current !== requestId) return;
+      thinkingLevelsCatalogKnownRef.current = true;
+      setPiStatus((current) => (
+        current?.state === 'ready' &&
+        current.model?.provider === activeModelProvider &&
+        current.model?.id === activeModelId
+          ? { ...current, availableThinkingLevels }
+          : current
+      ));
+    } catch (cause) {
+      if (thinkingLevelsRequestRef.current === requestId) {
+        setThinkingLevelsError(describeAgentStateError(cause, 'Pi could not load supported thinking levels.'));
+      }
+    } finally {
+      if (thinkingLevelsRequestRef.current === requestId) setThinkingLevelsLoading(false);
+    }
+  }, [activeModelId, activeModelProvider]);
+
+  const resetThinkingLevelsCatalog = useCallback((): void => {
+    thinkingLevelsCatalogKnownRef.current = false;
+    thinkingLevelsRequestRef.current += 1;
+    setThinkingLevelsLoading(false);
+    setThinkingLevelsError(null);
+    setPiStatus((current) => (
+      current && current.availableThinkingLevels.length > 0
+        ? { ...current, availableThinkingLevels: [] }
+        : current
+    ));
+  }, []);
+
   useEffect(() => {
     if (piStatus?.state !== 'ready') {
       modelsRequestRef.current += 1;
+      modelCatalogKeyRef.current = null;
+      modelCatalogInitializedRef.current = false;
+      thinkingLevelsCatalogKeyRef.current = null;
+      thinkingLevelsCatalogVersionRef.current = -1;
+      thinkingLevelsCatalogLengthRef.current = null;
+      thinkingLevelsCatalogKnownRef.current = false;
+      resetThinkingLevelsCatalog();
       setModelsLoading(false);
       setModelsError(null);
+      setAgentControlPending(null);
+      setAgentControlError(null);
       return;
     }
-    void loadAvailableModels();
-  }, [loadAvailableModels, piStatus?.state]);
+
+    if (
+      !modelCatalogInitializedRef.current ||
+      modelCatalogKeyRef.current !== activeModelKey
+    ) {
+      modelCatalogInitializedRef.current = true;
+      modelCatalogKeyRef.current = activeModelKey;
+      void loadAvailableModels();
+    }
+
+    const modelChanged = thinkingLevelsCatalogKeyRef.current !== activeModelKey;
+    const mutationChanged =
+      thinkingLevelsCatalogVersionRef.current !== thinkingLevelsRefreshVersion;
+    const availableThinkingLevelsCount = piStatus.availableThinkingLevels.length;
+    const catalogCleared =
+      thinkingLevelsCatalogLengthRef.current !== null &&
+      thinkingLevelsCatalogLengthRef.current > 0 &&
+      availableThinkingLevelsCount === 0;
+    if (catalogCleared) thinkingLevelsCatalogKnownRef.current = false;
+    thinkingLevelsCatalogLengthRef.current = availableThinkingLevelsCount;
+    const catalogMissing =
+      !thinkingLevelsCatalogKnownRef.current &&
+      availableThinkingLevelsCount === 0 &&
+      !thinkingLevelsLoading &&
+      thinkingLevelsError === null;
+    if (!modelChanged && !mutationChanged && !catalogMissing) return;
+
+    thinkingLevelsCatalogKeyRef.current = activeModelKey;
+    thinkingLevelsCatalogVersionRef.current = thinkingLevelsRefreshVersion;
+    resetThinkingLevelsCatalog();
+    void loadAvailableThinkingLevels();
+  }, [
+    activeModelKey,
+    loadAvailableModels,
+    loadAvailableThinkingLevels,
+    piStatus?.availableThinkingLevels.length,
+    piStatus?.state,
+    resetThinkingLevelsCatalog,
+    thinkingLevelsError,
+    thinkingLevelsLoading,
+    thinkingLevelsRefreshVersion,
+  ]);
 
   const handlePiEvent = useCallback((event: PiEvent): void => {
     if (event.type === 'runtime') {
+      if (event.snapshot.state === 'ready' && event.snapshot.availableThinkingLevels.length > 0) {
+        thinkingLevelsRequestRef.current += 1;
+        thinkingLevelsCatalogKnownRef.current = true;
+        setThinkingLevelsLoading(false);
+        setThinkingLevelsError(null);
+      }
       setPiStatus(event.snapshot);
       return;
     }
@@ -272,9 +382,11 @@ function App(): ReactElement {
 
     try {
       const model = await window.piDesktop.setModel(provider, modelId);
+      setThinkingLevelsRefreshVersion((current) => current + 1);
+      resetThinkingLevelsCatalog();
       setPiStatus((current) => (
         current?.state === 'ready'
-          ? { ...current, model }
+          ? { ...current, model, availableThinkingLevels: [] }
           : current
       ));
     } catch (cause) {
@@ -282,7 +394,7 @@ function App(): ReactElement {
     } finally {
       setAgentControlPending((current) => current === 'model' ? null : current);
     }
-  }, []);
+  }, [resetThinkingLevelsCatalog]);
 
   const changeThinkingLevel = useCallback(async (level: PiThinkingLevel): Promise<void> => {
     setAgentControlPending('thinking');
@@ -402,13 +514,16 @@ function App(): ReactElement {
               model: piStatus?.model ?? null,
               thinkingLevel: piStatus?.thinkingLevel ?? null,
               availableModels: piStatus?.availableModels ?? [],
+              availableThinkingLevels: piStatus?.availableThinkingLevels ?? [],
               runtimeReady: piStatus?.state === 'ready',
               isLoadingModels: modelsLoading,
+              isLoadingThinkingLevels: thinkingLevelsLoading,
               pendingControl: agentControlPending,
-              error: agentControlError ?? modelsError,
-              onRetryModels: modelsError || (piStatus?.state === 'ready' && piStatus.availableModels?.length === 0)
-                ? loadAvailableModels
-                : undefined,
+              modelCatalogError: modelsError,
+              thinkingLevelsError,
+              controlError: agentControlError,
+              onRetryModels: modelsError ? loadAvailableModels : undefined,
+              onRetryThinkingLevels: thinkingLevelsError ? loadAvailableThinkingLevels : undefined,
               onSetModel: changeModel,
               onSetThinkingLevel: changeThinkingLevel,
             }}
