@@ -1,6 +1,14 @@
-import type { PiEvent, PiRuntimeSnapshot, WslWorkspace } from '../../../shared/ipc.ts';
+import {
+  PI_THINKING_LEVELS,
+  type PiEvent,
+  type PiModel,
+  type PiRuntimeSnapshot,
+  type PiThinkingLevel,
+  type WslWorkspace,
+} from '../../../shared/ipc.ts';
 import { WslManager, type PiExecutableProbe } from '../../wsl/index.ts';
 import { PiRpcClient, type PiRpcTransport } from './index.ts';
+import type { PiRpcEvent } from './protocol.ts';
 import { createWslPiTransport } from './wsl-process-transport.ts';
 import { SessionManager, type SessionSynchronizationResult } from '../session/session-manager.ts';
 import { type SessionPointer, type SessionStore } from '../session/session-store.ts';
@@ -91,6 +99,96 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+}
+
+/**
+ * Parse a Pi model record (`{id, provider, name?}`), preferring a nested
+ * `model` object when the response wraps one (e.g. `data: {model: {...}}`).
+ * Returns null when the stable identity (id/provider) is missing.
+ */
+function parseModelRecord(value: unknown): PiModel | null {
+  const record = asRecord(value);
+  if (!record) return null;
+  const candidate = asRecord(record['model']) ?? record;
+  const id = nonEmptyString(candidate['id']);
+  const provider = nonEmptyString(candidate['provider']);
+  if (id === null || provider === null) return null;
+  const name = nonEmptyString(candidate['name']);
+  return name === null ? { id, provider } : { id, provider, name };
+}
+
+/** Parse `get_available_models` data: `{models: [...]}` or a bare array. */
+function parseAvailableModels(data: unknown): PiModel[] {
+  const record = asRecord(data);
+  const candidates = Array.isArray(data) ? data : record?.['models'];
+  if (!Array.isArray(candidates)) return [];
+  const models: PiModel[] = [];
+  for (const entry of candidates) {
+    const model = parseModelRecord(entry);
+    if (model !== null) models.push(model);
+  }
+  return models;
+}
+
+function isThinkingLevel(value: unknown): value is PiThinkingLevel {
+  return typeof value === 'string' && (PI_THINKING_LEVELS as readonly string[]).includes(value);
+}
+
+/** Read a thinking level Pi echoed in a response (`data.thinkingLevel`/`level`). */
+function parseEchoedThinkingLevel(data: unknown): PiThinkingLevel | null {
+  const record = asRecord(data);
+  if (!record) return null;
+  for (const key of ['thinkingLevel', 'thinking_level', 'level'] as const) {
+    const value = record[key];
+    if (isThinkingLevel(value)) return value;
+  }
+  return null;
+}
+
+/** Parse an async `model_change` protocol event: `{provider, modelId}`. */
+function parseModelChangeEvent(event: PiRpcEvent): PiModel | null {
+  const record = asRecord(event);
+  if (!record) return null;
+  const provider = nonEmptyString(record['provider']);
+  const modelId = nonEmptyString(record['modelId']) ?? nonEmptyString(record['model_id']);
+  if (provider === null || modelId === null) return null;
+  return { id: modelId, provider };
+}
+
+/** Parse an async `thinking_level_change` protocol event: `{thinkingLevel}`. */
+function parseThinkingLevelChangeEvent(event: PiRpcEvent): PiThinkingLevel | null {
+  const record = asRecord(event);
+  if (!record) return null;
+  for (const key of ['thinkingLevel', 'thinking_level', 'level'] as const) {
+    const value = record[key];
+    if (isThinkingLevel(value)) return value;
+  }
+  return null;
+}
+
+/** Value equality for projected models; fresh objects with equal content must not re-emit. */
+function modelsEqual(a: PiModel | null, b: PiModel | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.id === b.id && a.provider === b.provider && (a.name ?? null) === (b.name ?? null);
+}
+
+/** Validate a renderer-supplied model identity before it becomes a Pi command. */
+function validateModelIdentifier(value: string, field: string): string {
+  const normalized = value.trim();
+  if (normalized.length === 0) {
+    throw new TypeError(`Pi ${field} must be a non-empty string`);
+  }
+  return normalized;
+}
+
 function piProbeDetail(probe: PiExecutableProbe | null): string {
   if (!probe) return 'Pi was not checked because the distribution is unavailable.';
   if (probe.available) return `Pi ${probe.version ?? 'version unknown'} is available.`;
@@ -125,6 +223,9 @@ export class PiRuntimeController {
     lastEntryId: null,
     sessionId: null,
     sessionFile: null,
+    model: null,
+    thinkingLevel: null,
+    availableModels: [],
   };
 
   constructor(options: PiRuntimeOptions = {}) {
@@ -135,7 +236,11 @@ export class PiRuntimeController {
   }
 
   get snapshot(): PiRuntimeSessionSnapshot {
-    return { ...this.snapshotValue, workspace: this.snapshotValue.workspace && { ...this.snapshotValue.workspace } };
+    return {
+      ...this.snapshotValue,
+      workspace: this.snapshotValue.workspace && { ...this.snapshotValue.workspace },
+      availableModels: [...this.snapshotValue.availableModels],
+    };
   }
 
   /**
@@ -234,6 +339,17 @@ export class PiRuntimeController {
         if (sessionSnapshot.sessionFile !== this.snapshotValue.sessionFile) {
           patch.sessionFile = sessionSnapshot.sessionFile;
         }
+        // Agent-state projections come from the authoritative get_state
+        // response; explicit nulls reset the runtime snapshot alongside the
+        // session identity. Models are compared by value: each session emit
+        // rebuilds the snapshot object, so reference equality would re-emit
+        // unchanged models on every cursor/state transition.
+        if (!modelsEqual(sessionSnapshot.model, this.snapshotValue.model)) {
+          patch.model = sessionSnapshot.model;
+        }
+        if (sessionSnapshot.thinkingLevel !== this.snapshotValue.thinkingLevel) {
+          patch.thinkingLevel = sessionSnapshot.thinkingLevel;
+        }
         if (Object.keys(patch).length > 0) {
           this.setSnapshot(patch);
           if (sessionSnapshot.lastSeenEntryId !== null) {
@@ -259,6 +375,18 @@ export class PiRuntimeController {
       conversation.onEvent((event: ConversationEvent) => this.handlers.onEvent?.(event));
 
       client.onEvent((event) => {
+        // Agent-state change events are projected into the runtime snapshot
+        // so selectors observe the authoritative state without re-querying;
+        // the raw event is still forwarded for protocol consumers.
+        if (this.client === client) {
+          if (event.type === 'model_change') {
+            const model = parseModelChangeEvent(event);
+            if (model !== null) this.setSnapshot({ model });
+          } else if (event.type === 'thinking_level_change') {
+            const level = parseThinkingLevelChangeEvent(event);
+            if (level !== null) this.setSnapshot({ thinkingLevel: level });
+          }
+        }
         this.handlers.onEvent?.({ type: 'protocol', message: event });
       });
       client.onStderr((text) => this.handlers.onEvent?.({ type: 'stderr', text }));
@@ -292,6 +420,10 @@ export class PiRuntimeController {
         lastSeenEntryId: session.lastSeenEntryId,
         leafId: session.leafId,
         lastEntryId: session.lastSeenEntryId,
+        // Projected from the get_state handshake run by openSession; no
+        // second request is needed to seed the agent-state selectors.
+        model: session.model,
+        thinkingLevel: session.thinkingLevel,
       });
       return this.snapshot;
     } catch (error) {
@@ -394,6 +526,10 @@ export class PiRuntimeController {
         lastSeenEntryId: session.lastSeenEntryId,
         leafId: session.leafId,
         lastEntryId: session.lastSeenEntryId,
+        // Projected from the get_state handshake run by the forced open;
+        // reconnect re-seeds the agent state without an extra round trip.
+        model: session.model,
+        thinkingLevel: session.thinkingLevel,
       });
 
       // The handshake is complete: resume prompts queued while disconnected.
@@ -473,7 +609,16 @@ export class PiRuntimeController {
         await this.persistPointer(sessionWorkspaceKey(workspace), session);
       }
       this.session = null;
-      this.setSnapshot({ state: 'stopped', workspace: null, piVersion: null });
+      // The Pi process is gone: the projected agent state and the model list
+      // no longer describe anything, so the selectors reset with the runtime.
+      this.setSnapshot({
+        state: 'stopped',
+        workspace: null,
+        piVersion: null,
+        model: null,
+        thinkingLevel: null,
+        availableModels: [],
+      });
     }
     return this.snapshot;
   }
@@ -511,6 +656,70 @@ export class PiRuntimeController {
       throw new Error('Pi is not running. Start Pi before responding to an extension UI request.');
     }
     await this.client.write(validateExtensionUiResponse(response));
+  }
+
+  /**
+   * List the models Pi can switch to. The command shape is owned here: the
+   * renderer can never pick a Pi command type. The response's `models` array
+   * is authoritative and replaces `snapshot.availableModels` so selectors
+   * observe the same list the response returned.
+   */
+  async getAvailableModels(): Promise<PiModel[]> {
+    if (!this.client) {
+      throw new Error('Pi is not running. Start Pi before listing models.');
+    }
+    const response = await this.client.request({ type: 'get_available_models' });
+    const models = parseAvailableModels(response.data);
+    this.setSnapshot({ availableModels: models });
+    return models;
+  }
+
+  /**
+   * Switch the active agent model. Provider and model id are validated here
+   * (the last boundary before a Pi command is built) and forwarded verbatim
+   * as `{type: 'set_model', provider, modelId}`. The response's model data
+   * is authoritative: it is applied to the snapshot and returned to the
+   * caller, falling back to the requested identity when Pi acknowledges
+   * without echoing the model.
+   */
+  async setModel(provider: string, modelId: string): Promise<PiModel> {
+    if (!this.client) {
+      throw new Error('Pi is not running. Start Pi before changing the model.');
+    }
+    const validatedProvider = validateModelIdentifier(provider, 'provider');
+    const validatedModelId = validateModelIdentifier(modelId, 'modelId');
+    const response = await this.client.request({
+      type: 'set_model',
+      provider: validatedProvider,
+      modelId: validatedModelId,
+    });
+    const model = parseModelRecord(response.data) ?? {
+      id: validatedModelId,
+      provider: validatedProvider,
+    };
+    this.setSnapshot({ model });
+    return model;
+  }
+
+  /**
+   * Switch the agent thinking level. Only Pi's allowed levels pass the
+   * runtime boundary; the command is `{type: 'set_thinking_level', level}`.
+   * The applied level (echoed by Pi when it does, otherwise the requested
+   * one) is authoritative and updates the snapshot.
+   */
+  async setThinkingLevel(level: PiThinkingLevel): Promise<PiThinkingLevel> {
+    if (!this.client) {
+      throw new Error('Pi is not running. Start Pi before changing the thinking level.');
+    }
+    if (!isThinkingLevel(level)) {
+      throw new TypeError(
+        `Invalid Pi thinking level: "${String(level)}". Expected one of: ${PI_THINKING_LEVELS.join(', ')}`,
+      );
+    }
+    const response = await this.client.request({ type: 'set_thinking_level', level });
+    const applied = parseEchoedThinkingLevel(response.data) ?? level;
+    this.setSnapshot({ thinkingLevel: applied });
+    return applied;
   }
 
   /** Tolerate a missing or corrupt store: startup degrades to a fresh session. */
