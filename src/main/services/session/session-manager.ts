@@ -96,6 +96,12 @@ export interface SessionCommandFactory {
   readonly synchronize: (sessionId: string | null, cursor: SessionCursor) => PiRpcCommand;
   readonly close: (sessionId: string | null) => PiRpcCommand | null;
   readonly fork: (sessionId: string | null, entryId: string) => PiRpcCommand;
+  /** Read the thinking levels the current model supports (`get_available_thinking_levels`). */
+  readonly getAvailableThinkingLevels: () => PiRpcCommand;
+  /** Switch the active agent model (`set_model`); the effective state is re-read via get_state. */
+  readonly setModel: (provider: string, modelId: string) => PiRpcCommand;
+  /** Switch the active agent thinking level (`set_thinking_level`); Pi answers success-only. */
+  readonly setThinkingLevel: (level: PiThinkingLevel) => PiRpcCommand;
 }
 
 export interface SessionManagerOptions {
@@ -185,6 +191,22 @@ export interface SessionForkResult {
   readonly snapshot: SessionSnapshot;
 }
 
+/** Outcome of `setModel`: the effective model after the authoritative refresh. */
+export interface SessionSetModelResult {
+  readonly model: PiModel;
+  readonly snapshot: SessionSnapshot;
+}
+
+/**
+ * Outcome of `setThinkingLevel`: the effective level read back from the
+ * authoritative `get_state` refresh. Pi answers `set_thinking_level` with no
+ * effective payload, so the requested level is never used as a fallback.
+ */
+export interface SessionSetThinkingLevelResult {
+  readonly level: PiThinkingLevel;
+  readonly snapshot: SessionSnapshot;
+}
+
 export type SessionManagerErrorCode =
   | "NO_CLIENT"
   | "INVALID_STATE"
@@ -223,6 +245,9 @@ const defaultCommands: SessionCommandFactory = {
   // PiRpcClient decides whether to abort or close that process separately.
   close: () => null,
   fork: (_sessionId, entryId) => ({ type: "fork", entryId }),
+  getAvailableThinkingLevels: () => ({ type: "get_available_thinking_levels" }),
+  setModel: (provider, modelId) => ({ type: "set_model", provider, modelId }),
+  setThinkingLevel: (level) => ({ type: "set_thinking_level", level }),
 };
 
 const recoverableStates = new Set<SessionLifecycleState>([
@@ -534,6 +559,56 @@ function validateModel(model: PiModel | null | undefined): PiModel | null {
   return name === null ? { id, provider } : { id, provider, name };
 }
 
+function validateModelIdentifier(value: string, field: string): string {
+  const normalized = nonEmptyString(value);
+  if (normalized === null) {
+    throw new TypeError(`Pi ${field} must be a non-empty string`);
+  }
+  return normalized;
+}
+
+/**
+ * Parse the `get_available_thinking_levels` response strictly: only
+ * `data.levels` containing known Pi thinking levels is accepted, and the
+ * list must be non-empty (Pi's live contract: every model supports at least
+ * one level, e.g. `["off"]`). Malformed data (missing/absent/empty `levels`,
+ * or an entry outside Pi's vocabulary) rejects with `SessionManagerError` —
+ * the shell never returns a fabricated or global list. Pi lists only the
+ * levels the current model supports; a non-reasoning model answers
+ * `["off"]`.
+ */
+function parseAvailableThinkingLevels(data: unknown, operation: string): PiThinkingLevel[] {
+  const record = asRecord(data);
+  if (!record || !Array.isArray(record["levels"])) {
+    throw new SessionManagerError(
+      "INVALID_RESPONSE",
+      operation,
+      "get_available_thinking_levels must answer data.levels as an array",
+    );
+  }
+  const rawLevels = record["levels"] as JsonValue[];
+  if (rawLevels.length === 0) {
+    throw new SessionManagerError(
+      "INVALID_RESPONSE",
+      operation,
+      "get_available_thinking_levels reported an empty levels array",
+    );
+  }
+  const levels: PiThinkingLevel[] = [];
+  for (const entry of rawLevels) {
+    const level = normalizeThinkingLevel(typeof entry === "string" ? entry : "");
+    if (level === null) {
+      throw new SessionManagerError(
+        "INVALID_RESPONSE",
+        operation,
+        `get_available_thinking_levels reported an unknown thinking level: ${String(entry)}`,
+      );
+    }
+    levels.push(level);
+  }
+  return levels;
+}
+
 function validateThinkingLevel(level: PiThinkingLevel | null | undefined): PiThinkingLevel | null {
   if (level === undefined || level === null) return null;
   const normalized = normalizeThinkingLevel(level);
@@ -684,7 +759,9 @@ export class SessionManager {
       try {
         const command = validateCommand(this.commands.create(this.sessionIdValue), "create");
         const response = await this.request(client, command, "create");
-        this.applyResponseMetadata(response);
+        // A new_session acknowledgement never projects agent state: model and
+        // thinking are authoritative only from get_state.
+        this.applyResponseMetadata(response, [], { agentState: false });
         this.setState("ready");
         return this.getSnapshot();
       } catch (error: unknown) {
@@ -748,7 +825,9 @@ export class SessionManager {
           this.emitSnapshot();
           const command = validateCommand(this.commands.create(this.sessionIdValue), "create");
           const response = await this.request(client, command, "create");
-          this.applyResponseMetadata(response);
+          // The fallback new_session acknowledgement never projects agent
+          // state; the follow-up get_state owns model/thinking.
+          this.applyResponseMetadata(response, [], { agentState: false });
         }
         return await this.readState(client, resumed);
       } catch (error: unknown) {
@@ -837,7 +916,9 @@ export class SessionManager {
           "fork",
         );
         const response = await this.request(client, command, "fork");
-        this.applyResponseMetadata(response);
+        // The fork acknowledgement never projects agent state; model and
+        // thinking are authoritative only from get_state.
+        this.applyResponseMetadata(response, [], { agentState: false });
         this.setState("ready");
         return {
           sessionId: this.sessionIdValue,
@@ -847,6 +928,160 @@ export class SessionManager {
         };
       } catch (error: unknown) {
         throw this.fail("fork", error, "failed");
+      }
+    });
+  }
+
+  /**
+   * Re-read the authoritative `get_state` and re-project session metadata.
+   * Applies identity/cursor/model/thinking metadata exactly like the
+   * handshake and emits exactly one snapshot. Used to confirm the effective
+   * state after a mutation and by the controlled settle refresh; the runtime
+   * reads the selected model/thinking from this manager afterwards, so a
+   * `get_state` failure rejects instead of regressing to stale values.
+   *
+   * For an established session (one that already projected agent state), the
+   * fields it holds must be re-reported by the authoritative response: a
+   * get_state that omits them rejects (the runtime is marked disconnected)
+   * instead of preserving the cached selection into the settled runtime.
+   * Initial no-model sessions stay permissive.
+   */
+  refreshState(): Promise<SessionSnapshot> {
+    return this.enqueue(async () => {
+      this.assertState("refresh state", [...recoverableStates]);
+      this.clearError();
+      try {
+        return await this.refreshStateInternal("refresh state", {
+          model: this.modelValue !== null,
+          thinkingLevel: this.thinkingLevelValue !== null,
+        });
+      } catch (error: unknown) {
+        throw this.fail("refresh state", error, "disconnected");
+      }
+    });
+  }
+
+  /**
+   * Read the thinking levels the current model supports. The response
+   * (`data.levels`) is strict: only known Pi levels are accepted and a
+   * malformed payload rejects with `SessionManagerError` — never a
+   * fabricated/global list. A pure catalog read: it never fails the session,
+   * so a bad catalog response cannot kill an otherwise healthy queue.
+   */
+  getAvailableThinkingLevels(): Promise<PiThinkingLevel[]> {
+    return this.enqueue(async () => {
+      this.assertState("get available thinking levels", [...recoverableStates]);
+      const client = this.requireClient("get available thinking levels");
+      const command = validateCommand(
+        this.commands.getAvailableThinkingLevels(),
+        "get available thinking levels",
+      );
+      const response = await this.request(client, command, "get available thinking levels");
+      return parseAvailableThinkingLevels(response.data, "get available thinking levels");
+    });
+  }
+
+  /**
+   * Switch the active agent model. The `set_model` response is a mutation
+   * acknowledgement: Pi's authoritative `get_state` owns the effective model
+   * identity and thinking level, so the refresh after the command must
+   * report both a valid model and a valid thinking level — missing fields
+   * reject the mutation instead of preserving any prior or echoed value, and
+   * the requested identity is never used as a fallback. The response's
+   * optional display `name` is preserved only when get_state reports the
+   * same model identity without one (identity/effective values stay
+   * authoritative).
+   */
+  setModel(provider: string, modelId: string): Promise<SessionSetModelResult> {
+    return this.enqueue(async () => {
+      this.assertState("set model", ["ready"]);
+      const validatedProvider = validateModelIdentifier(provider, "provider");
+      const validatedModelId = validateModelIdentifier(modelId, "modelId");
+      const client = this.requireClient("set model");
+      this.clearError();
+      try {
+        const command = validateCommand(
+          this.commands.setModel(validatedProvider, validatedModelId),
+          "set model",
+        );
+        // No identity/cursor/thinking metadata is projected from the
+        // set_model response; only its optional model display name may be
+        // carried over when the authoritative refresh reports the same
+        // identity without one.
+        const response = await this.request(client, command, "set model");
+        const echoedModel = parseModelValue(response.data);
+        const snapshot = await this.refreshStateInternal("set model", {
+          model: true,
+          thinkingLevel: true,
+        });
+        const refreshedModel = snapshot.model;
+        if (refreshedModel === null) {
+          // Pi reported no active model (absent, explicit null, or
+          // malformed): the mutation cannot be confirmed and no requested or
+          // echoed value is used as a fallback.
+          throw new SessionManagerError(
+            "INVALID_RESPONSE",
+            "set model",
+            "Pi did not report the active model after set_model",
+          );
+        }
+        const model =
+          echoedModel !== null &&
+          echoedModel.name !== undefined &&
+          refreshedModel.name === undefined &&
+          echoedModel.id === refreshedModel.id &&
+          echoedModel.provider === refreshedModel.provider
+            ? { ...refreshedModel, name: echoedModel.name }
+            : refreshedModel;
+        if (model !== refreshedModel) this.modelValue = model;
+        return { model, snapshot };
+      } catch (error: unknown) {
+        throw this.mutationFailure("set model", error);
+      }
+    });
+  }
+
+  /**
+   * Switch the active agent thinking level. Pi answers `set_thinking_level`
+   * with no effective payload, so the applied level is read back from the
+   * authoritative `get_state` refresh — which must report a valid thinking
+   * level — and the requested level is never used as a fallback. Rejects
+   * when Pi reports no effective level.
+   */
+  setThinkingLevel(level: PiThinkingLevel): Promise<SessionSetThinkingLevelResult> {
+    return this.enqueue(async () => {
+      this.assertState("set thinking level", ["ready"]);
+      const validatedLevel = validateThinkingLevel(level);
+      if (validatedLevel === null) {
+        throw new TypeError(`thinkingLevel must be one of: ${PI_THINKING_LEVELS.join(", ")}`);
+      }
+      const client = this.requireClient("set thinking level");
+      this.clearError();
+      try {
+        const command = validateCommand(
+          this.commands.setThinkingLevel(validatedLevel),
+          "set thinking level",
+        );
+        // Success-only command: no metadata is projected from its response,
+        // and the authoritative get_state refresh owns the effective level.
+        await this.request(client, command, "set thinking level");
+        const snapshot = await this.refreshStateInternal("set thinking level", {
+          thinkingLevel: true,
+        });
+        const effective = snapshot.thinkingLevel;
+        if (effective === null) {
+          // Pi reported no effective level (absent, explicit null, or
+          // malformed): the mutation cannot be confirmed and the requested
+          // level is never used as a fallback.
+          throw new SessionManagerError(
+            "INVALID_RESPONSE",
+            "set thinking level",
+            "Pi did not report the effective thinking level after set_thinking_level",
+          );
+        }
+        return { level: effective, snapshot };
+      } catch (error: unknown) {
+        throw this.mutationFailure("set thinking level", error);
       }
     });
   }
@@ -876,7 +1111,9 @@ export class SessionManager {
         if (command) {
           const client = this.requireClient("close");
           const response = await this.request(client, command, "close");
-          this.applyResponseMetadata(response);
+          // The close acknowledgement never projects agent state; model and
+          // thinking are authoritative only from get_state.
+          this.applyResponseMetadata(response, [], { agentState: false });
         }
         this.detachClient();
         this.setState("closed");
@@ -906,7 +1143,9 @@ export class SessionManager {
       // decides between fresh-session fallback and strict rejection, so the
       // old identity and durable cursor survive a cancelled strict reconnect.
       if (isCancelled(response)) return false;
-      this.applyResponseMetadata(response);
+      // The switch_session acknowledgement never projects agent state; the
+      // follow-up get_state owns model/thinking.
+      this.applyResponseMetadata(response, [], { agentState: false });
       return true;
     } catch {
       return false;
@@ -917,9 +1156,96 @@ export class SessionManager {
   private async readState(client: SessionPiRpcClient, resumed: boolean): Promise<SessionOpenResult> {
     const command = validateCommand(this.commands.getState(), "state");
     const response = await this.request(client, command, "state");
+    // A RESUMED persisted session must re-report the authoritative model and
+    // thinking level — a get_state missing them rejects instead of
+    // preserving stale values into the re-established runtime. An initial
+    // fresh session (new_session) may be a no-model session and stays
+    // permissive unless the manager already holds a projection (e.g. a
+    // forced reconnect of an established runtime).
+    this.validateRequiredState("open", response, {
+      model: resumed || this.modelValue !== null,
+      thinkingLevel: resumed || this.thinkingLevelValue !== null,
+    });
     this.applyResponseMetadata(response);
     this.setState("ready");
     return this.openResult(resumed);
+  }
+
+  /**
+   * Validate a get_state response against required agent-state fields.
+   * Presence-only: a field that is simply absent never satisfies the
+   * requirement (cached or echoed values are never preserved through a
+   * refresh that did not re-report them), while an EXPLICIT null is an
+   * authoritative reset and passes — it is applied by the caller's normal
+   * projection. Mutation methods additionally reject a null effective value
+   * after the refresh (their own guard), and stale/partial values are never
+   * applied because this check runs before any metadata is applied.
+   */
+  private validateRequiredState(
+    operation: string,
+    response: PiRpcSuccessResponse,
+    required: { readonly model?: boolean; readonly thinkingLevel?: boolean },
+  ): void {
+    if (required.model === true && !responseModel(response).present) {
+      throw new SessionManagerError(
+        "INVALID_RESPONSE",
+        operation,
+        `${operation} requires Pi's get_state to report the active model`,
+      );
+    }
+    if (required.thinkingLevel === true && !responseThinkingLevel(response).present) {
+      throw new SessionManagerError(
+        "INVALID_RESPONSE",
+        operation,
+        `${operation} requires Pi's get_state to report the active thinking level`,
+      );
+    }
+  }
+
+  /**
+   * Read `get_state`, re-project metadata, and emit exactly one snapshot.
+   * Shared by the public `refreshState` and the mutation methods (which must
+   * not re-enqueue behind their own tail).
+   *
+   * Mutation refreshes pass `required` so an absent effective field rejects
+   * before any metadata is applied — a response with the model present but
+   * the thinking level absent can never partially mutate session state, and
+   * a prior or echoed value never satisfies a required field. Explicit nulls
+   * pass the presence check and are applied as authoritative resets; the
+   * mutation methods then reject when the effective value is null. Ordinary
+   * handshake and settle refreshes pass only the fields the manager already
+   * holds (established sessions), so a no-model startup stays permissive.
+   */
+  private async refreshStateInternal(
+    operation: string,
+    required: { readonly model?: boolean; readonly thinkingLevel?: boolean } = {},
+  ): Promise<SessionSnapshot> {
+    const client = this.requireClient(operation);
+    const command = validateCommand(this.commands.getState(), "state");
+    const response = await this.request(client, command, "state");
+    this.validateRequiredState(operation, response, required);
+    this.applyResponseMetadata(response);
+    this.emitSnapshot();
+    return this.getSnapshot();
+  }
+
+  /**
+   * Wrap a mutation failure without failing the session: a rejected
+   * `set_model`/`set_thinking_level` does not kill the queue, so the
+   * lifecycle state is preserved and only the error is surfaced.
+   */
+  private mutationFailure(operation: string, error: unknown): SessionManagerError {
+    const wrapped =
+      error instanceof SessionManagerError
+        ? error
+        : new SessionManagerError(
+            "RPC_FAILURE",
+            operation,
+            `Session ${operation} failed: ${errorMessage(error)}`,
+            { cause: error },
+          );
+    this.lastErrorValue = wrapped.message;
+    return wrapped;
   }
 
   private openResult(resumed: boolean): SessionOpenResult {
@@ -953,7 +1279,11 @@ export class SessionManager {
     )
       .then((response) => {
         const entries = readEntries(response.data);
-        this.applyResponseMetadata(response, entries);
+        // Identity/cursor handling is preserved for the legitimate
+        // get_entries command, but the response's arbitrary wrapper fields
+        // must never overwrite the selected model/thinking projected from
+        // get_state.
+        this.applyResponseMetadata(response, entries, { agentState: false });
         this.setState("ready");
         return {
           sessionId: this.sessionIdValue,
@@ -974,6 +1304,7 @@ export class SessionManager {
   private applyResponseMetadata(
     response: PiRpcSuccessResponse,
     entries: readonly JsonValue[] = [],
+    options: { readonly agentState?: boolean } = {},
   ): void {
     const sessionId = responseSessionId(response);
     if (sessionId !== null) this.sessionIdValue = sessionId;
@@ -984,11 +1315,35 @@ export class SessionManager {
     const leaf = responseLeafId(response);
     if (leaf.present) this.leafIdValue = leaf.value;
 
-    const model = responseModel(response);
-    if (model.present) this.modelValue = model.value;
+    // Selected agent state (model/thinking) is projected only from
+    // authoritative get_state responses. History (get_entries) responses may
+    // carry arbitrary wrapper fields that must never overwrite the projected
+    // selection; mutation responses are not fed through this projection at
+    // all. When get_state reports the same model identity without the
+    // optional display name, the compatible name from the previous
+    // projection is preserved (identity and effective values stay
+    // authoritative; only the display metadata survives).
+    if (options.agentState !== false) {
+      const model = responseModel(response);
+      if (model.present) {
+        if (model.value === null) {
+          this.modelValue = null;
+        } else if (
+          model.value.name === undefined &&
+          this.modelValue !== null &&
+          this.modelValue.id === model.value.id &&
+          this.modelValue.provider === model.value.provider &&
+          this.modelValue.name !== undefined
+        ) {
+          this.modelValue = { ...model.value, name: this.modelValue.name };
+        } else {
+          this.modelValue = model.value;
+        }
+      }
 
-    const thinkingLevel = responseThinkingLevel(response);
-    if (thinkingLevel.present) this.thinkingLevelValue = thinkingLevel.value;
+      const thinkingLevel = responseThinkingLevel(response);
+      if (thinkingLevel.present) this.thinkingLevelValue = thinkingLevel.value;
+    }
 
     const cursor = responseAppendCursor(response, entries, this.lastSeenEntryIdValue);
     if (cursor !== null) this.lastSeenEntryIdValue = cursor;
