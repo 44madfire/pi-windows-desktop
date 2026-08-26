@@ -14,6 +14,7 @@ import type {
 import type { SessionPointer, SessionStore } from "../session/session-store.ts";
 import {
   SessionManager,
+  SessionManagerError,
   type SessionPiRpcClient,
   type SessionSnapshot,
 } from "../session/session-manager.ts";
@@ -43,6 +44,11 @@ type FakeResponse = Record<string, unknown> | readonly unknown[];
 /**
  * Default Pi behavior for the handshake commands. `get_entries` yields the
  * optional `since` cursor plus `entries`/`leafId` when supplied.
+ *
+ * The default `get_state` reports Pi's required model and thinkingLevel
+ * fields (the authoritative agent state the handshake and mutation refreshes
+ * project), so tests that exercise mutations against the default fixture
+ * satisfy the required-field refresh contract.
  */
 const defaultResponses = (command: WireCommand): FakeResponse => {
   switch (command.type) {
@@ -50,7 +56,12 @@ const defaultResponses = (command: WireCommand): FakeResponse => {
     case "switch_session":
       return { sessionId: "pi-session-1" };
     case "get_state":
-      return { sessionId: "pi-session-1", sessionFile };
+      return {
+        sessionId: "pi-session-1",
+        sessionFile,
+        model: { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5" },
+        thinkingLevel: "medium",
+      };
     case "get_entries":
       return {
         entries:
@@ -369,7 +380,14 @@ test("a restored runtime resumes switch_session, requests full history, and re-h
       case "switch_session":
         return { sessionId: "pi-session-1" };
       case "get_state":
-        return { sessionId: "pi-session-1", sessionFile };
+        // A resumed persisted session must report the authoritative agent
+        // state (model + thinking level).
+        return {
+          sessionId: "pi-session-1",
+          sessionFile,
+          model: { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5" },
+          thinkingLevel: "medium",
+        };
       case "get_entries":
         // Full history (no `since` cursor): the persisted session's old
         // user/assistant turn is restored for the fresh conversation. An
@@ -475,7 +493,14 @@ test("a stored leaf and cursor round-trip through a full-history cold start", as
       case "switch_session":
         return { sessionId: "pi-session-1" };
       case "get_state":
-        return { sessionId: "pi-session-1", sessionFile };
+        // A resumed persisted session must report the authoritative agent
+        // state (model + thinking level).
+        return {
+          sessionId: "pi-session-1",
+          sessionFile,
+          model: { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5" },
+          thinkingLevel: "medium",
+        };
       case "get_entries":
         // The response carries no leafId key: it is not authoritative about
         // the active leaf, so the restored leaf must be preserved.
@@ -766,7 +791,14 @@ const reconnectResponses = (command: WireCommand): Record<string, unknown> => {
     case "switch_session":
       return { sessionId: "pi-session-1" };
     case "get_state":
-      return { sessionId: "pi-session-1", sessionFile };
+      // Resumed/established sessions must report the authoritative agent
+      // state (model + thinking level).
+      return {
+        sessionId: "pi-session-1",
+        sessionFile,
+        model: { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5" },
+        thinkingLevel: "medium",
+      };
     case "get_entries":
       return command.since === undefined
         ? {
@@ -832,7 +864,14 @@ test("a second runtime cold start requests full history and restores the previou
       case "switch_session":
         return { sessionId: "pi-session-1" };
       case "get_state":
-        return { sessionId: "pi-session-1", sessionFile };
+        // A resumed persisted session must report the authoritative agent
+        // state (model + thinking level).
+        return {
+          sessionId: "pi-session-1",
+          sessionFile,
+          model: { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5" },
+          thinkingLevel: "medium",
+        };
       case "get_entries": {
         if (command.since === undefined) {
           return turnPersisted
@@ -1010,7 +1049,18 @@ test("a failing pointer save stays best-effort: runtime stays ready, warns, and 
 
   assert.deepEqual(
     transports[0].writtenCommands().map((command) => command.type),
-    ["new_session", "get_state", "get_entries", "prompt", "get_entries", "prompt"],
+    [
+      "new_session",
+      "get_state",
+      "get_entries",
+      "prompt",
+      // The controlled settle refresh: get_entries catch-up, then the
+      // authoritative get_state, then a best-effort supported-levels read.
+      "get_entries",
+      "get_state",
+      "get_available_thinking_levels",
+      "prompt",
+    ],
     "the queued prompt must follow the post-settled synchronization despite the failing pointer save",
   );
   assert.equal(runtime.snapshot.state, "ready");
@@ -1283,7 +1333,14 @@ test("a live turn that settled before the transport died is never duplicated by 
       case "switch_session":
         return { sessionId: "pi-session-1" };
       case "get_state":
-        return { sessionId: "pi-session-1", sessionFile };
+        // A resumed persisted session must report the authoritative agent
+        // state (model + thinking level).
+        return {
+          sessionId: "pi-session-1",
+          sessionFile,
+          model: { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5" },
+          thinkingLevel: "medium",
+        };
       case "get_entries": {
         getEntriesCalls += 1;
         // 1: startup catch-up on a fresh session — empty history.
@@ -1428,7 +1485,18 @@ test("a queued prompt is dispatched only after the post-settled synchronization 
   const commands = transports[0].writtenCommands().map((command) => command.type);
   assert.deepEqual(
     commands,
-    ["new_session", "get_state", "get_entries", "prompt", "get_entries", "prompt"],
+    [
+      "new_session",
+      "get_state",
+      "get_entries",
+      "prompt",
+      // The settle refresh reads the authoritative get_state plus a
+      // best-effort supported-levels query before the queue resumes.
+      "get_entries",
+      "get_state",
+      "get_available_thinking_levels",
+      "prompt",
+    ],
     "the queued prompt must follow the post-settled synchronization",
   );
   assert.equal(runtime.snapshot.lastSeenEntryId, "user-1");
@@ -1740,8 +1808,9 @@ test("setModel writes the exact command and applies the authoritative response",
 
   const model = await runtime.setModel("anthropic", "claude-sonnet-4-5");
 
-  // The response model is authoritative: it is applied to the snapshot and
-  // returned to the caller.
+  // The effective model comes from the authoritative get_state refresh (the
+  // default fixture reports the same model Pi's set_model echoed): it is
+  // applied to the snapshot and returned to the caller.
   assert.deepEqual(model, {
     id: "claude-sonnet-4-5",
     provider: "anthropic",
@@ -1757,74 +1826,229 @@ test("setModel writes the exact command and applies the authoritative response",
   await runtime.stop();
 });
 
-test("setModel accepts a nested model echo and falls back to the requested identity on a bare ack", async () => {
+test("setModel refreshes the effective state from get_state and the supported levels", async () => {
+  let getStateCalls = 0;
   const transport = new FakeTransport((command) => {
-    if (command.type === "set_model") {
-      return command.provider === "openai"
-        ? { model: { id: "gpt-5", provider: "openai" } }
-        : {}; // bare acknowledgement: Pi does not echo the model
+    switch (command.type) {
+      case "set_model":
+        return {}; // bare acknowledgement: no model echo at all
+      case "get_state":
+        getStateCalls += 1;
+        if (getStateCalls === 1) {
+          // Handshake seeds the previous selection.
+          return {
+            sessionId: "pi-session-1",
+            sessionFile,
+            model: { id: "claude-sonnet-4-5", provider: "anthropic" },
+            thinkingLevel: "medium",
+          };
+        }
+        // The authoritative refresh after set_model reports the applied model.
+        return {
+          sessionId: "pi-session-1",
+          sessionFile,
+          model: { id: "gpt-5", provider: "openai", name: "GPT-5" },
+          thinkingLevel: "low",
+        };
+      case "get_available_thinking_levels":
+        return { levels: ["off", "low"] };
+      default:
+        return defaultResponses(command);
     }
-    return defaultResponses(command);
   });
   const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
   await runtime.start(workspace);
 
-  const nested = await runtime.setModel("openai", "gpt-5");
-  assert.deepEqual(nested, { id: "gpt-5", provider: "openai" });
-  assert.deepEqual(runtime.snapshot.model, { id: "gpt-5", provider: "openai" });
+  const model = await runtime.setModel("anthropic", "claude-sonnet-4-5");
 
-  // Without an echo, the requested identity becomes the authoritative model —
-  // the shell never leaves the selector stale after a successful switch.
-  const fallback = await runtime.setModel("anthropic", "claude-sonnet-4-5");
-  assert.deepEqual(fallback, { id: "claude-sonnet-4-5", provider: "anthropic" });
-  assert.deepEqual(runtime.snapshot.model, { id: "claude-sonnet-4-5", provider: "anthropic" });
+  // The effective model comes from the authoritative get_state refresh —
+  // never fabricated from the requested identity.
+  assert.deepEqual(model, { id: "gpt-5", provider: "openai", name: "GPT-5" });
+  assert.deepEqual(runtime.snapshot.model, model);
+  // The get_state refresh re-reads the effective thinking level too.
+  assert.equal(runtime.snapshot.thinkingLevel, "low");
+  // The switch refreshed the model-specific supported thinking levels.
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, ["off", "low"]);
+  // The exact command shape plus the refresh sequence.
+  const command = transport.writtenCommands().find((c) => c.type === "set_model");
+  assert.deepEqual(
+    { provider: command?.provider, modelId: command?.modelId },
+    { provider: "anthropic", modelId: "claude-sonnet-4-5" },
+  );
+  assert.deepEqual(
+    transport.writtenCommands().map((c) => c.type).slice(-3),
+    ["set_model", "get_state", "get_available_thinking_levels"],
+  );
 
   await runtime.stop();
 });
 
-test("setThinkingLevel writes the exact command and applies the authoritative echoed level", async () => {
+test("setModel clears the supported levels when the catalog read fails after the switch", async () => {
+  let getStateCalls = 0;
+  let levelsCalls = 0;
   const transport = new FakeTransport((command) => {
-    if (command.type === "set_thinking_level") {
-      return { thinkingLevel: "max" };
+    switch (command.type) {
+      case "set_model":
+        return { id: "gpt-5", provider: "openai" };
+      case "get_state":
+        getStateCalls += 1;
+        // The handshake seeds the previous model; the mutation refresh
+        // reports the switched-to model with its effective thinking level.
+        return {
+          sessionId: "pi-session-1",
+          sessionFile,
+          model:
+            getStateCalls === 1
+              ? { id: "claude-sonnet-4-5", provider: "anthropic" }
+              : { id: "gpt-5", provider: "openai" },
+          thinkingLevel: "medium",
+        };
+      case "get_available_thinking_levels":
+        levelsCalls += 1;
+        return levelsCalls === 1 ? { levels: ["off"] } : {}; // malformed after
+      default:
+        return defaultResponses(command);
     }
-    return defaultResponses(command);
+  });
+  const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
+  await runtime.start(workspace);
+  await runtime.getAvailableThinkingLevels();
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, ["off"]);
+  assert.equal(runtime.snapshot.model?.id, "claude-sonnet-4-5");
+
+  // A malformed levels payload never fails the successful model mutation,
+  // but the stale pre-switch list is cleared: the new model's supported
+  // options are unknown, so the old model's list must not remain selectable.
+  const model = await runtime.setModel("openai", "gpt-5");
+  assert.deepEqual(model, { id: "gpt-5", provider: "openai" });
+  assert.equal(runtime.snapshot.state, "ready");
+  assert.equal(runtime.snapshot.model?.id, "gpt-5");
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, []);
+
+  await runtime.stop();
+});
+
+test("setModel preserves the compatible display name while get_state owns the effective identity", async () => {
+  const transport = new FakeTransport((command) => {
+    switch (command.type) {
+      case "set_model":
+        // Pi's set_model answers the full model object, including the name.
+        return { id: "gpt-5", provider: "openai", name: "GPT-5" };
+      case "get_state":
+        // The authoritative get_state confirms the same identity without the
+        // optional display name; the compatible name survives.
+        return {
+          sessionId: "pi-session-1",
+          sessionFile,
+          model: { id: "gpt-5", provider: "openai" },
+          thinkingLevel: "low",
+        };
+      case "get_available_thinking_levels":
+        return { levels: ["off"] };
+      default:
+        return defaultResponses(command);
+    }
+  });
+  const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
+  await runtime.start(workspace);
+
+  const model = await runtime.setModel("openai", "gpt-5");
+
+  // Identity and effective level come from get_state; the name is the
+  // compatible echo enrichment.
+  assert.deepEqual(model, { id: "gpt-5", provider: "openai", name: "GPT-5" });
+  assert.deepEqual(runtime.snapshot.model, { id: "gpt-5", provider: "openai", name: "GPT-5" });
+  assert.equal(runtime.snapshot.thinkingLevel, "low");
+  await runtime.stop();
+});
+
+test("setThinkingLevel writes the exact command and reads the effective level from get_state", async () => {
+  let getStateCalls = 0;
+  const transport = new FakeTransport((command) => {
+    switch (command.type) {
+      case "set_thinking_level":
+        return {}; // success-only: Pi answers with no effective payload
+      case "get_state":
+        getStateCalls += 1;
+        if (getStateCalls === 1) {
+          return { sessionId: "pi-session-1", sessionFile, thinkingLevel: "medium" };
+        }
+        return { sessionId: "pi-session-1", sessionFile, thinkingLevel: "max" };
+      default:
+        return defaultResponses(command);
+    }
   });
   const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
   await runtime.start(workspace);
 
   const applied = await runtime.setThinkingLevel("high");
 
-  // Pi's echo is authoritative even when it differs from the request.
+  // The effective level is read back from the authoritative get_state, not
+  // an echo (there is none) and never the requested value.
   assert.equal(applied, "max");
   assert.equal(runtime.snapshot.thinkingLevel, "max");
   const command = transport.writtenCommands().find((c) => c.type === "set_thinking_level");
   assert.equal(command?.level, "high");
   assert.deepEqual(Object.keys(command ?? {}).sort(), ["id", "level", "type"]);
+  // The mutation followed the command with the get_state refresh.
+  assert.deepEqual(
+    transport.writtenCommands().map((c) => c.type).slice(-2),
+    ["set_thinking_level", "get_state"],
+  );
 
   await runtime.stop();
 });
 
-test("setThinkingLevel falls back to the requested level when Pi does not echo one", async () => {
-  const transport = new FakeTransport(); // default: `{}` for set_thinking_level
+test("setThinkingLevel never falls back to the requested level", async () => {
+  let getStateCalls = 0;
+  const transport = new FakeTransport((command) => {
+    switch (command.type) {
+      case "set_thinking_level":
+        return {}; // success without any effective level payload
+      case "get_state":
+        getStateCalls += 1;
+        if (getStateCalls === 1) {
+          return { sessionId: "pi-session-1", sessionFile, thinkingLevel: "medium" };
+        }
+        // Pi applies a different effective level than the one requested.
+        return { sessionId: "pi-session-1", sessionFile, thinkingLevel: "low" };
+      default:
+        return defaultResponses(command);
+    }
+  });
   const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
   await runtime.start(workspace);
 
-  const applied = await runtime.setThinkingLevel("low");
+  const applied = await runtime.setThinkingLevel("high");
 
+  // The requested "high" is never used as a fallback: get_state reports the
+  // authoritative "low" and the shell must expose exactly that.
   assert.equal(applied, "low");
   assert.equal(runtime.snapshot.thinkingLevel, "low");
   await runtime.stop();
 });
 
-test("model_change and thinking_level_change events update the runtime snapshot and still forward raw", async () => {
+test("model_change and thinking_level_change events never project state and still forward raw", async () => {
   const forwarded: PiEvent[] = [];
-  const transport = new FakeTransport();
+  const transport = new FakeTransport((command) => {
+    if (command.type === "get_state") {
+      return {
+        sessionId: "pi-session-1",
+        sessionFile,
+        model: { id: "seed", provider: "anthropic" },
+        thinkingLevel: "medium",
+      };
+    }
+    return defaultResponses(command);
+  });
   const runtime = new PiRuntimeController({
     wsl: fakeWsl,
     createTransport: () => transport,
     handlers: { onEvent: (event) => forwarded.push(event) },
   });
   await runtime.start(workspace);
+  assert.deepEqual(runtime.snapshot.model, { id: "seed", provider: "anthropic" });
+  assert.equal(runtime.snapshot.thinkingLevel, "medium");
 
   transport.emitStdoutLine(
     JSON.stringify({ type: "model_change", provider: "openai", modelId: "gpt-5" }),
@@ -1832,10 +2056,11 @@ test("model_change and thinking_level_change events update the runtime snapshot 
   transport.emitStdoutLine(JSON.stringify({ type: "thinking_level_change", thinkingLevel: "xhigh" }));
   await flushMicrotasks();
 
-  // The async events project the authoritative state into the snapshot so
-  // selectors observe it without re-querying.
-  assert.deepEqual(runtime.snapshot.model, { id: "gpt-5", provider: "openai" });
-  assert.equal(runtime.snapshot.thinkingLevel, "xhigh");
+  // Model/thinking changes are not Pi RPC events: `get_state` is the only
+  // authoritative source, so no fake `model_change`/`thinking_level_change`
+  // projection may mutate the snapshot.
+  assert.deepEqual(runtime.snapshot.model, { id: "seed", provider: "anthropic" });
+  assert.equal(runtime.snapshot.thinkingLevel, "medium");
 
   // The raw events still reach protocol consumers unchanged.
   const protocolTypes: string[] = [];
@@ -1851,26 +2076,201 @@ test("model_change and thinking_level_change events update the runtime snapshot 
   await runtime.stop();
 });
 
-test("agent-state events tolerate snake_case payloads and ignore malformed ones", async () => {
-  const transport = new FakeTransport();
+test("state-like RPC events never mutate the projected agent state regardless of payload shape", async () => {
+  const transport = new FakeTransport((command) => {
+    if (command.type === "get_state") {
+      return {
+        sessionId: "pi-session-1",
+        sessionFile,
+        model: { id: "seed", provider: "anthropic" },
+        thinkingLevel: "medium",
+      };
+    }
+    return defaultResponses(command);
+  });
   const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
   await runtime.start(workspace);
 
+  // snake_case payloads are equally inert.
   transport.emitStdoutLine(
     JSON.stringify({ type: "model_change", provider: "anthropic", model_id: "claude-sonnet-4-5" }),
   );
   transport.emitStdoutLine(JSON.stringify({ type: "thinking_level_change", thinking_level: "medium" }));
   await flushMicrotasks();
-  assert.equal(runtime.snapshot.model?.id, "claude-sonnet-4-5");
+  assert.equal(runtime.snapshot.model?.id, "seed");
   assert.equal(runtime.snapshot.thinkingLevel, "medium");
 
-  // Malformed events must not fabricate state: the snapshot keeps the last
-  // authoritative values.
+  // Malformed events are inert too: the snapshot keeps the last
+  // authoritative get_state values.
   transport.emitStdoutLine(JSON.stringify({ type: "model_change", provider: "orphan" }));
   transport.emitStdoutLine(JSON.stringify({ type: "thinking_level_change", thinkingLevel: "turbo" }));
   await flushMicrotasks();
-  assert.equal(runtime.snapshot.model?.id, "claude-sonnet-4-5");
+  assert.equal(runtime.snapshot.model?.id, "seed");
   assert.equal(runtime.snapshot.thinkingLevel, "medium");
+
+  await runtime.stop();
+});
+
+test("getAvailableThinkingLevels writes the exact command, parses data.levels, and seeds the snapshot", async () => {
+  const transport = new FakeTransport((command) => {
+    if (command.type === "get_available_thinking_levels") {
+      return { levels: ["off", "low", "max"] };
+    }
+    return defaultResponses(command);
+  });
+  const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
+  await runtime.start(workspace);
+  // The catalog is not seeded by the handshake: empty until queried.
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, []);
+
+  const levels = await runtime.getAvailableThinkingLevels();
+
+  assert.deepEqual(levels, ["off", "low", "max"]);
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, levels);
+  // The command carries only the owned type (+ the correlation id).
+  const command = transport.writtenCommands().find((c) => c.type === "get_available_thinking_levels");
+  assert.deepEqual(Object.keys(command ?? {}).sort(), ["id", "type"]);
+
+  await runtime.stop();
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, []);
+});
+
+test("getAvailableThinkingLevels rejects malformed levels and keeps the previous list", async () => {
+  let levelsCalls = 0;
+  const transport = new FakeTransport((command) => {
+    if (command.type === "get_available_thinking_levels") {
+      levelsCalls += 1;
+      return levelsCalls === 1 ? { levels: ["off"] } : { levels: ["off", "turbo"] };
+    }
+    return defaultResponses(command);
+  });
+  const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
+  await runtime.start(workspace);
+
+  await runtime.getAvailableThinkingLevels();
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, ["off"]);
+
+  // An unknown entry is malformed: the whole list is rejected and the
+  // previous authoritative list survives — the shell never fabricates levels.
+  await assert.rejects(runtime.getAvailableThinkingLevels(), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "INVALID_RESPONSE");
+    return true;
+  });
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, ["off"]);
+  assert.equal(runtime.snapshot.state, "ready", "a catalog failure never fails the runtime");
+
+  await runtime.stop();
+});
+
+test("getAvailableThinkingLevels rejects an absent levels payload", async () => {
+  const transport = new FakeTransport(); // default: `{}` for the catalog query
+  const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
+  await runtime.start(workspace);
+
+  await assert.rejects(runtime.getAvailableThinkingLevels(), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "INVALID_RESPONSE");
+    return true;
+  });
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, []);
+
+  await runtime.stop();
+});
+
+test("set -> settle -> post-settle synchronize preserves the selected model and thinking level", async () => {
+  const forwarded: PiEvent[] = [];
+  let getStateCalls = 0;
+  let getEntriesCalls = 0;
+  const responses = (command: WireCommand): Record<string, unknown> => {
+    switch (command.type) {
+      case "new_session":
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "get_state":
+        getStateCalls += 1;
+        if (getStateCalls === 1) {
+          return {
+            sessionId: "pi-session-1",
+            sessionFile,
+            model: { id: "claude-sonnet-4-5", provider: "anthropic" },
+            thinkingLevel: "medium",
+          };
+        }
+        // Every later refresh (set_model, settle) confirms the selection.
+        return {
+          sessionId: "pi-session-1",
+          sessionFile,
+          model: { id: "gpt-5", provider: "openai" },
+          thinkingLevel: "max",
+        };
+      case "get_entries":
+        getEntriesCalls += 1;
+        if (getEntriesCalls === 1) return { entries: [], leafId: null };
+        return {
+          entries: [
+            {
+              type: "message",
+              id: "user-1",
+              parentId: null,
+              timestamp: "2026-01-01T00:00:00.000Z",
+              message: { role: "user", content: "first" },
+            },
+          ],
+          leafId: "user-1",
+        };
+      case "get_available_thinking_levels":
+        return { levels: ["off", "max"] };
+      default:
+        return {};
+    }
+  };
+  const transport = new FakeTransport(responses);
+  const runtime = new PiRuntimeController({
+    wsl: fakeWsl,
+    createTransport: () => transport,
+    handlers: { onEvent: (event) => forwarded.push(event) },
+  });
+  await runtime.start(workspace);
+
+  await runtime.setModel("anthropic", "gpt-5");
+  assert.equal(runtime.snapshot.model?.id, "gpt-5");
+  assert.equal(runtime.snapshot.thinkingLevel, "max");
+
+  await runtime.sendPrompt("first");
+  transport.emitStdoutLine(JSON.stringify({ type: "agent_settled" }));
+  await flushMicrotasks();
+  await flushMicrotasks();
+
+  // The controlled settle refresh ran: get_entries catch-up, authoritative
+  // get_state, then best-effort supported levels.
+  assert.deepEqual(
+    transport.writtenCommands().map((command) => command.type).slice(-3),
+    ["get_entries", "get_state", "get_available_thinking_levels"],
+  );
+  assert.equal(runtime.snapshot.state, "ready");
+  // The selection never regressed through the settle synchronization.
+  assert.equal(runtime.snapshot.model?.id, "gpt-5");
+  assert.equal(runtime.snapshot.thinkingLevel, "max");
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, ["off", "max"]);
+
+  // No runtime snapshot published after the model switch may regress the
+  // selected model or thinking level (the session enters synchronizing
+  // during the settle; the projection must not follow it).
+  let sawPostSetSnapshot = false;
+  for (const event of forwarded) {
+    if (event.type !== "runtime") continue;
+    const snapshot = event.snapshot;
+    if (snapshot.model?.id === "gpt-5") {
+      sawPostSetSnapshot = true;
+      assert.equal(
+        snapshot.thinkingLevel,
+        "max",
+        "the selected thinking level must never regress",
+      );
+    }
+  }
+  assert.ok(sawPostSetSnapshot, "the post-set model selection must be published");
 
   await runtime.stop();
 });
@@ -1882,6 +2282,7 @@ test("model/level selectors reject before the runtime is started", async () => {
   });
 
   await assert.rejects(runtime.getAvailableModels(), /not running/);
+  await assert.rejects(runtime.getAvailableThinkingLevels(), /not running/);
   await assert.rejects(runtime.setModel("anthropic", "claude-sonnet-4-5"), /not running/);
   await assert.rejects(runtime.setThinkingLevel("high"), /not running/);
 });
@@ -1909,18 +2310,32 @@ test("setModel and setThinkingLevel reject invalid renderer inputs at the runtim
   await runtime.stop();
 });
 
-test("stop clears the projected agent state and the model catalog", async () => {
+test("stop clears the projected agent state, the model catalog, and the supported thinking levels", async () => {
+  let getStateCalls = 0;
   const transport = new FakeTransport((command) => {
-    if (command.type === "get_available_models") {
-      return { models: [{ id: "gpt-5", provider: "openai" }] };
+    switch (command.type) {
+      case "get_available_models":
+        return { models: [{ id: "gpt-5", provider: "openai" }] };
+      case "set_model":
+        return { id: "gpt-5", provider: "openai" };
+      case "get_available_thinking_levels":
+        return { levels: ["off", "low"] };
+      case "get_state":
+        getStateCalls += 1;
+        if (getStateCalls === 1) {
+          // Handshake: a no-model session is valid.
+          return { sessionId: "pi-session-1", sessionFile, thinkingLevel: "medium" };
+        }
+        // Mutation refreshes must report the effective model and level.
+        return {
+          sessionId: "pi-session-1",
+          sessionFile,
+          model: { id: "gpt-5", provider: "openai" },
+          thinkingLevel: "max",
+        };
+      default:
+        return defaultResponses(command);
     }
-    if (command.type === "set_model") {
-      return { id: "gpt-5", provider: "openai" };
-    }
-    if (command.type === "set_thinking_level") {
-      return { thinkingLevel: "max" };
-    }
-    return defaultResponses(command);
   });
   const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
   await runtime.start(workspace);
@@ -1931,12 +2346,327 @@ test("stop clears the projected agent state and the model catalog", async () => 
   assert.equal(runtime.snapshot.availableModels.length, 1);
   assert.equal(runtime.snapshot.model?.id, "gpt-5");
   assert.equal(runtime.snapshot.thinkingLevel, "max");
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, ["off", "low"]);
 
   await runtime.stop();
 
-  // The Pi process is gone: agent state and the catalog reset with it.
+  // The Pi process is gone: agent state and the catalogs reset with it.
   assert.equal(runtime.snapshot.state, "stopped");
   assert.equal(runtime.snapshot.model, null);
   assert.equal(runtime.snapshot.thinkingLevel, null);
   assert.deepEqual(runtime.snapshot.availableModels, []);
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, []);
+});
+
+test("a model mutation in flight when stop is requested never publishes stale agent state into the stopped runtime", async () => {
+  let getStateCalls = 0;
+  const responses = (command: WireCommand): Record<string, unknown> => {
+    switch (command.type) {
+      case "new_session":
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "set_model":
+        return { id: "gpt-5", provider: "openai" };
+      case "get_state":
+        getStateCalls += 1;
+        return {
+          sessionId: "pi-session-1",
+          sessionFile,
+          model:
+            getStateCalls === 1
+              ? { id: "claude-sonnet-4-5", provider: "anthropic" }
+              : { id: "gpt-5", provider: "openai" },
+          thinkingLevel: "medium",
+        };
+      case "get_entries":
+        return { entries: [], leafId: null };
+      case "get_available_thinking_levels":
+        return { levels: ["off", "low"] };
+      default:
+        return {};
+    }
+  };
+  const transport = new FakeTransport(responses, { deferResponses: true });
+  const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
+
+  const starting = runtime.start(workspace);
+  for (let index = 0; index < 5; index += 1) {
+    transport.flushDeferredResponses();
+    await flushMicrotasks();
+  }
+  await starting;
+  assert.equal(runtime.snapshot.state, "ready");
+
+  // The mutation's responses are deferred, so it holds the lifecycle tail
+  // when stop() is requested; the stop is serialized behind the mutation,
+  // which publishes into the ready runtime and is then cleared by the stop —
+  // an overlapping result can never be published into the stopped snapshot.
+  const changing = runtime.setModel("openai", "gpt-5");
+  const stopping = runtime.stop();
+  for (let index = 0; index < 5; index += 1) {
+    transport.flushDeferredResponses();
+    await flushMicrotasks();
+  }
+  const model = await changing;
+  const stopped = await stopping;
+
+  assert.deepEqual(model, { id: "gpt-5", provider: "openai" });
+  assert.equal(stopped.state, "stopped");
+  assert.equal(runtime.snapshot.state, "stopped");
+  assert.equal(runtime.snapshot.model, null);
+  assert.equal(runtime.snapshot.thinkingLevel, null);
+  assert.deepEqual(runtime.snapshot.availableModels, []);
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, []);
+});
+
+test("a catalog read in flight when stop is requested never overwrites the stopped runtime's cleared catalog", async () => {
+  const transport = new FakeTransport(
+    (command) => {
+      if (command.type === "get_available_models") {
+        return { models: [{ id: "gpt-5", provider: "openai" }] };
+      }
+      return defaultResponses(command);
+    },
+    { deferResponses: true },
+  );
+  const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
+
+  const starting = runtime.start(workspace);
+  for (let index = 0; index < 5; index += 1) {
+    transport.flushDeferredResponses();
+    await flushMicrotasks();
+  }
+  await starting;
+  assert.equal(runtime.snapshot.state, "ready");
+
+  // The catalog read holds the lifecycle tail while stop() is requested; the
+  // stop queues behind it, so the overlapping result is published into the
+  // ready runtime and then cleared by the stop — never into the stopped
+  // snapshot.
+  const reading = runtime.getAvailableModels();
+  const stopping = runtime.stop();
+  for (let index = 0; index < 5; index += 1) {
+    transport.flushDeferredResponses();
+    await flushMicrotasks();
+  }
+  const models = await reading;
+  await stopping;
+
+  assert.deepEqual(models, [{ id: "gpt-5", provider: "openai" }]);
+  assert.equal(runtime.snapshot.state, "stopped");
+  assert.deepEqual(runtime.snapshot.availableModels, []);
+});
+
+test("a mutation whose transport dies before its catalog read rejects instead of publishing into the disconnected runtime", async () => {
+  let getStateCalls = 0;
+  const responses = (command: WireCommand): Record<string, unknown> => {
+    switch (command.type) {
+      case "new_session":
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "set_model":
+        return { id: "gpt-5", provider: "openai" };
+      case "get_state":
+        getStateCalls += 1;
+        return {
+          sessionId: "pi-session-1",
+          sessionFile,
+          model:
+            getStateCalls === 1
+              ? { id: "claude-sonnet-4-5", provider: "anthropic" }
+              : { id: "gpt-5", provider: "openai" },
+          thinkingLevel: "medium",
+        };
+      case "get_entries":
+        return { entries: [], leafId: null };
+      case "get_available_thinking_levels":
+        return { levels: ["off", "low"] };
+      default:
+        return {};
+    }
+  };
+  const transport = new FakeTransport(responses, { deferResponses: true });
+  const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
+
+  const starting = runtime.start(workspace);
+  for (let index = 0; index < 5; index += 1) {
+    transport.flushDeferredResponses();
+    await flushMicrotasks();
+  }
+  await starting;
+  assert.equal(runtime.snapshot.state, "ready");
+  assert.equal(runtime.snapshot.model?.id, "claude-sonnet-4-5");
+
+  // The mutation completes its set_model + get_state refresh, then its
+  // supported-levels catalog read is in flight when the transport dies. The
+  // wiring references are unchanged by a transport error, but the runtime is
+  // no longer ready: the result must be discarded, not published.
+  const changing = runtime.setModel("openai", "gpt-5");
+  await flushMicrotasks();
+  await flushMicrotasks();
+  transport.flushDeferredResponses(); // release set_model
+  await flushMicrotasks();
+  await flushMicrotasks();
+  transport.flushDeferredResponses(); // release get_state; the catalog read is now in flight
+  await flushMicrotasks();
+  await flushMicrotasks();
+  transport.emitExit(1, "SIGTERM"); // transport dies while the catalog read is pending
+  await flushMicrotasks();
+  await flushMicrotasks();
+
+  await assert.rejects(changing, /discarded/);
+  // The disconnected runtime never received the new model: the handshake
+  // projection is untouched and nothing stale was published.
+  assert.equal(runtime.snapshot.state, "disconnected");
+  assert.equal(runtime.snapshot.model?.id, "claude-sonnet-4-5");
+  assert.equal(runtime.snapshot.thinkingLevel, "medium");
+
+  await runtime.stop();
+});
+
+test("a settle catalog failure clears the supported levels instead of keeping the previous model's list", async () => {
+  let levelsCalls = 0;
+  let getEntriesCalls = 0;
+  const responses = (command: WireCommand): Record<string, unknown> => {
+    switch (command.type) {
+      case "new_session":
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "get_state":
+        return {
+          sessionId: "pi-session-1",
+          sessionFile,
+          model: { id: "claude-sonnet-4-5", provider: "anthropic" },
+          thinkingLevel: "medium",
+        };
+      case "get_entries": {
+        getEntriesCalls += 1;
+        if (getEntriesCalls === 1) return { entries: [], leafId: null };
+        return {
+          entries: [
+            {
+              type: "message",
+              id: "user-1",
+              parentId: null,
+              timestamp: "2026-01-01T00:00:00.000Z",
+              message: { role: "user", content: "first" },
+            },
+          ],
+          leafId: "user-1",
+        };
+      }
+      case "get_available_thinking_levels":
+        levelsCalls += 1;
+        return levelsCalls === 1 ? { levels: ["off", "low"] } : { levels: ["off", "turbo"] };
+      default:
+        return {};
+    }
+  };
+  const transport = new FakeTransport(responses);
+  const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
+  await runtime.start(workspace);
+  await runtime.getAvailableThinkingLevels();
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, ["off", "low"]);
+
+  await runtime.sendPrompt("first");
+  transport.emitStdoutLine(JSON.stringify({ type: "agent_settled" }));
+  await flushMicrotasks();
+  await flushMicrotasks();
+
+  // The settle catalog read failed (an unknown level): the stale pre-settle
+  // list is cleared so unsupported options cannot be selected, while the
+  // settled queue stays healthy.
+  assert.equal(runtime.snapshot.state, "ready");
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, []);
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 0);
+
+  await runtime.stop();
+});
+
+test("a rejected setThinkingLevel publishes the explicitly cleared level instead of retaining the stale selection", async () => {
+  let getStateCalls = 0;
+  const responses = (command: WireCommand): Record<string, unknown> => {
+    switch (command.type) {
+      case "new_session":
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "set_thinking_level":
+        return {}; // success-only: no effective payload
+      case "get_state":
+        getStateCalls += 1;
+        if (getStateCalls === 1) {
+          return { sessionId: "pi-session-1", sessionFile, thinkingLevel: "medium" };
+        }
+        // The authoritative refresh explicitly reports no thinking level:
+        // the mutation cannot confirm the switch.
+        return { sessionId: "pi-session-1", sessionFile, thinkingLevel: null };
+      case "get_entries":
+        return { entries: [], leafId: null };
+      default:
+        return {};
+    }
+  };
+  const transport = new FakeTransport(responses);
+  const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
+  await runtime.start(workspace);
+  assert.equal(runtime.snapshot.thinkingLevel, "medium");
+
+  await assert.rejects(runtime.setThinkingLevel("high"), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "INVALID_RESPONSE");
+    return true;
+  });
+
+  // The explicit authoritative null is published: the stale pre-mutation
+  // selection never remains in the snapshot.
+  assert.equal(runtime.snapshot.thinkingLevel, null);
+  assert.equal(runtime.snapshot.state, "ready");
+  await runtime.stop();
+});
+
+test("a rejected setModel publishes the explicitly cleared model instead of retaining the stale selection", async () => {
+  let getStateCalls = 0;
+  const responses = (command: WireCommand): Record<string, unknown> => {
+    switch (command.type) {
+      case "new_session":
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "set_model":
+        return { id: "gpt-5", provider: "openai" };
+      case "get_state":
+        getStateCalls += 1;
+        if (getStateCalls === 1) {
+          return {
+            sessionId: "pi-session-1",
+            sessionFile,
+            model: { id: "claude-sonnet-4-5", provider: "anthropic" },
+            thinkingLevel: "medium",
+          };
+        }
+        // The authoritative refresh explicitly reports no model (and no
+        // level): the mutation cannot confirm the switch.
+        return { sessionId: "pi-session-1", sessionFile, model: null, thinkingLevel: null };
+      case "get_entries":
+        return { entries: [], leafId: null };
+      default:
+        return {};
+    }
+  };
+  const transport = new FakeTransport(responses);
+  const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
+  await runtime.start(workspace);
+  assert.equal(runtime.snapshot.model?.id, "claude-sonnet-4-5");
+
+  await assert.rejects(runtime.setModel("openai", "gpt-5"), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "INVALID_RESPONSE");
+    return true;
+  });
+
+  // The explicit authoritative nulls are published: no stale selection
+  // remains in the snapshot.
+  assert.equal(runtime.snapshot.model, null);
+  assert.equal(runtime.snapshot.thinkingLevel, null);
+  assert.equal(runtime.snapshot.state, "ready");
+  await runtime.stop();
 });
