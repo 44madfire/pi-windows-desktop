@@ -10,6 +10,9 @@ export const IPC_CHANNELS = {
   getPiStatus: 'pi:get-status',
   piEvent: 'pi:event',
   piExtensionUiResponse: 'pi:extension-ui-response',
+  getAvailableModels: 'pi:get-available-models',
+  setModel: 'pi:set-model',
+  setThinkingLevel: 'pi:set-thinking-level',
   sendPrompt: 'conversation:send-prompt',
   abortPrompt: 'conversation:abort-prompt',
   getConversation: 'conversation:get',
@@ -85,11 +88,55 @@ export interface WslProbeInfo {
 
 export type PiRuntimeState = 'stopped' | 'starting' | 'ready' | 'disconnected' | 'stopping' | 'failed';
 
+/**
+ * A Pi model as exposed to the renderer. The full wire record may carry more
+ * fields; the project retains the stable identifier and provider (plus an
+ * optional display name when Pi reports one). Pi remains authoritative for
+ * which model is active.
+ */
+export interface PiModel {
+  id: string;
+  provider: string;
+  name?: string;
+}
+
+/** Pi's allowed thinking levels, as reported by `get_state` and accepted by `set_thinking_level`. */
+export type PiThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+/** The complete set of thinking levels Pi accepts; validated in main and the runtime boundary. */
+export const PI_THINKING_LEVELS: readonly PiThinkingLevel[] = [
+  'off',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const;
+
 export interface PiRuntimeSnapshot {
   state: PiRuntimeState;
   workspace: WslWorkspace | null;
   piVersion: string | null;
   lastError: string | null;
+  /**
+   * Active agent model, projected from the authoritative `get_state`
+   * handshake (start/reconnect) and refreshed by `set_model` responses and
+   * `model_change` events. Null until Pi reports one.
+   */
+  model: PiModel | null;
+  /**
+   * Active agent thinking level, projected from the authoritative
+   * `get_state` handshake and refreshed by `set_thinking_level` responses
+   * and `thinking_level_change` events. Null until Pi reports one.
+   */
+  thinkingLevel: PiThinkingLevel | null;
+  /**
+   * Models Pi can switch to, from the `get_available_models` response.
+   * Empty until the renderer calls `getAvailableModels()` after the runtime
+   * is ready; cleared when the runtime stops.
+   */
+  availableModels: PiModel[];
   /** Non-fatal runtime warning, such as a failed best-effort pointer save. */
   lastWarning: string | null;
   /**
@@ -195,6 +242,9 @@ export interface DesktopApi {
   stopPi: () => Promise<PiRuntimeSnapshot>;
   getPiStatus: () => Promise<PiRuntimeSnapshot>;
   sendExtensionUiResponse: (response: ExtensionUiResponse) => Promise<void>;
+  getAvailableModels: () => Promise<PiModel[]>;
+  setModel: (provider: string, modelId: string) => Promise<PiModel>;
+  setThinkingLevel: (level: PiThinkingLevel) => Promise<PiThinkingLevel>;
   sendPrompt: (prompt: string) => Promise<ConversationSnapshot>;
   abortPrompt: () => Promise<ConversationSnapshot>;
   getConversation: () => Promise<ConversationSnapshot>;
@@ -235,6 +285,18 @@ export interface IpcContract {
   [IPC_CHANNELS.piExtensionUiResponse]: {
     request: { response: ExtensionUiResponse };
     response: void;
+  };
+  [IPC_CHANNELS.getAvailableModels]: {
+    request: undefined;
+    response: PiModel[];
+  };
+  [IPC_CHANNELS.setModel]: {
+    request: { provider: string; modelId: string };
+    response: PiModel;
+  };
+  [IPC_CHANNELS.setThinkingLevel]: {
+    request: { level: PiThinkingLevel };
+    response: PiThinkingLevel;
   };
   [IPC_CHANNELS.sendPrompt]: {
     request: { prompt: string };
