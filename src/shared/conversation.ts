@@ -10,6 +10,13 @@ export type ConversationRecordStatus = 'queued' | 'running' | 'completed' | 'fai
 
 export interface ConversationMessageRecord {
   id: string;
+  /**
+   * Authoritative Pi session entry id this record maps to, when known.
+   * Hydrated entries always carry it; live records gain it when they are
+   * reconciled against persisted session entries. Absent while a record has
+   * no authoritative Pi entry yet.
+   */
+  piEntryId?: string;
   type: 'message';
   role: 'user' | 'assistant';
   content: string;
@@ -18,6 +25,8 @@ export interface ConversationMessageRecord {
 
 export interface ConversationToolRecord {
   id: string;
+  /** Authoritative Pi session entry id this record maps to, when known. */
+  piEntryId?: string;
   type: 'tool';
   name: string;
   status: ConversationRecordStatus;
@@ -29,6 +38,8 @@ export interface ConversationToolRecord {
 
 export interface ConversationBashRecord {
   id: string;
+  /** Authoritative Pi session entry id this record maps to, when known. */
+  piEntryId?: string;
   type: 'bash';
   command: string;
   status: ConversationRecordStatus;

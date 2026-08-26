@@ -233,6 +233,7 @@ function projectEntry(
     case "user": {
       return {
         id: entryId,
+        piEntryId: entryId,
         type: "message",
         role: "user",
         content: messageText(message.content),
@@ -242,7 +243,7 @@ function projectEntry(
     case "assistant": {
       const content = assistantText(message.content);
       if (!content) return null;
-      return { id: entryId, type: "message", role: "assistant", content, createdAt };
+      return { id: entryId, piEntryId: entryId, type: "message", role: "assistant", content, createdAt };
     }
     case "toolResult": {
       const toolCallId = stringValue(message.toolCallId);
@@ -254,6 +255,7 @@ function projectEntry(
       if (name.toLowerCase() === "bash" || name.toLowerCase() === "shell") {
         return {
           id: toolCallId,
+          piEntryId: entryId,
           type: "bash",
           command: call?.input ?? output ?? name,
           status,
@@ -264,6 +266,7 @@ function projectEntry(
       }
       return {
         id: toolCallId,
+        piEntryId: entryId,
         type: "tool",
         name,
         status,
@@ -348,8 +351,9 @@ export class ConversationController {
    * the same entries (a second synchronize, a reconnection) never duplicates
    * history. A live record created during this process that already represents
    * an authoritative entry (same role/content or stable tool identity) is
-   * reconciled instead of appended: its Pi entry id is remembered as known and
-   * only genuinely new history is appended. Hydration does not change
+   * reconciled instead of appended: its Pi entry id is remembered as known,
+   * the authoritative Pi entry id is attached to the live record, and only
+   * genuinely new history is appended. Hydration does not change
    * execution state, the queue, or streaming state, and a later live message
    * is a new record appended after the hydrated history.
    */
@@ -369,9 +373,16 @@ export class ConversationController {
 
       // An identical id is already on the timeline (live tool records share
       // Pi's toolCallId; a previous hydrate appended the entry): the entry is
-      // known and must never append again.
-      if (this.records.some((existing) => existing.id === record.id)) {
+      // known and must never append again, but the authoritative Pi entry id
+      // still maps onto the existing record (a live tool record whose local
+      // id is Pi's toolCallId gains its toolResult entry id here).
+      const existing = this.records.find((candidate) => candidate.id === record.id);
+      if (existing) {
         this.hydratedRecordIds.add(record.id);
+        if (record.piEntryId !== undefined && existing.piEntryId === undefined) {
+          existing.piEntryId = record.piEntryId;
+          changed = true;
+        }
         continue;
       }
 
@@ -383,6 +394,13 @@ export class ConversationController {
         this.hydratedRecordIds.add(record.id);
         this.reconciledRecordIds.add(live.id);
         matchedLive.add(live.id);
+        // The live record keeps its local id; the authoritative Pi entry id
+        // is attached so the mapping is host-derived and stable across
+        // replays (a later replay is skipped by the id sets above).
+        if (record.piEntryId !== undefined && live.piEntryId === undefined) {
+          live.piEntryId = record.piEntryId;
+          changed = true;
+        }
         continue;
       }
 

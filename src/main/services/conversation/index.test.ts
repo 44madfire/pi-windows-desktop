@@ -918,3 +918,260 @@ test('hydrate reads current Pi toolCall blocks (id/name/arguments) and attaches 
   assert.equal(bash.type === 'bash' ? bash.status : '', 'completed');
   assert.equal(controller.snapshot.executionState, 'idle');
 });
+test('hydrated records expose the authoritative Pi entry id while tool ids stay toolCallIds', () => {
+  const mock = createClient();
+  const controller = new ConversationController(mock.client);
+  controller.hydrate([
+    {
+      type: 'message',
+      id: 'user-1',
+      parentId: null,
+      timestamp: '2026-01-01T00:00:00.000Z',
+      message: { role: 'user', content: 'Inspect the project' },
+    },
+    {
+      type: 'message',
+      id: 'assistant-1',
+      parentId: 'user-1',
+      timestamp: '2026-01-01T00:00:01.000Z',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'hidden' },
+          { type: 'text', text: 'Done' },
+          { type: 'toolCall', id: 'tool-1', name: 'bash', arguments: { command: 'pwd' } },
+        ],
+      },
+    },
+    {
+      type: 'message',
+      id: 'result-1',
+      parentId: 'assistant-1',
+      timestamp: '2026-01-01T00:00:02.000Z',
+      message: {
+        role: 'toolResult',
+        toolCallId: 'tool-1',
+        toolName: 'bash',
+        content: [{ type: 'text', text: '/home/pi' }],
+      },
+    },
+    {
+      type: 'message',
+      id: 'result-2',
+      parentId: 'assistant-1',
+      timestamp: '2026-01-01T00:00:03.000Z',
+      message: {
+        role: 'toolResult',
+        toolCallId: 'tool-2',
+        toolName: 'grep',
+        content: [{ type: 'text', text: 'found' }],
+      },
+    },
+  ]);
+
+  const timeline = controller.snapshot.timeline;
+  assert.equal(timeline.length, 4);
+  // Message records: the local id already is the Pi entry id, and the
+  // authoritative id is exposed explicitly on the record.
+  const user = timeline[0];
+  assert.equal(user.type === 'message' ? user.id : '', 'user-1');
+  assert.equal(user.type === 'message' ? user.piEntryId : '', 'user-1');
+  const assistant = timeline[1];
+  assert.equal(assistant.type === 'message' ? assistant.id : '', 'assistant-1');
+  assert.equal(assistant.type === 'message' ? assistant.piEntryId : '', 'assistant-1');
+  // Tool records keep Pi's toolCallId as their local id and expose the
+  // toolResult entry id as the authoritative Pi entry id.
+  const bash = timeline[2];
+  assert.equal(bash.type === 'bash' ? bash.id : '', 'tool-1');
+  assert.equal(bash.type === 'bash' ? bash.piEntryId : '', 'result-1');
+  const tool = timeline[3];
+  assert.equal(tool.type === 'tool' ? tool.id : '', 'tool-2');
+  assert.equal(tool.type === 'tool' ? tool.piEntryId : '', 'result-2');
+});
+
+test('reconciliation attaches the authoritative Pi entry id without replacing local ids', async () => {
+  const mock = createClient();
+  const controller = new ConversationController(mock.client);
+  const prompt = controller.sendPrompt('Inspect the project');
+  mock.resolvePrompt();
+  await prompt;
+  mock.emit({ type: 'message_start', message: { id: 'msg-1', role: 'assistant', content: [] } });
+  mock.emit({
+    type: 'message_end',
+    message: { id: 'msg-1', role: 'assistant', content: [{ type: 'text', text: 'Done' }] },
+  });
+  // Legacy-shaped tool event without a Pi toolCallId: the live record gets a
+  // local `conversation-*` id.
+  mock.emit({ type: 'tool_execution_start', toolName: 'bash', command: 'pwd' });
+  mock.emit({ type: 'tool_execution_end', toolName: 'bash', command: 'pwd', output: '/home/pi', exitCode: 0 });
+  mock.emit({ type: 'agent_settled' });
+
+  const liveBash = controller.snapshot.timeline.find((record) => record.type === 'bash');
+  assert.ok(liveBash && liveBash.type === 'bash' && liveBash.id.startsWith('conversation-'));
+  assert.equal(liveBash.type === 'bash' ? liveBash.piEntryId : undefined, undefined);
+
+  controller.hydrate([
+    {
+      type: 'message',
+      id: 'user-1',
+      parentId: null,
+      timestamp: '2026-01-01T00:00:00.000Z',
+      message: { role: 'user', content: 'Inspect the project' },
+    },
+    {
+      type: 'message',
+      id: 'assistant-1',
+      parentId: 'user-1',
+      timestamp: '2026-01-01T00:00:01.000Z',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'Done' },
+          { type: 'toolCall', id: 'tool-1', name: 'bash', arguments: { command: 'pwd' } },
+        ],
+      },
+    },
+    {
+      type: 'message',
+      id: 'result-1',
+      parentId: 'assistant-1',
+      timestamp: '2026-01-01T00:00:02.000Z',
+      message: {
+        role: 'toolResult',
+        toolCallId: 'tool-1',
+        toolName: 'bash',
+        content: [{ type: 'text', text: '/home/pi' }],
+      },
+    },
+  ]);
+
+  const messages = controller.snapshot.timeline.filter((record) => record.type === 'message');
+  assert.equal(messages.length, 2, 'live user/assistant records reconcile, not duplicate');
+  const user = messages[0];
+  // The live record keeps its local id and gains the authoritative entry id.
+  assert.ok(user.type === 'message' && user.id.startsWith('conversation-'));
+  assert.equal(user.type === 'message' ? user.piEntryId : '', 'user-1');
+  const assistant = messages[1];
+  assert.equal(assistant.type === 'message' ? assistant.piEntryId : '', 'assistant-1');
+  const bash = controller.snapshot.timeline.find((record) => record.type === 'bash');
+  assert.ok(bash && bash.type === 'bash');
+  assert.equal(bash.id, liveBash?.id, 'the reconciled tool keeps its local id');
+  assert.equal(bash.piEntryId, 'result-1', 'the authoritative toolResult entry id is attached');
+
+  // A live tool record whose local id already is Pi's toolCallId (current Pi
+  // events) gains the authoritative toolResult entry id the same way.
+  const second = controller.sendPrompt('run git status');
+  mock.resolvePrompt();
+  await second;
+  mock.emit({ type: 'agent_start' });
+  mock.emit({ type: 'tool_execution_start', toolCallId: 'tool-2', toolName: 'bash', args: { command: 'git status' } });
+  mock.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'tool-2',
+    toolName: 'bash',
+    args: { command: 'git status' },
+    result: { content: [{ type: 'text', text: 'On branch main' }], details: undefined },
+    isError: false,
+  });
+  mock.emit({ type: 'agent_settled' });
+  const liveTool2 = controller.snapshot.timeline.find((record) => record.id === 'tool-2');
+  assert.equal(liveTool2?.type === 'bash' ? liveTool2.piEntryId : undefined, undefined);
+
+  const secondTurnEntries = [
+    {
+      type: 'message',
+      id: 'user-2',
+      parentId: null,
+      timestamp: '2026-01-01T00:00:04.000Z',
+      message: { role: 'user', content: 'run git status' },
+    },
+    {
+      type: 'message',
+      id: 'assistant-2',
+      parentId: 'user-2',
+      timestamp: '2026-01-01T00:00:05.000Z',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'toolCall', id: 'tool-2', name: 'bash', arguments: { command: 'git status' } }],
+      },
+    },
+    {
+      type: 'message',
+      id: 'result-2',
+      parentId: 'assistant-2',
+      timestamp: '2026-01-01T00:00:06.000Z',
+      message: {
+        role: 'toolResult',
+        toolCallId: 'tool-2',
+        toolName: 'bash',
+        content: [{ type: 'text', text: 'On branch main' }],
+      },
+    },
+  ];
+  controller.hydrate(secondTurnEntries);
+
+  assert.equal(controller.snapshot.timeline.length, 5, 'no history duplicated by the second hydrate');
+  const user2 = controller.snapshot.timeline.find((record) => record.type === 'message' && record.content === 'run git status');
+  assert.ok(user2 && user2.type === 'message');
+  assert.ok(user2.id.startsWith('conversation-'));
+  assert.equal(user2.piEntryId, 'user-2');
+  const bash2 = controller.snapshot.timeline.find((record) => record.id === 'tool-2');
+  assert.ok(bash2 && bash2.type === 'bash');
+  assert.equal(bash2.id, 'tool-2', 'the same-id tool keeps its toolCallId');
+  assert.equal(bash2.piEntryId, 'result-2', 'the same-id tool gains the authoritative entry id');
+
+  // Replaying the same authoritative entries changes nothing.
+  controller.hydrate(secondTurnEntries);
+  assert.equal(controller.snapshot.timeline.length, 5);
+  const bash2Replay = controller.snapshot.timeline.find((record) => record.id === 'tool-2');
+  assert.equal(bash2Replay?.type === 'bash' ? bash2Replay.piEntryId : '', 'result-2');
+  const user2Replay = controller.snapshot.timeline.find((record) => record.type === 'message' && record.content === 'run git status');
+  assert.equal(user2Replay?.type === 'message' ? user2Replay.piEntryId : '', 'user-2');
+});
+
+test('replaying hydrated entries keeps the Pi entry id mapping stable and never duplicates', () => {
+  const mock = createClient();
+  const controller = new ConversationController(mock.client);
+  const entries = [
+    {
+      type: 'message',
+      id: 'user-1',
+      parentId: null,
+      timestamp: '2026-01-01T00:00:00.000Z',
+      message: { role: 'user', content: 'history' },
+    },
+    {
+      type: 'message',
+      id: 'assistant-1',
+      parentId: 'user-1',
+      timestamp: '2026-01-01T00:00:01.000Z',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'toolCall', id: 'tool-1', name: 'bash', arguments: { command: 'pwd' } }],
+      },
+    },
+    {
+      type: 'message',
+      id: 'result-1',
+      parentId: 'assistant-1',
+      timestamp: '2026-01-01T00:00:02.000Z',
+      message: {
+        role: 'toolResult',
+        toolCallId: 'tool-1',
+        toolName: 'bash',
+        content: [{ type: 'text', text: '/home/pi' }],
+      },
+    },
+  ];
+
+  controller.hydrate(entries);
+  controller.hydrate(entries);
+
+  assert.equal(controller.snapshot.timeline.length, 2, 'a hydrated replay never appends duplicates');
+  const user = controller.snapshot.timeline[0];
+  assert.equal(user.type === 'message' ? user.piEntryId : '', 'user-1');
+  assert.equal(user.type === 'message' ? user.id : '', 'user-1');
+  const bash = controller.snapshot.timeline[1];
+  assert.equal(bash.type === 'bash' ? bash.piEntryId : '', 'result-1');
+  assert.equal(bash.type === 'bash' ? bash.id : '', 'tool-1');
+});
