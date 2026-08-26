@@ -463,7 +463,7 @@ export function createNodeProcessRunner(): ProcessRunner {
  *
  * When a configured executable path is supplied, discovery skips the PATH
  * lookup entirely and probes that executable's version directly; a failing
- * probe makes the executable unavailable with reason
+ * probe is terminal and makes the executable unavailable with reason
  * "configured-executable-failed". Otherwise it runs a non-login
  * `/bin/sh -c` lookup, then a profile-aware `/bin/bash -lc` lookup, and
  * finally an interactive `/bin/bash -l -i -c` lookup, so nvm/fnm and other
@@ -471,12 +471,17 @@ export function createNodeProcessRunner(): ProcessRunner {
  * prints the found path on a dedicated marker line
  * (`printf '<marker>%s\n' "$(command -v pi)"`) and only that line is parsed,
  * so shell and profile output can never be mistaken for the executable.
- * A version probe that fails makes the executable unavailable with reason
- * "executable-version-failed" when discovered or
- * "configured-executable-failed" when configured; lookup-failed/not-found
- * are reported only after every fallback has been tried. Lookup and version
- * commands always keep discrete argv entries; a configured path is never
- * interpolated into a shell command.
+ * Each auto-discovered path is probed in lookup order; a candidate whose
+ * version probe fails does not stop discovery, because a later,
+ * profile-initialized candidate may still be the working executable. The
+ * first candidate whose probe succeeds wins. When every discovered candidate
+ * fails, the executable is reported unavailable with reason
+ * "executable-version-failed" and the last version probe result (the most
+ * useful one, from the deepest lookup); when a configured path fails, the
+ * reason is "configured-executable-failed". lookup-failed/not-found are
+ * reported only after every fallback has been tried and no candidate was
+ * ever found. Lookup and version commands always keep discrete argv entries;
+ * a configured path is never interpolated into a shell command.
  */
 export class DefaultPiExecutableLocator implements PiExecutableLocator {
   private readonly runInDistribution: RunInDistribution;
@@ -495,13 +500,26 @@ export class DefaultPiExecutableLocator implements PiExecutableLocator {
       return this.probeVersion(distribution, this.configuredExecutable, true);
     }
 
+    // A broken auto-discovered candidate must not mask a later,
+    // profile-initialized one. Remember the most recent version failure and
+    // keep walking the shell fallbacks; it is reported only when every
+    // candidate turns out broken.
+    let lastVersionFailure: Extract<PiExecutableProbe, { reason: "executable-version-failed" }> | null =
+      null;
+
     const shLookup = await this.runInDistribution(distribution, "/bin/sh", [
       "-c",
       PI_LOOKUP_COMMAND,
     ]);
     const shExecutable = shLookup.ok ? parsePiLookupOutput(shLookup.stdout) : null;
     if (shExecutable !== null) {
-      return this.probeVersion(distribution, shExecutable, false);
+      const probe = await this.probeVersion(distribution, shExecutable, false);
+      if (probe.available) {
+        return probe;
+      }
+      if (probe.reason === "executable-version-failed") {
+        lastVersionFailure = probe;
+      }
     }
 
     const loginLookup = await this.runInDistribution(distribution, "/bin/bash", [
@@ -511,7 +529,13 @@ export class DefaultPiExecutableLocator implements PiExecutableLocator {
     ]);
     const loginExecutable = loginLookup.ok ? parsePiLookupOutput(loginLookup.stdout) : null;
     if (loginExecutable !== null) {
-      return this.probeVersion(distribution, loginExecutable, false);
+      const probe = await this.probeVersion(distribution, loginExecutable, false);
+      if (probe.available) {
+        return probe;
+      }
+      if (probe.reason === "executable-version-failed") {
+        lastVersionFailure = probe;
+      }
     }
 
     // Profile-initialized tools (nvm, fnm, ...) only end up on PATH for
@@ -523,27 +547,44 @@ export class DefaultPiExecutableLocator implements PiExecutableLocator {
       PI_LOOKUP_COMMAND,
     ]);
     if (!interactiveLookup.ok) {
-      return {
-        available: false,
-        executable: null,
-        version: null,
-        reason: "lookup-failed",
-        lookupResult: interactiveLookup,
-      };
+      return (
+        lastVersionFailure ?? {
+          available: false,
+          executable: null,
+          version: null,
+          reason: "lookup-failed",
+          lookupResult: interactiveLookup,
+        }
+      );
     }
 
     const interactiveExecutable = parsePiLookupOutput(interactiveLookup.stdout);
     if (interactiveExecutable === null) {
-      return {
-        available: false,
-        executable: null,
-        version: null,
-        reason: "not-found",
-        lookupResult: interactiveLookup,
-      };
+      return (
+        lastVersionFailure ?? {
+          available: false,
+          executable: null,
+          version: null,
+          reason: "not-found",
+          lookupResult: interactiveLookup,
+        }
+      );
     }
 
-    return this.probeVersion(distribution, interactiveExecutable, false);
+    const probe = await this.probeVersion(distribution, interactiveExecutable, false);
+    if (probe.available) {
+      return probe;
+    }
+    if (probe.reason === "executable-version-failed") {
+      lastVersionFailure = probe;
+    }
+    return lastVersionFailure ?? {
+      available: false,
+      executable: null,
+      version: null,
+      reason: "not-found",
+      lookupResult: interactiveLookup,
+    };
   }
 
   private async probeVersion(

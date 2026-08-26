@@ -396,10 +396,12 @@ test("falls back to an interactive login lookup for profile-initialized PATHs", 
   ]);
 });
 
-test("reports an auto-discovered executable unavailable when its version probe fails", async () => {
+test("reports an auto-discovered executable unavailable when its version probe fails and no later lookup finds a working path", async () => {
   const fake = queuedRunner([
     result(`${PI_LOOKUP_MARKER}/usr/local/bin/pi\n`),
     result("", "cannot execute: Exec format error", 126),
+    result(`${PI_LOOKUP_MARKER}\n`, ""), // login lookup: no path
+    result(`${PI_LOOKUP_MARKER}\n`, ""), // interactive lookup: no path
   ]);
   const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake));
 
@@ -416,6 +418,66 @@ test("reports an auto-discovered executable unavailable when its version probe f
   assert.deepEqual(fake.calls.map((call) => call.args), [
     ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", PI_LOOKUP_SCRIPT],
     ["--distribution", "Ubuntu", "--exec", "/usr/local/bin/pi", "--version"],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-i", "-c", PI_LOOKUP_SCRIPT],
+  ]);
+});
+
+test("continues past a broken PATH candidate to a working profile candidate", async () => {
+  const fake = queuedRunner([
+    result(`${PI_LOOKUP_MARKER}/usr/local/bin/pi\n`), // non-login lookup: broken path first on PATH
+    result("", "cannot execute: Exec format error", 126),
+    result(`${PI_LOOKUP_MARKER}/home/user/.nvm/versions/node/v22/bin/pi\n`), // login lookup: working profile path
+    result("pi 3.1.0\n", ""),
+  ]);
+  const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake));
+
+  const probe = await locator.locate("Ubuntu");
+
+  assert.equal(probe.available, true);
+  if (probe.available) {
+    assert.equal(probe.executable, "/home/user/.nvm/versions/node/v22/bin/pi");
+    assert.equal(probe.version, "pi 3.1.0");
+  }
+  assert.deepEqual(fake.calls.map((call) => call.args), [
+    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/usr/local/bin/pi", "--version"],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/home/user/.nvm/versions/node/v22/bin/pi", "--version"],
+  ]);
+});
+
+test("retains the last version failure when every discovered candidate is broken", async () => {
+  const fake = queuedRunner([
+    result(`${PI_LOOKUP_MARKER}/usr/local/bin/pi\n`),
+    result("", "cannot execute: Exec format error", 126),
+    result(`${PI_LOOKUP_MARKER}/home/user/.nvm/versions/node/v22/bin/pi\n`),
+    result("", "segmentation fault", 139),
+    result(`${PI_LOOKUP_MARKER}/opt/fnm/aliases/default/bin/pi\n`), // interactive lookup: last candidate
+    result("", "cannot execute: Exec format error", 126),
+  ]);
+  const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake));
+
+  const probe = await locator.locate("Ubuntu");
+
+  assert.equal(probe.available, false);
+  if (!probe.available && probe.reason === "executable-version-failed") {
+    assert.equal(probe.executable, null);
+    assert.equal(probe.version, null);
+    assert.equal(probe.versionResult.exitCode, 126);
+    assert.equal(probe.versionResult.stderr, "cannot execute: Exec format error");
+    assert.deepEqual(probe.versionResult.command, {
+      executable: "/opt/fnm/aliases/default/bin/pi",
+      args: ["--version"],
+    });
+  }
+  assert.deepEqual(fake.calls.map((call) => call.args), [
+    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/usr/local/bin/pi", "--version"],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/home/user/.nvm/versions/node/v22/bin/pi", "--version"],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-i", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/opt/fnm/aliases/default/bin/pi", "--version"],
   ]);
 });
 
