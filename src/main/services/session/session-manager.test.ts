@@ -1172,34 +1172,47 @@ test("setModel rejects when the get_state refresh omits the thinking level", asy
   assert.equal(manager.thinkingLevel, null);
 });
 
-test("setModel with preexisting state rejects when the refresh omits the model instead of preserving the cached value", async () => {
+test("setModel with preexisting state clears the accepted-but-unconfirmed selection when the refresh omits the model", async () => {
   const client = new FakePiRpcClient();
   client.queueResponse({ id: "echoed-model", provider: "echoed" }); // set_model
   client.queueResponse({ sessionId: "pi-session-1" }); // get_state: no model, no level
+  const snapshots: SessionSnapshot[] = [];
   const manager = new SessionManager({
     client,
     model: { id: "stale-model", provider: "stale" },
     thinkingLevel: "low",
   });
   await manager.reconnect(client, { synchronize: false });
+  manager.onStateChange((snapshot) => {
+    snapshots.push(snapshot);
+  });
 
   await assert.rejects(manager.setModel("anthropic", "claude-sonnet-4-5"), (error: unknown) => {
     assert.ok(error instanceof SessionManagerError);
     assert.equal(error.code, "INVALID_RESPONSE");
     return true;
   });
-  // The mutation rejects: the preexisting cached model/level were never
-  // reported as the effective result of the failed mutation.
+  // Pi accepted set_model but the authoritative refresh could not confirm
+  // it: the accepted-but-unconfirmed selection is cleared — the stale cached
+  // model and level never survive an unconfirmed mutation. The reset is
+  // published as an explicit snapshot.
   assert.equal(manager.state, "ready");
-  assert.deepEqual(manager.model, { id: "stale-model", provider: "stale" });
-  assert.equal(manager.thinkingLevel, "low");
+  assert.equal(manager.model, null);
+  assert.equal(manager.thinkingLevel, null);
+  assert.equal(snapshots.length, 1);
+  assert.equal(snapshots[0].model, null);
+  assert.equal(snapshots[0].thinkingLevel, null);
 });
 
-test("setThinkingLevel with preexisting state rejects when the refresh omits the level instead of preserving it", async () => {
+test("setThinkingLevel with preexisting state clears the accepted-but-unconfirmed level when the refresh omits it", async () => {
   const client = new FakePiRpcClient();
   client.queueResponse({}); // success-only response
   client.queueResponse({ sessionId: "pi-session-1" }); // get_state without a level
-  const manager = new SessionManager({ client, thinkingLevel: "medium" });
+  const manager = new SessionManager({
+    client,
+    model: { id: "claude-sonnet-4-5", provider: "anthropic" },
+    thinkingLevel: "medium",
+  });
   await manager.reconnect(client, { synchronize: false });
 
   await assert.rejects(manager.setThinkingLevel("high"), (error: unknown) => {
@@ -1208,9 +1221,121 @@ test("setThinkingLevel with preexisting state rejects when the refresh omits the
     return true;
   });
   assert.equal(manager.state, "ready");
-  // The requested level is never a fallback and the cached level is not
-  // reported as the effective level of the failed mutation.
-  assert.equal(manager.thinkingLevel, "medium");
+  // The requested level is never a fallback and the accepted-but-unconfirmed
+  // cached level is cleared; the model (not part of this mutation) is
+  // preserved.
+  assert.equal(manager.thinkingLevel, null);
+  assert.deepEqual(manager.model, { id: "claude-sonnet-4-5", provider: "anthropic" });
+});
+
+test("setModel clears the accepted-but-unconfirmed selection when the get_state readback transport-fails", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ id: "gpt-5", provider: "openai" }); // set_model accepted
+  client.queueError("transport died"); // get_state readback transport failure
+  const snapshots: SessionSnapshot[] = [];
+  const manager = new SessionManager({
+    client,
+    model: { id: "claude-sonnet-4-5", provider: "anthropic" },
+    thinkingLevel: "low",
+  });
+  await manager.reconnect(client, { synchronize: false });
+  manager.onStateChange((snapshot) => {
+    snapshots.push(snapshot);
+  });
+
+  await assert.rejects(manager.setModel("openai", "gpt-5"), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "RPC_FAILURE");
+    return true;
+  });
+  // Pi accepted set_model but the readback could not confirm it: no stale
+  // cached selection survives the unconfirmed mutation — the model and the
+  // model-specific level are both cleared and the reset is published.
+  assert.equal(manager.state, "ready");
+  assert.equal(manager.model, null);
+  assert.equal(manager.thinkingLevel, null);
+  assert.equal(snapshots.length, 1);
+  assert.equal(snapshots[0].model, null);
+  assert.equal(snapshots[0].thinkingLevel, null);
+});
+
+test("setThinkingLevel clears the accepted-but-unconfirmed level while preserving the model when the readback transport-fails", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({}); // set_thinking_level accepted (success-only)
+  client.queueError("transport died"); // get_state readback transport failure
+  const manager = new SessionManager({
+    client,
+    model: { id: "claude-sonnet-4-5", provider: "anthropic" },
+    thinkingLevel: "low",
+  });
+  await manager.reconnect(client, { synchronize: false });
+
+  await assert.rejects(manager.setThinkingLevel("high"), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "RPC_FAILURE");
+    return true;
+  });
+  // The unconfirmed level is cleared; the model (not part of this mutation)
+  // is preserved.
+  assert.equal(manager.state, "ready");
+  assert.equal(manager.thinkingLevel, null);
+  assert.deepEqual(manager.model, { id: "claude-sonnet-4-5", provider: "anthropic" });
+});
+
+test("set commands rejected before acceptance preserve the previous selected state", async () => {
+  const client = new FakePiRpcClient();
+  client.queueError("set_model rejected"); // Pi never accepted the command
+  const manager = new SessionManager({
+    client,
+    model: { id: "claude-sonnet-4-5", provider: "anthropic" },
+    thinkingLevel: "low",
+  });
+  await manager.reconnect(client, { synchronize: false });
+
+  await assert.rejects(manager.setModel("openai", "gpt-5"), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "RPC_FAILURE");
+    return true;
+  });
+  // No acceptance, no clearing: the previous selection is preserved.
+  assert.equal(manager.state, "ready");
+  assert.deepEqual(manager.model, { id: "claude-sonnet-4-5", provider: "anthropic" });
+  assert.equal(manager.thinkingLevel, "low");
+
+  client.queueError("set_thinking_level rejected"); // Pi never accepted the command
+  await assert.rejects(manager.setThinkingLevel("high"), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "RPC_FAILURE");
+    return true;
+  });
+  assert.equal(manager.state, "ready");
+  assert.deepEqual(manager.model, { id: "claude-sonnet-4-5", provider: "anthropic" });
+  assert.equal(manager.thinkingLevel, "low");
+});
+
+test("the setModel result snapshot reflects the compatible display-name enrichment", async () => {
+  const client = new FakePiRpcClient();
+  // The set_model response carries the full model object including the
+  // display name…
+  client.queueResponse({ id: "gpt-5", provider: "openai", name: "GPT-5" });
+  // …and the authoritative get_state confirms the SAME identity without the
+  // optional name; the compatible display metadata survives.
+  client.queueResponse({
+    sessionId: "pi-session-1",
+    model: { id: "gpt-5", provider: "openai" },
+    thinkingLevel: "low",
+  });
+  const manager = new SessionManager({ client });
+  await manager.reconnect(client, { synchronize: false });
+
+  const result = await manager.setModel("openai", "gpt-5");
+
+  // The result snapshot is taken after the enrichment: it reflects the same
+  // effective model the result exposes — never the pre-enrichment refresh.
+  assert.deepEqual(result.model, { id: "gpt-5", provider: "openai", name: "GPT-5" });
+  assert.deepEqual(result.snapshot.model, { id: "gpt-5", provider: "openai", name: "GPT-5" });
+  assert.deepEqual(manager.model, { id: "gpt-5", provider: "openai", name: "GPT-5" });
+  assert.equal(result.snapshot.thinkingLevel, "low");
 });
 
 test("setModel preserves the compatible display name from the set_model response when get_state omits it", async () => {

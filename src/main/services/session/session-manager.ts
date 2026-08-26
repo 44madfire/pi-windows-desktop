@@ -991,6 +991,14 @@ export class SessionManager {
    * optional display `name` is preserved only when get_state reports the
    * same model identity without one (identity/effective values stay
    * authoritative).
+   *
+   * The acknowledgement is tracked separately from the readback: when Pi
+   * accepted `set_model` but the follow-up `get_state` cannot confirm it
+   * (transport failure, missing/invalid required fields, or a null
+   * effective state), the accepted-but-unconfirmed selection is cleared —
+   * set_model resets both the model and the thinking level (model-specific)
+   * — before the rejection is surfaced. A command rejected before
+   * acceptance preserves the previous state.
    */
   setModel(provider: string, modelId: string): Promise<SessionSetModelResult> {
     return this.enqueue(async () => {
@@ -999,6 +1007,11 @@ export class SessionManager {
       const validatedModelId = validateModelIdentifier(modelId, "modelId");
       const client = this.requireClient("set model");
       this.clearError();
+      // True once Pi accepted the set_model command. Only an accepted
+      // mutation may clear the projected selection on an unconfirmed
+      // readback; a command that fails before acceptance preserves it.
+      let acknowledged = false;
+      let echoedModel: PiModel | null = null;
       try {
         const command = validateCommand(
           this.commands.setModel(validatedProvider, validatedModelId),
@@ -1009,7 +1022,8 @@ export class SessionManager {
         // carried over when the authoritative refresh reports the same
         // identity without one.
         const response = await this.request(client, command, "set model");
-        const echoedModel = parseModelValue(response.data);
+        acknowledged = true;
+        echoedModel = parseModelValue(response.data);
         const snapshot = await this.refreshStateInternal("set model", {
           model: true,
           thinkingLevel: true,
@@ -1034,8 +1048,23 @@ export class SessionManager {
             ? { ...refreshedModel, name: echoedModel.name }
             : refreshedModel;
         if (model !== refreshedModel) this.modelValue = model;
-        return { model, snapshot };
+        // The result snapshot is read after the compatible display-name
+        // enrichment so it reflects the exact effective model returned.
+        return { model, snapshot: this.getSnapshot() };
       } catch (error: unknown) {
+        if (acknowledged) {
+          // Pi accepted the mutation but the authoritative get_state readback
+          // could not confirm it (transport failure, missing/invalid required
+          // fields, or a null effective state). No stale cached selection may
+          // survive an unconfirmed mutation: set_model clears both the model
+          // and the thinking level (the level is model-specific and unknown
+          // while the model is unconfirmed). The reset is published as an
+          // explicit snapshot so wiring-current observers never retain the
+          // old selection.
+          this.modelValue = null;
+          this.thinkingLevelValue = null;
+          this.emitSnapshot();
+        }
         throw this.mutationFailure("set model", error);
       }
     });
@@ -1047,6 +1076,14 @@ export class SessionManager {
    * authoritative `get_state` refresh — which must report a valid thinking
    * level — and the requested level is never used as a fallback. Rejects
    * when Pi reports no effective level.
+   *
+   * The acknowledgement is tracked separately from the readback: when Pi
+   * accepted `set_thinking_level` but the follow-up `get_state` cannot
+   * confirm it (transport failure, missing/invalid required fields, or a
+   * null effective state), the accepted-but-unconfirmed level is cleared —
+   * while the model (not part of this mutation) is preserved — before the
+   * rejection is surfaced. A command rejected before acceptance preserves
+   * the previous state.
    */
   setThinkingLevel(level: PiThinkingLevel): Promise<SessionSetThinkingLevelResult> {
     return this.enqueue(async () => {
@@ -1057,6 +1094,10 @@ export class SessionManager {
       }
       const client = this.requireClient("set thinking level");
       this.clearError();
+      // True once Pi accepted the set_thinking_level command. Only an
+      // accepted mutation may clear the projected level on an unconfirmed
+      // readback; a command that fails before acceptance preserves it.
+      let acknowledged = false;
       try {
         const command = validateCommand(
           this.commands.setThinkingLevel(validatedLevel),
@@ -1065,6 +1106,7 @@ export class SessionManager {
         // Success-only command: no metadata is projected from its response,
         // and the authoritative get_state refresh owns the effective level.
         await this.request(client, command, "set thinking level");
+        acknowledged = true;
         const snapshot = await this.refreshStateInternal("set thinking level", {
           thinkingLevel: true,
         });
@@ -1081,6 +1123,17 @@ export class SessionManager {
         }
         return { level: effective, snapshot };
       } catch (error: unknown) {
+        if (acknowledged) {
+          // Pi accepted the mutation but the authoritative get_state readback
+          // could not confirm it (transport failure, missing/invalid required
+          // fields, or a null effective state). No stale cached level may
+          // survive an unconfirmed mutation: set_thinking_level clears the
+          // thinking level while preserving the model (it was not part of
+          // this mutation). The reset is published as an explicit snapshot so
+          // wiring-current observers never retain the old selection.
+          this.thinkingLevelValue = null;
+          this.emitSnapshot();
+        }
         throw this.mutationFailure("set thinking level", error);
       }
     });
