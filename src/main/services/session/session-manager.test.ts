@@ -349,6 +349,66 @@ test("strict reconnect rejects a cancelled switch without creating a new session
 });
 
 
+test("a cancelled switch response never mutates identity or cursor metadata", async () => {
+  const client = new FakePiRpcClient();
+  // Pi declines the switch but the response still carries identity/cursor
+  // fields; those must be treated as part of the cancellation signal, never
+  // as authoritative metadata to adopt.
+  client.queueResponse({ cancelled: true, sessionId: "intruder-session", lastEntryId: "intruder-entry" });
+  const manager = new SessionManager({
+    client,
+    sessionId: "old-session",
+    sessionFile: "/sessions/old",
+    lastEntryId: "entry-old",
+  });
+
+  await assert.rejects(
+    manager.openSession("/sessions/old", { force: true, fallbackToNewSession: false }),
+    (error: unknown) => {
+      assert.ok(error instanceof SessionManagerError);
+      assert.equal(error.code, "SESSION_NOT_RESUMED");
+      return true;
+    },
+  );
+  assert.deepEqual(client.commands, [{ type: "switch_session", sessionPath: "/sessions/old" }]);
+  // The persisted identity, file, and durable cursor survive untouched: the
+  // cancelled response is not applied before strict handling decides.
+  assert.equal(manager.sessionId, "old-session");
+  assert.equal(manager.sessionFile, "/sessions/old");
+  assert.equal(manager.lastSeenEntryId, "entry-old");
+  assert.equal(manager.lastEntryId, "entry-old");
+  assert.equal(manager.leafId, null);
+});
+
+test("cancelled switch metadata does not leak into the fresh-session fallback", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({
+    cancelled: true,
+    sessionId: "stale-id",
+    sessionFile: "/sessions/stale",
+    lastEntryId: "stale-entry",
+  });
+  client.queueResponse({ sessionId: "fresh-session" });
+  client.queueResponse({ sessionId: "fresh-session", sessionFile: "/sessions/fresh" });
+  const manager = new SessionManager({
+    client,
+    sessionId: "old-session",
+    sessionFile: "/sessions/old",
+    lastEntryId: "entry-old",
+  });
+
+  const opened = await manager.openSession("/sessions/old");
+
+  assert.equal(opened.resumed, false);
+  // The fresh session adopts only the fallback identity; no field from the
+  // cancelled switch response survives anywhere.
+  assert.equal(manager.sessionId, "fresh-session");
+  assert.equal(manager.sessionFile, "/sessions/fresh");
+  assert.equal(manager.lastSeenEntryId, null);
+  assert.equal(manager.leafId, null);
+});
+
+
 test("a cancelled switch_session with a stale persisted cursor clears identity before fresh catch-up", async () => {
   const client = new FakePiRpcClient();
   client.queueResponse({ cancelled: true }); // switch_session cancelled
