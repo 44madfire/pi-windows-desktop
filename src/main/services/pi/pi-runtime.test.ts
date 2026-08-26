@@ -97,6 +97,8 @@ class FakeTransport implements PiRpcTransport {
   readonly operations: string[] = [];
   /** stdin.write() return value; a rejected promise simulates an async write failure. */
   writeResult: PiRpcWriteResult = true;
+  /** Command types held back even when deferResponses is off (membership only). */
+  private readonly deferCommandTypes: Record<string, boolean>;
   /** Commands whose responses were deferred (deferResponses mode), in write order. */
   readonly deferredCommands: WireCommand[] = [];
   private readonly lifecycle = new EventEmitter();
@@ -114,12 +116,16 @@ class FakeTransport implements PiRpcTransport {
       readonly exitOnEof?: boolean;
       /** Hold responses until {@link flushDeferredResponses} releases them. */
       readonly deferResponses?: boolean;
+      /** Hold responses for exactly these command types until {@link flushDeferredResponses} releases them. */
+      readonly deferCommandTypes?: readonly string[];
     } = {},
   ) {
     this.respond = respond;
     this.failCommands = options.failCommands ?? {};
     this.exitOnEof = options.exitOnEof ?? true;
     this.deferResponses = options.deferResponses ?? false;
+    const deferred = options.deferCommandTypes ?? [];
+    this.deferCommandTypes = Object.fromEntries(deferred.map((type) => [type, true]));
   }
 
   /** Release responses for all deferred commands, in write order. */
@@ -136,7 +142,7 @@ class FakeTransport implements PiRpcTransport {
       const line = frame.trim();
       if (line) {
         const command = JSON.parse(line) as WireCommand;
-        if (this.deferResponses) {
+        if (this.deferResponses || this.deferCommandTypes[command.type] === true) {
           this.deferredCommands.push(command);
         } else {
           this.emitResponse(command);
@@ -2580,6 +2586,279 @@ test("a settle catalog failure clears the supported levels instead of keeping th
   assert.deepEqual(runtime.snapshot.availableThinkingLevels, []);
   assert.equal(runtime.conversationSnapshot.queuedPromptCount, 0);
 
+  await runtime.stop();
+});
+
+test("a transport death during the settle-time catalog read keeps the queue paused and reconnect recovers it", async () => {
+  const store = fakeStore(null);
+  let getEntriesCalls = 0;
+  const responses = (command: WireCommand): Record<string, unknown> => {
+    switch (command.type) {
+      case "new_session":
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "get_state":
+        return {
+          sessionId: "pi-session-1",
+          sessionFile,
+          model: { id: "claude-sonnet-4-5", provider: "anthropic" },
+          thinkingLevel: "medium",
+        };
+      case "get_entries": {
+        getEntriesCalls += 1;
+        // 1: startup catch-up on a fresh session — empty history.
+        if (getEntriesCalls === 1) return { entries: [], leafId: null };
+        // 2: the post-agent_settled synchronization returns the settled
+        // turn's authoritative user entry for reconciliation.
+        return {
+          entries: [
+            {
+              type: "message",
+              id: "user-1",
+              parentId: null,
+              timestamp: "2026-01-01T00:00:00.000Z",
+              message: { role: "user", content: "first" },
+            },
+          ],
+          leafId: "user-1",
+        };
+      }
+      case "get_available_thinking_levels":
+        return { levels: ["off", "low"] };
+      default:
+        return {};
+    }
+  };
+  const { runtime, transports } = runtimeWithTransportSequence(
+    [
+      // Only the settle-time catalog read is held: its response stays
+      // deferred until the transport is killed, pinning the failure at
+      // exactly that boundary.
+      new FakeTransport(responses, { deferCommandTypes: ["get_available_thinking_levels"] }),
+      new FakeTransport(reconnectResponses),
+    ],
+    store,
+  );
+
+  await runtime.start(workspace);
+  assert.equal(runtime.snapshot.model?.id, "claude-sonnet-4-5");
+  await runtime.sendPrompt("first");
+  await runtime.sendPrompt("second");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 1);
+
+  // The first turn settles; the settle sequence runs (get_entries catch-up,
+  // get_state refresh) and the model-specific catalog read is now in flight
+  // on the wire.
+  transports[0].emitStdoutLine(JSON.stringify({ type: "agent_settled" }));
+  await flushMicrotasks();
+  await flushMicrotasks();
+  assert.ok(
+    transports[0].writtenCommands().some((command) => command.type === "get_available_thinking_levels"),
+    "the settle sequence must reach the catalog read",
+  );
+
+  // The transport dies exactly while the catalog read is pending.
+  transports[0].emitExit(1, "SIGTERM");
+  await flushMicrotasks();
+  await flushMicrotasks();
+
+  // The settle hook rejected through the disconnect seam: the queue stays
+  // paused with a visible error and the queued prompt was never dispatched,
+  // while the runtime publishes no stale agent state — the handshake
+  // projection is untouched.
+  assert.equal(runtime.snapshot.state, "disconnected");
+  assert.equal(runtime.snapshot.model?.id, "claude-sonnet-4-5");
+  assert.equal(runtime.snapshot.thinkingLevel, "medium");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 1);
+  assert.equal(runtime.conversationSnapshot.executionState, "error");
+  assert.equal(
+    transports[0].writtenCommands().filter((command) => command.type === "prompt").length,
+    1,
+    "no prompt may dispatch after the settle catalog transport loss",
+  );
+
+  // The reconnect handshake recovers: the queue resumes only after it
+  // completes, and the preserved prompt is dispatched last.
+  await runtime.reconnect();
+  const commands = transports[1].writtenCommands();
+  assert.deepEqual(
+    commands.map((command) => command.type),
+    ["switch_session", "get_state", "get_entries", "prompt"],
+  );
+  assert.equal(commands[3].message, "second");
+  assert.equal(runtime.snapshot.state, "ready");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 0);
+
+  await runtime.stop();
+});
+
+test("an accepted setModel whose get_state readback fails clears the unconfirmed selection from the snapshot", async () => {
+  let getStateCalls = 0;
+  const responses = (command: WireCommand): Record<string, unknown> => {
+    switch (command.type) {
+      case "new_session":
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "set_model":
+        return { id: "gpt-5", provider: "openai" };
+      case "get_state":
+        getStateCalls += 1;
+        if (getStateCalls === 1) {
+          return {
+            sessionId: "pi-session-1",
+            sessionFile,
+            model: { id: "claude-sonnet-4-5", provider: "anthropic" },
+            thinkingLevel: "medium",
+          };
+        }
+        // The authoritative refresh omits the model and the level: the
+        // mutation cannot be confirmed.
+        return { sessionId: "pi-session-1", sessionFile };
+      case "get_entries":
+        return { entries: [], leafId: null };
+      case "get_available_thinking_levels":
+        return { levels: ["off", "low"] };
+      default:
+        return {};
+    }
+  };
+  const transport = new FakeTransport(responses);
+  const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
+  await runtime.start(workspace);
+  await runtime.getAvailableThinkingLevels();
+  assert.equal(runtime.snapshot.model?.id, "claude-sonnet-4-5");
+  assert.equal(runtime.snapshot.thinkingLevel, "medium");
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, ["off", "low"]);
+
+  await assert.rejects(runtime.setModel("openai", "gpt-5"), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "INVALID_RESPONSE");
+    return true;
+  });
+
+  // Pi accepted set_model but the readback could not confirm it: the
+  // runtime publishes the explicit reset (wiring is still ready) instead of
+  // retaining the stale selection — and the stale model's supported levels
+  // are cleared with it so unsupported options cannot stay selectable.
+  assert.equal(runtime.snapshot.state, "ready");
+  assert.equal(runtime.snapshot.model, null);
+  assert.equal(runtime.snapshot.thinkingLevel, null);
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, []);
+  await runtime.stop();
+});
+
+test("the post-settled synchronization publishes model, thinking level, and supported levels in one snapshot", async () => {
+  const forwarded: PiEvent[] = [];
+  let getEntriesCalls = 0;
+  const responses = (command: WireCommand): Record<string, unknown> => {
+    switch (command.type) {
+      case "new_session":
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "get_state":
+        return {
+          sessionId: "pi-session-1",
+          sessionFile,
+          model: { id: "claude-sonnet-4-5", provider: "anthropic" },
+          thinkingLevel: "medium",
+        };
+      case "get_entries": {
+        getEntriesCalls += 1;
+        // 1: startup catch-up on a fresh session — empty history.
+        if (getEntriesCalls === 1) return { entries: [], leafId: null };
+        // 2: the post-agent_settled synchronization returns the settled
+        // turn's authoritative user entry for reconciliation.
+        return {
+          entries: [
+            {
+              type: "message",
+              id: "user-1",
+              parentId: null,
+              timestamp: "2026-01-01T00:00:00.000Z",
+              message: { role: "user", content: "first" },
+            },
+          ],
+          leafId: "user-1",
+        };
+      }
+      case "get_available_thinking_levels":
+        return { levels: ["off", "low"] };
+      default:
+        return {};
+    }
+  };
+  const transport = new FakeTransport(responses);
+  const runtime = new PiRuntimeController({
+    wsl: fakeWsl,
+    createTransport: () => transport,
+    handlers: { onEvent: (event) => forwarded.push(event) },
+  });
+  await runtime.start(workspace);
+  await runtime.sendPrompt("first");
+  transport.emitStdoutLine(JSON.stringify({ type: "agent_settled" }));
+  await flushMicrotasks();
+  await flushMicrotasks();
+
+  assert.equal(runtime.snapshot.state, "ready");
+  assert.equal(runtime.snapshot.model?.id, "claude-sonnet-4-5");
+  assert.equal(runtime.snapshot.thinkingLevel, "medium");
+  assert.deepEqual(runtime.snapshot.availableThinkingLevels, ["off", "low"]);
+
+  // The agent-state projection after the settle is a single snapshot: the
+  // model-specific supported levels are published together with the
+  // authoritative model and thinking level (after the reconcile and pointer
+  // persistence), never in a separate earlier event.
+  const settledEvents = forwarded.filter(
+    (event): event is Extract<PiEvent, { type: "runtime" }> =>
+      event.type === "runtime" &&
+      Array.isArray(event.snapshot.availableThinkingLevels) &&
+      event.snapshot.availableThinkingLevels.length === 2,
+  );
+  assert.equal(settledEvents.length, 1);
+  assert.equal(settledEvents[0].snapshot.model?.id, "claude-sonnet-4-5");
+  assert.equal(settledEvents[0].snapshot.thinkingLevel, "medium");
+  await runtime.stop();
+});
+
+test("a setModel rejected before acceptance preserves the previous selection", async () => {
+  const transport = new FakeTransport(defaultResponses, { failCommands: { set_model: true } });
+  const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
+  await runtime.start(workspace);
+  assert.equal(runtime.snapshot.model?.id, "claude-sonnet-4-5");
+  assert.equal(runtime.snapshot.thinkingLevel, "medium");
+
+  await assert.rejects(runtime.setModel("openai", "gpt-5"), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "RPC_FAILURE");
+    return true;
+  });
+
+  // Pi never accepted the command: the previous selection is preserved and
+  // nothing was published onto the ready runtime.
+  assert.equal(runtime.snapshot.state, "ready");
+  assert.equal(runtime.snapshot.model?.id, "claude-sonnet-4-5");
+  assert.equal(runtime.snapshot.thinkingLevel, "medium");
+  await runtime.stop();
+});
+
+test("a setThinkingLevel rejected before acceptance preserves the previous selection", async () => {
+  const transport = new FakeTransport(defaultResponses, {
+    failCommands: { set_thinking_level: true },
+  });
+  const runtime = new PiRuntimeController({ wsl: fakeWsl, createTransport: () => transport });
+  await runtime.start(workspace);
+  assert.equal(runtime.snapshot.thinkingLevel, "medium");
+
+  await assert.rejects(runtime.setThinkingLevel("high"), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "RPC_FAILURE");
+    return true;
+  });
+
+  // Pi never accepted the command: the previous level is preserved and
+  // nothing was published onto the ready runtime.
+  assert.equal(runtime.snapshot.state, "ready");
+  assert.equal(runtime.snapshot.thinkingLevel, "medium");
   await runtime.stop();
 });
 

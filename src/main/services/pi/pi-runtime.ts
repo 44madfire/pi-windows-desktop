@@ -519,6 +519,13 @@ export class PiRuntimeController {
    * start/stop/reconnect. When the wiring is no longer live (the runtime was
    * stopped) it rejects so the conversation keeps its queue paused instead
    * of dispatching into a dead runtime.
+   *
+   * The best-effort supported-levels catalog read is guarded by a post-read
+   * transport boundary: a transport that died during (or right after) the
+   * read rejects the settle, so the queue stays paused and reconnect is the
+   * recovery path, and no stale model/state or unrelated persistence is
+   * published onto the disconnected runtime. A catalog answer that merely
+   * failed to parse never disconnects a healthy runtime.
    */
   private async synchronizeAfterSettle(
     workspaceKey: string,
@@ -530,23 +537,36 @@ export class PiRuntimeController {
       throw new Error('Pi runtime wiring changed before the post-settled synchronization');
     }
     let sync: SessionSynchronizationResult;
+    let levels: PiThinkingLevel[] | null = null;
     try {
       sync = await session.synchronize();
       // The controlled settle refresh: re-read the authoritative get_state
       // so the runtime exposes the selected model/thinking from the manager
       // (a synchronizing session can never regress them), and refresh the
-      // model-specific supported levels best effort — a catalog failure must
-      // never kill an otherwise healthy queue.
+      // model-specific supported levels best effort — a malformed catalog
+      // answer must never kill an otherwise healthy queue.
       await session.refreshState();
+      let catalogError: unknown = null;
       try {
-        const levels = await session.getAvailableThinkingLevels();
-        this.setSnapshot({ availableThinkingLevels: levels });
-      } catch {
-        // The settled model's supported levels could not be re-read: the
-        // previous model's list no longer describes it, so it is cleared
-        // (never retained) — unsupported options must not stay selectable.
-        // The failure itself never kills the healthy settled queue.
-        this.setSnapshot({ availableThinkingLevels: [] });
+        levels = await session.getAvailableThinkingLevels();
+      } catch (error) {
+        // The settled model's supported levels could not be read. The
+        // failure is not yet classified: a transport that died during the
+        // read routes through the disconnect seam below, while a catalog
+        // answer that merely failed to parse clears the list (the previous
+        // model's options must not stay selectable) and keeps the queue
+        // healthy.
+        catalogError = error;
+        levels = null;
+      }
+      // Post-catalog transport boundary: a transport that died during (or
+      // right after) the best-effort catalog read must not publish stale
+      // model/state or run unrelated persistence. The settle fails through
+      // the disconnect seam, so the queue stays paused and reconnect is the
+      // recovery path. A catalog read that failed while the transport is
+      // still healthy never disconnects the runtime.
+      if (client.state !== 'ready') {
+        throw catalogError ?? new Error('Pi transport disconnected during the post-settled catalog read');
       }
     } catch (error) {
       // The post-settled catch-up failed (transport or RPC). The session is
@@ -559,8 +579,17 @@ export class PiRuntimeController {
     if (this.client !== client || this.session !== session) return;
     conversation.hydrate(sync.entries);
     await this.persistPointer(workspaceKey, session);
-    // Publish the manager's effective agent state after the settle refresh.
-    this.setSnapshot({ model: session.model, thinkingLevel: session.thinkingLevel });
+    this.verifyRuntimeWiring(client, session);
+    // A single post-settle snapshot: the effective agent state from the
+    // authoritative refresh plus the model-specific supported levels. A
+    // failed or malformed catalog read clears the list; the transport-bound
+    // disconnect was already routed through the seam above, so the healthy
+    // queue keeps dispatching either way.
+    this.setSnapshot({
+      model: session.model,
+      thinkingLevel: session.thinkingLevel,
+      availableThinkingLevels: levels ?? [],
+    });
   }
 
   /**
@@ -697,16 +726,29 @@ export class PiRuntimeController {
         ({ model } = await session.setModel(validatedProvider, validatedModelId));
       } catch (error) {
         // A rejected mutation may still have staged an explicit authoritative
-        // reset (e.g. get_state reported the model as null); publish it so
-        // the snapshot never retains a stale selection, then propagate the
-        // rejection. Nothing is published when the wiring changed or the
-        // runtime is no longer ready — the stale completion is rejected.
+        // reset (e.g. get_state reported the model as null, or an
+        // accepted-but-unconfirmed set_model cleared the selection); publish
+        // it so the snapshot never retains a stale selection, then propagate
+        // the rejection. When the model is no longer confirmed, its
+        // supported levels are stale too and are cleared with it so
+        // unsupported options cannot stay selectable. Nothing is published
+        // when the wiring changed or the runtime is no longer ready — the
+        // stale completion is rejected.
         this.verifyRuntimeWiring(client, session);
         if (
           session.model !== this.snapshotValue.model ||
           session.thinkingLevel !== this.snapshotValue.thinkingLevel
         ) {
-          this.setSnapshot({ model: session.model, thinkingLevel: session.thinkingLevel });
+          const reset = session.model === null;
+          this.setSnapshot(
+            reset
+              ? {
+                  model: session.model,
+                  thinkingLevel: session.thinkingLevel,
+                  availableThinkingLevels: [],
+                }
+              : { model: session.model, thinkingLevel: session.thinkingLevel },
+          );
         }
         throw error;
       }
