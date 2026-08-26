@@ -10,8 +10,9 @@ import { isJsonObject } from "../pi/protocol.ts";
  * Pi owns its session file (and the history inside it); the desktop persists
  * only this small pointer, enough to ask Pi to resume the same session on the
  * next start. `sessionFile` is authoritative for resuming; `sessionId` is a
- * diagnostic fallback identity; `lastEntryId` is the durable `get_entries`
- * cursor used to catch up.
+ * diagnostic fallback identity; `lastEntryId` is the durable append-order
+ * cursor (`get_entries` `since`) used to catch up — a compatibility alias of
+ * `lastSeenEntryId`, and never the active leaf.
  */
 export interface SessionPointer {
   /** Stable workspace key the pointer is stored under. */
@@ -20,8 +21,38 @@ export interface SessionPointer {
   readonly sessionFile: string | null;
   /** Pi session id, kept for diagnostics and as a fallback identity. */
   readonly sessionId: string | null;
-  /** Durable history cursor (get_entries `leafId`); null = full history. */
+  /**
+   * Durable append-order cursor (get_entries `since`); null = full history.
+   * Compatibility alias of `lastSeenEntryId`; never the active leaf.
+   */
   readonly lastEntryId: string | null;
+  /**
+   * Current active leaf from the last get_entries response. Restored on
+   * load as an independent nullable field so a restarted runtime exposes
+   * the active branch tip immediately, but never used as a catch-up cursor
+   * (the durable append cursor is `lastEntryId`) and replaced by the next
+   * authoritative get_entries response.
+   */
+  readonly leafId: string | null;
+}
+
+/**
+ * The on-disk record shape inside the pointer file. It differs from the
+ * loaded `SessionPointer`: the durable append cursor is stored under the
+ * canonical `lastSeenEntryId` key (the pointer's `lastEntryId` is the
+ * compatibility alias), and the active `leafId` is recorded as an
+ * independent nullable field that loaders restore but never use as a
+ * cursor. The legacy `lastEntryId` key is tolerated on read so older files
+ * migrate without losing their cursor; new writes use `lastSeenEntryId`.
+ */
+interface StoredPointerRecord {
+  workspace: string;
+  sessionFile: string | null;
+  sessionId: string | null;
+  lastSeenEntryId: string | null;
+  leafId: string | null;
+  /** Legacy cursor key accepted from older pointer files. */
+  lastEntryId?: string | null;
 }
 
 /** Persistence seam for the runtime: load by workspace, save a whole pointer. */
@@ -60,8 +91,8 @@ function requireWorkspaceKey(workspace: unknown): string {
  * plain data properties: a key like `__proto__` or `constructor` can never
  * touch the object's prototype or shadow its members.
  */
-function createIndex(): Record<string, SessionPointer> {
-  return Object.create(null) as Record<string, SessionPointer>;
+function createIndex(): Record<string, StoredPointerRecord> {
+  return Object.create(null) as Record<string, StoredPointerRecord>;
 }
 
 /**
@@ -70,7 +101,7 @@ function createIndex(): Record<string, SessionPointer> {
  * assignment on a plain object would; copying the parsed object into a
  * null-prototype container keeps every key a plain own data property.
  */
-function parseIndexRecord(content: string): Record<string, SessionPointer> | null {
+function parseIndexRecord(content: string): Record<string, StoredPointerRecord> | null {
   let value: unknown;
   try {
     value = JSON.parse(content);
@@ -85,6 +116,13 @@ function parseIndexRecord(content: string): Record<string, SessionPointer> | nul
  * Validate and normalize one loaded pointer record. Missing or non-string
  * identity fields degrade to null; a pointer with neither a session file nor
  * a session id is useless and treated as absent.
+ *
+ * The durable append cursor is read from the canonical `lastSeenEntryId` key,
+ * falling back to the legacy `lastEntryId` key so older pointer files migrate
+ * without losing their cursor. A `leafId` key is never consulted for the
+ * cursor: the active leaf may lag the append end and is not a catch-up
+ * position. The leaf is read independently and restored so a restarted
+ * runtime exposes the active branch tip until the next response replaces it.
  */
 function parsePointerFile(content: string, workspace: string): SessionPointer | null {
   const record = parseIndexRecord(content);
@@ -96,10 +134,17 @@ function parsePointerFile(content: string, workspace: string): SessionPointer | 
 
   const sessionFile = stringOrNull(entry.sessionFile);
   const sessionId = stringOrNull(entry.sessionId);
-  const lastEntryId = stringOrNull(entry.lastEntryId);
+  const lastEntryId =
+    stringOrNull(entry.lastSeenEntryId) ?? stringOrNull(entry.lastEntryId);
   if (sessionFile === null && sessionId === null) return null;
 
-  return { workspace, sessionFile, sessionId, lastEntryId };
+  return {
+    workspace,
+    sessionFile,
+    sessionId,
+    lastEntryId,
+    leafId: stringOrNull(entry.leafId),
+  };
 }
 
 /**
@@ -166,11 +211,16 @@ export class JsonSessionStore implements SessionStore {
   private async performSave(pointer: SessionPointer): Promise<void> {
     const key = requireWorkspaceKey(pointer.workspace);
     const index = await this.readIndex();
+    // The pointer's `lastEntryId` is the compatibility alias of the durable
+    // append cursor; it is persisted under the canonical `lastSeenEntryId`
+    // key. The active `leafId` is written as an independent nullable field;
+    // loaders restore it but never use it as a cursor.
     index[key] = {
       workspace: key,
       sessionFile: stringOrNull(pointer.sessionFile),
       sessionId: stringOrNull(pointer.sessionId),
-      lastEntryId: stringOrNull(pointer.lastEntryId),
+      lastSeenEntryId: stringOrNull(pointer.lastEntryId),
+      leafId: stringOrNull(pointer.leafId),
     };
 
     // A unique temp name avoids clobbering a leftover temp file from a
@@ -186,7 +236,7 @@ export class JsonSessionStore implements SessionStore {
     }
   }
 
-  private async readIndex(): Promise<Record<string, SessionPointer>> {
+  private async readIndex(): Promise<Record<string, StoredPointerRecord>> {
     let content: string;
     try {
       content = await this.readFile(this.filePath);
