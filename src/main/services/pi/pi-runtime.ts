@@ -8,7 +8,6 @@ import {
 } from '../../../shared/ipc.ts';
 import { WslManager, type PiExecutableProbe } from '../../wsl/index.ts';
 import { PiRpcClient, type PiRpcTransport } from './index.ts';
-import type { PiRpcEvent } from './protocol.ts';
 import { createWslPiTransport } from './wsl-process-transport.ts';
 import { SessionManager, type SessionSynchronizationResult } from '../session/session-manager.ts';
 import { type SessionPointer, type SessionStore } from '../session/session-store.ts';
@@ -142,44 +141,6 @@ function isThinkingLevel(value: unknown): value is PiThinkingLevel {
   return typeof value === 'string' && (PI_THINKING_LEVELS as readonly string[]).includes(value);
 }
 
-/** Read a thinking level Pi echoed in a response (`data.thinkingLevel`/`level`). */
-function parseEchoedThinkingLevel(data: unknown): PiThinkingLevel | null {
-  const record = asRecord(data);
-  if (!record) return null;
-  for (const key of ['thinkingLevel', 'thinking_level', 'level'] as const) {
-    const value = record[key];
-    if (isThinkingLevel(value)) return value;
-  }
-  return null;
-}
-
-/** Parse an async `model_change` protocol event: `{provider, modelId}`. */
-function parseModelChangeEvent(event: PiRpcEvent): PiModel | null {
-  const record = asRecord(event);
-  if (!record) return null;
-  const provider = nonEmptyString(record['provider']);
-  const modelId = nonEmptyString(record['modelId']) ?? nonEmptyString(record['model_id']);
-  if (provider === null || modelId === null) return null;
-  return { id: modelId, provider };
-}
-
-/** Parse an async `thinking_level_change` protocol event: `{thinkingLevel}`. */
-function parseThinkingLevelChangeEvent(event: PiRpcEvent): PiThinkingLevel | null {
-  const record = asRecord(event);
-  if (!record) return null;
-  for (const key of ['thinkingLevel', 'thinking_level', 'level'] as const) {
-    const value = record[key];
-    if (isThinkingLevel(value)) return value;
-  }
-  return null;
-}
-
-/** Value equality for projected models; fresh objects with equal content must not re-emit. */
-function modelsEqual(a: PiModel | null, b: PiModel | null): boolean {
-  if (a === null || b === null) return a === b;
-  return a.id === b.id && a.provider === b.provider && (a.name ?? null) === (b.name ?? null);
-}
-
 /** Validate a renderer-supplied model identity before it becomes a Pi command. */
 function validateModelIdentifier(value: string, field: string): string {
   const normalized = value.trim();
@@ -226,6 +187,7 @@ export class PiRuntimeController {
     model: null,
     thinkingLevel: null,
     availableModels: [],
+    availableThinkingLevels: [],
   };
 
   constructor(options: PiRuntimeOptions = {}) {
@@ -240,6 +202,7 @@ export class PiRuntimeController {
       ...this.snapshotValue,
       workspace: this.snapshotValue.workspace && { ...this.snapshotValue.workspace },
       availableModels: [...this.snapshotValue.availableModels],
+      availableThinkingLevels: [...this.snapshotValue.availableThinkingLevels],
     };
   }
 
@@ -295,6 +258,10 @@ export class PiRuntimeController {
       sessionId: previousSessionId,
       sessionFile: previousSessionFile,
       piVersion: null,
+      // A new Pi process is being bound: the previous process's supported
+      // thinking levels no longer describe it, so the selector resets until
+      // the model-specific catalog is re-read.
+      availableThinkingLevels: [],
     });
 
     // Hoisted so the failure path can terminate the client it created before
@@ -321,9 +288,15 @@ export class PiRuntimeController {
       this.session = session;
       session.onStateChange((sessionSnapshot) => {
         if (this.client !== client) return;
-        // Propagate identity/cursor unconditionally, including explicit nulls:
-        // a cancelled resume must reset the runtime snapshot instead of
-        // retaining stale session fields alongside a new identity.
+        // Forward session identity/cursor only, including explicit nulls: a
+        // cancelled resume must reset the runtime snapshot instead of
+        // retaining stale session fields alongside a new identity. The
+        // selected model/thinking are deliberately NOT copied here — every
+        // lifecycle snapshot would otherwise re-project agent state, and Pi
+        // RPC state changes are not events. The runtime reads them from the
+        // SessionManager at the handshake, at mutation completion, and after
+        // the controlled settle refresh, so a synchronizing session can
+        // never regress the exposed model/thinking.
         const patch: Partial<PiRuntimeSessionSnapshot> = {};
         if (sessionSnapshot.lastSeenEntryId !== this.snapshotValue.lastSeenEntryId) {
           patch.lastSeenEntryId = sessionSnapshot.lastSeenEntryId;
@@ -338,17 +311,6 @@ export class PiRuntimeController {
         }
         if (sessionSnapshot.sessionFile !== this.snapshotValue.sessionFile) {
           patch.sessionFile = sessionSnapshot.sessionFile;
-        }
-        // Agent-state projections come from the authoritative get_state
-        // response; explicit nulls reset the runtime snapshot alongside the
-        // session identity. Models are compared by value: each session emit
-        // rebuilds the snapshot object, so reference equality would re-emit
-        // unchanged models on every cursor/state transition.
-        if (!modelsEqual(sessionSnapshot.model, this.snapshotValue.model)) {
-          patch.model = sessionSnapshot.model;
-        }
-        if (sessionSnapshot.thinkingLevel !== this.snapshotValue.thinkingLevel) {
-          patch.thinkingLevel = sessionSnapshot.thinkingLevel;
         }
         if (Object.keys(patch).length > 0) {
           this.setSnapshot(patch);
@@ -375,18 +337,10 @@ export class PiRuntimeController {
       conversation.onEvent((event: ConversationEvent) => this.handlers.onEvent?.(event));
 
       client.onEvent((event) => {
-        // Agent-state change events are projected into the runtime snapshot
-        // so selectors observe the authoritative state without re-querying;
-        // the raw event is still forwarded for protocol consumers.
-        if (this.client === client) {
-          if (event.type === 'model_change') {
-            const model = parseModelChangeEvent(event);
-            if (model !== null) this.setSnapshot({ model });
-          } else if (event.type === 'thinking_level_change') {
-            const level = parseThinkingLevelChangeEvent(event);
-            if (level !== null) this.setSnapshot({ thinkingLevel: level });
-          }
-        }
+        // Model/thinking state changes are not Pi RPC events: `get_state` is
+        // the only authoritative source, so no fake `model_change` /
+        // `thinking_level_change` projection happens here. The raw event is
+        // forwarded unchanged for protocol consumers.
         this.handlers.onEvent?.({ type: 'protocol', message: event });
       });
       client.onStderr((text) => this.handlers.onEvent?.({ type: 'stderr', text }));
@@ -498,7 +452,16 @@ export class PiRuntimeController {
     }
 
     const workspaceKey = sessionWorkspaceKey(workspace);
-    this.setSnapshot({ state: 'starting', workspace, lastError: null, lastWarning: null });
+    this.setSnapshot({
+      state: 'starting',
+      workspace,
+      lastError: null,
+      lastWarning: null,
+      // The replacement Pi process is not bound yet: the previous process's
+      // supported thinking levels no longer describe it, so the selector
+      // resets until the forced handshake and catalog re-read.
+      availableThinkingLevels: [],
+    });
     try {
       // Replace the transport. Pending requests are rejected and are not
       // replayed: Pi may have accepted a command before the transport died.
@@ -569,6 +532,22 @@ export class PiRuntimeController {
     let sync: SessionSynchronizationResult;
     try {
       sync = await session.synchronize();
+      // The controlled settle refresh: re-read the authoritative get_state
+      // so the runtime exposes the selected model/thinking from the manager
+      // (a synchronizing session can never regress them), and refresh the
+      // model-specific supported levels best effort — a catalog failure must
+      // never kill an otherwise healthy queue.
+      await session.refreshState();
+      try {
+        const levels = await session.getAvailableThinkingLevels();
+        this.setSnapshot({ availableThinkingLevels: levels });
+      } catch {
+        // The settled model's supported levels could not be re-read: the
+        // previous model's list no longer describes it, so it is cleared
+        // (never retained) — unsupported options must not stay selectable.
+        // The failure itself never kills the healthy settled queue.
+        this.setSnapshot({ availableThinkingLevels: [] });
+      }
     } catch (error) {
       // The post-settled catch-up failed (transport or RPC). The session is
       // already marked disconnected by the manager; surface the same state
@@ -580,6 +559,8 @@ export class PiRuntimeController {
     if (this.client !== client || this.session !== session) return;
     conversation.hydrate(sync.entries);
     await this.persistPointer(workspaceKey, session);
+    // Publish the manager's effective agent state after the settle refresh.
+    this.setSnapshot({ model: session.model, thinkingLevel: session.thinkingLevel });
   }
 
   /**
@@ -592,7 +573,18 @@ export class PiRuntimeController {
   /** Persist the current session pointer before resolving, so quit awaits it. */
   private async stopInternal(): Promise<PiRuntimeSnapshot> {
     if (!this.client) {
-      this.setSnapshot({ state: 'stopped', workspace: null });
+      // No live client (never started, or a failed startup left no client):
+      // the stopped runtime must not retain projected agent state or either
+      // catalog from a previous run.
+      this.setSnapshot({
+        state: 'stopped',
+        workspace: null,
+        piVersion: null,
+        model: null,
+        thinkingLevel: null,
+        availableModels: [],
+        availableThinkingLevels: [],
+      });
       return this.snapshot;
     }
 
@@ -609,8 +601,9 @@ export class PiRuntimeController {
         await this.persistPointer(sessionWorkspaceKey(workspace), session);
       }
       this.session = null;
-      // The Pi process is gone: the projected agent state and the model list
-      // no longer describe anything, so the selectors reset with the runtime.
+      // The Pi process is gone: the projected agent state, the model list,
+      // and the supported thinking levels no longer describe anything, so
+      // the selectors reset with the runtime.
       this.setSnapshot({
         state: 'stopped',
         workspace: null,
@@ -618,6 +611,7 @@ export class PiRuntimeController {
         model: null,
         thinkingLevel: null,
         availableModels: [],
+        availableThinkingLevels: [],
       });
     }
     return this.snapshot;
@@ -663,63 +657,137 @@ export class PiRuntimeController {
    * renderer can never pick a Pi command type. The response's `models` array
    * is authoritative and replaces `snapshot.availableModels` so selectors
    * observe the same list the response returned.
+   *
+   * Serialized on the lifecycle tail: the client is captured, the runtime
+   * must be `ready`, and the wiring is re-verified after the request so a
+   * result that lands after the runtime stopped/restarted is rejected
+   * instead of being published into the replacement runtime.
    */
-  async getAvailableModels(): Promise<PiModel[]> {
-    if (!this.client) {
-      throw new Error('Pi is not running. Start Pi before listing models.');
-    }
-    const response = await this.client.request({ type: 'get_available_models' });
-    const models = parseAvailableModels(response.data);
-    this.setSnapshot({ availableModels: models });
-    return models;
+  getAvailableModels(): Promise<PiModel[]> {
+    return this.enqueueLifecycle(async () => {
+      const client = this.requireReadyClient('list models');
+      const response = await client.request({ type: 'get_available_models' });
+      this.verifyRuntimeWiring(client);
+      const models = parseAvailableModels(response.data);
+      this.setSnapshot({ availableModels: models });
+      return models;
+    });
   }
 
   /**
    * Switch the active agent model. Provider and model id are validated here
    * (the last boundary before a Pi command is built) and forwarded verbatim
-   * as `{type: 'set_model', provider, modelId}`. The response's model data
-   * is authoritative: it is applied to the snapshot and returned to the
-   * caller, falling back to the requested identity when Pi acknowledges
-   * without echoing the model.
+   * as `{type: 'set_model', provider, modelId}`. The mutation is owned by the
+   * SessionManager: it re-reads the authoritative `get_state` and exposes
+   * the effective model/thinking — never the requested identity.
+   *
+   * Serialized on the lifecycle tail with the same wiring capture/verification
+   * as the other agent-state operations. The supported thinking levels are
+   * refreshed for the new model (best effort: a catalog failure never fails
+   * the successful mutation) and a failure clears the list — the previous
+   * model's options must not remain selectable for the new model.
    */
-  async setModel(provider: string, modelId: string): Promise<PiModel> {
-    if (!this.client) {
-      throw new Error('Pi is not running. Start Pi before changing the model.');
-    }
-    const validatedProvider = validateModelIdentifier(provider, 'provider');
-    const validatedModelId = validateModelIdentifier(modelId, 'modelId');
-    const response = await this.client.request({
-      type: 'set_model',
-      provider: validatedProvider,
-      modelId: validatedModelId,
+  setModel(provider: string, modelId: string): Promise<PiModel> {
+    return this.enqueueLifecycle(async () => {
+      const { client, session } = this.requireReadyRuntime('change the model');
+      const validatedProvider = validateModelIdentifier(provider, 'provider');
+      const validatedModelId = validateModelIdentifier(modelId, 'modelId');
+      let model: PiModel;
+      try {
+        ({ model } = await session.setModel(validatedProvider, validatedModelId));
+      } catch (error) {
+        // A rejected mutation may still have staged an explicit authoritative
+        // reset (e.g. get_state reported the model as null); publish it so
+        // the snapshot never retains a stale selection, then propagate the
+        // rejection. Nothing is published when the wiring changed or the
+        // runtime is no longer ready — the stale completion is rejected.
+        this.verifyRuntimeWiring(client, session);
+        if (
+          session.model !== this.snapshotValue.model ||
+          session.thinkingLevel !== this.snapshotValue.thinkingLevel
+        ) {
+          this.setSnapshot({ model: session.model, thinkingLevel: session.thinkingLevel });
+        }
+        throw error;
+      }
+      this.verifyRuntimeWiring(client, session);
+      // Thinking levels are model-specific; refresh them for the switched-to
+      // model. Best effort, mirroring the settle refresh: a malformed or
+      // failing catalog read must not fail the successful model mutation.
+      let availableThinkingLevels: PiThinkingLevel[] = [];
+      try {
+        availableThinkingLevels = await session.getAvailableThinkingLevels();
+      } catch {
+        // The new model's supported levels are unknown: clear the previous
+        // model's list so unsupported options cannot be selected. The
+        // renderer's catalog effect re-queries on the next model change.
+      }
+      this.verifyRuntimeWiring(client, session);
+      this.setSnapshot({
+        model,
+        thinkingLevel: session.thinkingLevel,
+        availableThinkingLevels,
+      });
+      return model;
     });
-    const model = parseModelRecord(response.data) ?? {
-      id: validatedModelId,
-      provider: validatedProvider,
-    };
-    this.setSnapshot({ model });
-    return model;
   }
 
   /**
    * Switch the agent thinking level. Only Pi's allowed levels pass the
    * runtime boundary; the command is `{type: 'set_thinking_level', level}`.
-   * The applied level (echoed by Pi when it does, otherwise the requested
-   * one) is authoritative and updates the snapshot.
+   * Pi answers success-only, so the effective level is read back from the
+   * authoritative `get_state` refresh and the requested level is never used
+   * as a fallback. Serialized on the lifecycle tail with wiring and
+   * readiness verification after the mutation.
    */
-  async setThinkingLevel(level: PiThinkingLevel): Promise<PiThinkingLevel> {
-    if (!this.client) {
-      throw new Error('Pi is not running. Start Pi before changing the thinking level.');
-    }
-    if (!isThinkingLevel(level)) {
-      throw new TypeError(
-        `Invalid Pi thinking level: "${String(level)}". Expected one of: ${PI_THINKING_LEVELS.join(', ')}`,
-      );
-    }
-    const response = await this.client.request({ type: 'set_thinking_level', level });
-    const applied = parseEchoedThinkingLevel(response.data) ?? level;
-    this.setSnapshot({ thinkingLevel: applied });
-    return applied;
+  setThinkingLevel(level: PiThinkingLevel): Promise<PiThinkingLevel> {
+    return this.enqueueLifecycle(async () => {
+      const { client, session } = this.requireReadyRuntime('change the thinking level');
+      if (!isThinkingLevel(level)) {
+        throw new TypeError(
+          `Invalid Pi thinking level: "${String(level)}". Expected one of: ${PI_THINKING_LEVELS.join(', ')}`,
+        );
+      }
+      let effective: PiThinkingLevel;
+      try {
+        ({ level: effective } = await session.setThinkingLevel(level));
+      } catch (error) {
+        // A rejected mutation may still have staged an explicit authoritative
+        // reset (e.g. get_state reported the level as null); publish it so
+        // the snapshot never retains a stale selection, then propagate the
+        // rejection. Nothing is published when the wiring changed or the
+        // runtime is no longer ready — the stale completion is rejected.
+        this.verifyRuntimeWiring(client, session);
+        if (
+          session.model !== this.snapshotValue.model ||
+          session.thinkingLevel !== this.snapshotValue.thinkingLevel
+        ) {
+          this.setSnapshot({ model: session.model, thinkingLevel: session.thinkingLevel });
+        }
+        throw error;
+      }
+      this.verifyRuntimeWiring(client, session);
+      this.setSnapshot({ thinkingLevel: effective, model: session.model });
+      return effective;
+    });
+  }
+
+  /**
+   * List the thinking levels the current model supports. The command shape
+   * is owned by the SessionManager; the response's `data.levels` is strict
+   * and model-specific (never the global enum) and replaces
+   * `snapshot.availableThinkingLevels` so selectors observe the same list
+   * the response returned. Serialized on the lifecycle tail with wiring and
+   * readiness verification after the request.
+   */
+  getAvailableThinkingLevels(): Promise<PiThinkingLevel[]> {
+    return this.enqueueLifecycle(async () => {
+      const { client, session } = this.requireReadyRuntime('list thinking levels');
+      const levels = await session.getAvailableThinkingLevels();
+      this.verifyRuntimeWiring(client, session);
+      this.setSnapshot({ availableThinkingLevels: levels });
+      return levels;
+    });
   }
 
   /** Tolerate a missing or corrupt store: startup degrades to a fresh session. */
@@ -762,6 +830,57 @@ export class PiRuntimeController {
     }
     if (this.snapshotValue.lastWarning !== null) {
       this.setSnapshot({ lastWarning: null });
+    }
+  }
+
+  /**
+   * Require a live client and a `ready` runtime for an agent-state operation.
+   * The check runs inside the serialized lifecycle body, so a catalog or
+   * mutation queued behind a start/stop/reconnect observes the settled
+   * wiring.
+   */
+  private requireReadyClient(operation: string): PiRpcClient {
+    const client = this.client;
+    if (!client) {
+      throw new Error(`Pi is not running. Start Pi before ${operation}.`);
+    }
+    if (this.snapshotValue.state !== 'ready') {
+      throw new Error(
+        `Pi is not ready to ${operation} while the runtime is ${this.snapshotValue.state}.`,
+      );
+    }
+    return client;
+  }
+
+  private requireReadyRuntime(operation: string): {
+    client: PiRpcClient;
+    session: SessionManager;
+  } {
+    const client = this.requireReadyClient(operation);
+    const session = this.session;
+    if (!session) {
+      throw new Error(`Pi is not running. Start Pi before ${operation}.`);
+    }
+    return { client, session };
+  }
+
+  /**
+   * Verify, after an awaited operation, that the captured wiring is still the
+   * live wiring AND the runtime is still `ready` before any result is
+   * published. The lifecycle tail already serializes start/stop/reconnect,
+   * but a transport failure only flips the runtime to `disconnected` without
+   * replacing the client/session references — publishing then would paint a
+   * stale result onto a dead or replaced runtime, so such operations reject
+   * instead.
+   */
+  private verifyRuntimeWiring(client: PiRpcClient, session?: SessionManager): void {
+    if (this.client !== client || (session !== undefined && this.session !== session)) {
+      throw new Error('Pi runtime wiring changed; the operation result was discarded');
+    }
+    if (this.snapshotValue.state !== 'ready') {
+      throw new Error(
+        `Pi runtime is ${this.snapshotValue.state}; the operation result was discarded`,
+      );
     }
   }
 
