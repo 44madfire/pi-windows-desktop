@@ -2,7 +2,14 @@ import { app, BrowserWindow, ipcMain } from 'electron';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDiagnosticsReport } from '../shared/diagnostics.js';
-import { IPC_CHANNELS, requireInvokeObject, type RuntimeInfo, type WslWorkspace } from '../shared/ipc.js';
+import {
+  IPC_CHANNELS,
+  PI_THINKING_LEVELS,
+  requireInvokeObject,
+  type PiThinkingLevel,
+  type RuntimeInfo,
+  type WslWorkspace,
+} from '../shared/ipc.js';
 import { PiRuntimeController } from './services/pi/pi-runtime.js';
 import { JsonSessionStore } from './services/session/session-store.js';
 import { gitStatusEnvelope, readWorkspaceFileEnvelope } from './services/workspace/ipc-mapping.js';
@@ -107,6 +114,32 @@ function registerIpcHandlers(): void {
     // extension_ui_response boundary exists, and the runtime re-validates the
     // payload shape before writing it to Pi.
     await piRuntime.sendExtensionUiResponse(payload.response);
+  });
+  // Agent-state selectors: the renderer only gets typed wrappers. Command
+  // shapes (get_available_models/set_model/set_thinking_level) are owned by
+  // the runtime, and the runtime re-validates identities before building any
+  // Pi command, so no raw Pi command or Node privilege crosses IPC.
+  ipcMain.handle(IPC_CHANNELS.getAvailableModels, () => piRuntime.getAvailableModels());
+  ipcMain.handle(IPC_CHANNELS.setModel, (_event, request: unknown) => {
+    const payload = requireInvokeObject(IPC_CHANNELS.setModel, request);
+    if (typeof payload.provider !== 'string' || typeof payload.modelId !== 'string') {
+      throw new Error(
+        `Invalid IPC request on "${IPC_CHANNELS.setModel}": "provider" and "modelId" are required strings.`,
+      );
+    }
+    return piRuntime.setModel(payload.provider, payload.modelId);
+  });
+  ipcMain.handle(IPC_CHANNELS.setThinkingLevel, (_event, request: unknown) => {
+    const payload = requireInvokeObject(IPC_CHANNELS.setThinkingLevel, request);
+    if (
+      typeof payload.level !== 'string' ||
+      !(PI_THINKING_LEVELS as readonly string[]).includes(payload.level)
+    ) {
+      throw new Error(
+        `Invalid IPC request on "${IPC_CHANNELS.setThinkingLevel}": "level" must be a known thinking level.`,
+      );
+    }
+    return piRuntime.setThinkingLevel(payload.level as PiThinkingLevel);
   });
   ipcMain.handle(IPC_CHANNELS.getConversation, () => piRuntime.conversationSnapshot);
   ipcMain.handle(IPC_CHANNELS.sendPrompt, (_event, request: unknown) => {
