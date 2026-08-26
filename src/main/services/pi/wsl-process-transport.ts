@@ -117,6 +117,56 @@ function validateExecutable(value: unknown): string {
   return value;
 }
 
+/**
+ * The Node-style writable surface the stdin adapter needs. The real child
+ * stdin is a Node `Writable`: `write()` reports backpressure synchronously as
+ * a boolean and settles the actual I/O through its callback. Test fakes mirror
+ * this shape so the adapter can be exercised without WSL.
+ */
+export interface WslPiProcessStdinWritable {
+  write(
+    chunk: string,
+    callback?: (error?: Error | null) => void,
+  ): boolean;
+  end(): void | PromiseLike<void>;
+  on(event: "error", listener: (error: unknown) => void): unknown;
+}
+
+/**
+ * Adapts the raw child stdin to the client-facing {@link PiRpcWritable}
+ * boundary. Node's `Writable#write` hands back a backpressure boolean and only
+ * reports completion/errors through its callback; this adapter converts each
+ * write into a Promise settled by that callback, so callers can await the
+ * actual I/O instead of polling a boolean.
+ */
+export class WslPiProcessStdinAdapter implements PiRpcWritable {
+  private readonly stdin: WslPiProcessStdinWritable;
+
+  constructor(stdin: WslPiProcessStdinWritable) {
+    this.stdin = stdin;
+  }
+
+  write(chunk: string): Promise<boolean | void> {
+    return new Promise<boolean | void>((resolve, reject) => {
+      this.stdin.write(chunk, (error?: Error | null) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      });
+    });
+  }
+
+  end(): void | PromiseLike<void> {
+    return this.stdin.end();
+  }
+
+  on(event: "error", listener: (error: unknown) => void): unknown {
+    return this.stdin.on(event, listener);
+  }
+}
+
 const defaultSpawn: WslPiProcessSpawn = (executable, argv, options) =>
   nodeSpawn(executable, [...argv], {
     shell: options.shell,
@@ -161,7 +211,13 @@ export class WslPiProcessTransport implements PiRpcTransport {
     }
 
     this.child = child;
-    this.stdin = child.stdin;
+    // The spawn seam types stdin as the client-facing PiRpcWritable, but the
+    // real child stdin (and the test fakes) expose Node-style callback
+    // writes. The adapter converts the synchronous backpressure boolean into
+    // a callback-driven Promise without leaking the raw stream to the client.
+    this.stdin = new WslPiProcessStdinAdapter(
+      child.stdin as unknown as WslPiProcessStdinWritable,
+    );
     this.stdout = child.stdout;
     this.stderr = child.stderr;
   }
