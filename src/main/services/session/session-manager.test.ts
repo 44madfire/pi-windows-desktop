@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { PiThinkingLevel } from "../../../shared/ipc.ts";
+
+import { PiRpcCommandError, PiRpcTransportError } from "../pi/errors.ts";
 import {
   SessionManager,
   SessionManagerError,
@@ -31,6 +33,11 @@ class FakePiRpcClient implements SessionPiRpcClient {
 
   queueError(message: string): void {
     this.responses.push(new Error(message));
+  }
+
+  /** Queue a pre-built failure (e.g. a PiRpcCommandError/TransportError). */
+  queueFailure(error: Error): void {
+    this.responses.push(error);
   }
 
   async request<TData extends JsonValue = JsonValue>(
@@ -291,6 +298,156 @@ test("a failed sync becomes recoverable and reconnect can continue from the same
   assert.deepEqual(recoveredClient.commands, [{ type: "get_entries", since: "entry-9" }]);
   assert.equal(result?.lastEntryId, "entry-10");
   assert.equal(manager.state, "ready");
+});
+
+test("reconnect retries exactly once with full history when the since cursor is stale", async () => {
+  const client = new FakePiRpcClient();
+  // Pi rejects the incremental catch-up: the persisted cursor no longer
+  // matches any entry id ("Entry not found: <cursor>").
+  client.queueFailure(
+    new PiRpcCommandError(1, "get_entries", {
+      type: "response",
+      id: 1,
+      command: "get_entries",
+      success: false,
+      error: "Entry not found: stale-entry-9",
+    }),
+  );
+  // The full-history retry (no `since` cursor) succeeds and re-anchors the
+  // durable cursor and leaf from its entries.
+  client.queueResponse({ entries: [{ id: "entry-10" }, { id: "entry-11" }], leafId: "entry-11" });
+  const manager = new SessionManager({
+    client,
+    sessionId: "session-4",
+    lastEntryId: "stale-entry-9",
+  });
+
+  const result = await manager.reconnect(client);
+
+  assert.deepEqual(client.commands, [
+    { type: "get_entries", since: "stale-entry-9" },
+    { type: "get_entries" },
+  ]);
+  assert.equal(result?.entryCount, 2);
+  // The successful replay was the full-history retry, so requestedAfter
+  // reports null while previousLastEntryId preserves the stale cursor the
+  // synchronization started from.
+  assert.equal(result?.requestedAfter, null);
+  assert.equal(result?.previousLastEntryId, "stale-entry-9");
+  assert.equal(result?.lastSeenEntryId, "entry-11");
+  assert.equal(result?.leafId, "entry-11");
+  assert.equal(manager.lastSeenEntryId, "entry-11");
+  assert.equal(manager.leafId, "entry-11");
+  assert.equal(manager.state, "ready");
+  assert.equal(manager.snapshot.lastError, null);
+});
+
+test("a stale-cursor retry that also fails surfaces the retry failure on the disconnected path", async () => {
+  const client = new FakePiRpcClient();
+  client.queueFailure(
+    new PiRpcCommandError(1, "get_entries", {
+      type: "response",
+      id: 1,
+      command: "get_entries",
+      success: false,
+      error: "Entry not found: stale-entry-9",
+    }),
+  );
+  const retryFailure = new PiRpcTransportError("pi process exited", "process");
+  client.queueFailure(retryFailure);
+  const manager = new SessionManager({
+    client,
+    sessionId: "session-4",
+    lastEntryId: "stale-entry-9",
+  });
+
+  await assert.rejects(manager.resume(), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "RPC_FAILURE");
+    assert.ok(error.cause === retryFailure, "the retry's own failure is the surfaced cause");
+    return true;
+  });
+  // Exactly one retry: the second command is the full-history request.
+  assert.deepEqual(client.commands, [
+    { type: "get_entries", since: "stale-entry-9" },
+    { type: "get_entries" },
+  ]);
+  assert.equal(manager.state, "disconnected");
+  assert.equal(
+    manager.lastSeenEntryId,
+    "stale-entry-9",
+    "the durable cursor survives a failed retry unchanged",
+  );
+  assert.equal(manager.snapshot.lastError, "Session resume failed: pi process exited");
+});
+
+test("a transport failure during synchronization is never retried", async () => {
+  const client = new FakePiRpcClient();
+  const transportError = new PiRpcTransportError("pi process exited", "process");
+  client.queueFailure(transportError);
+  const manager = new SessionManager({
+    client,
+    sessionId: "session-4",
+    lastEntryId: "stale-entry-9",
+  });
+
+  await assert.rejects(manager.synchronize(), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "RPC_FAILURE");
+    assert.ok(error.cause === transportError);
+    return true;
+  });
+  // A transport failure is not a cursor problem: exactly one command.
+  assert.deepEqual(client.commands, [{ type: "get_entries", since: "stale-entry-9" }]);
+  assert.equal(manager.state, "disconnected");
+  assert.equal(manager.lastSeenEntryId, "stale-entry-9");
+});
+
+test("an unrelated get_entries command failure is never retried", async () => {
+  const client = new FakePiRpcClient();
+  // A genuine get_entries command failure whose text is not a stale-cursor
+  // signal must not trigger the full-history retry.
+  client.queueFailure(
+    new PiRpcCommandError(1, "get_entries", {
+      type: "response",
+      id: 1,
+      command: "get_entries",
+      success: false,
+      error: "session storage is corrupted",
+    }),
+  );
+  const manager = new SessionManager({ client, sessionId: "session-4", lastEntryId: "entry-9" });
+
+  await assert.rejects(manager.resume(), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "RPC_FAILURE");
+    return true;
+  });
+  assert.deepEqual(client.commands, [{ type: "get_entries", since: "entry-9" }]);
+  assert.equal(manager.state, "disconnected");
+});
+
+test("a full-history synchronization is never retried after a stale-looking failure", async () => {
+  const client = new FakePiRpcClient();
+  client.queueFailure(
+    new PiRpcCommandError(1, "get_entries", {
+      type: "response",
+      id: 1,
+      command: "get_entries",
+      success: false,
+      error: "Entry not found: ghost-entry",
+    }),
+  );
+  const manager = new SessionManager({ client, sessionId: "session-4", lastEntryId: "entry-9" });
+
+  await assert.rejects(manager.synchronize({ since: null }), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "RPC_FAILURE");
+    return true;
+  });
+  // The first attempt was already the full entry list: no duplicate retry.
+  assert.deepEqual(client.commands, [{ type: "get_entries" }]);
+  assert.equal(manager.state, "disconnected");
 });
 
 test("restore from a serializable snapshot does not require a live Pi process until reconnect", async () => {
