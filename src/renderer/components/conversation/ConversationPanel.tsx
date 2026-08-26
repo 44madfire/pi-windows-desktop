@@ -28,6 +28,8 @@ export type ConversationRecordStatus =
 
 export type ConversationMessageRecord = {
   id: string;
+  /** Authoritative Pi entry id when this record has been persisted. */
+  piEntryId?: string;
   type: 'message';
   role: 'user' | 'assistant';
   content: string;
@@ -36,6 +38,8 @@ export type ConversationMessageRecord = {
 
 export type ConversationToolRecord = {
   id: string;
+  /** Authoritative Pi entry id when this record has been persisted. */
+  piEntryId?: string;
   type: 'tool';
   name: string;
   status: ConversationRecordStatus;
@@ -47,6 +51,8 @@ export type ConversationToolRecord = {
 
 export type ConversationBashRecord = {
   id: string;
+  /** Authoritative Pi entry id when this record has been persisted. */
+  piEntryId?: string;
   type: 'bash';
   command: string;
   status: ConversationRecordStatus;
