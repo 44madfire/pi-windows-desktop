@@ -57,7 +57,12 @@ class FakePiRpcClient implements SessionPiRpcClient {
 
 test("models create state and persists only Pi session identity/cursor data", async () => {
   const client = new FakePiRpcClient();
-  client.queueResponse({ sessionId: "pi-session-1", lastEntryId: "entry-0" });
+  client.queueResponse({
+    sessionId: "pi-session-1",
+    lastEntryId: "entry-0",
+    model: { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5" },
+    thinkingLevel: "high",
+  });
   const states: string[] = [];
   const manager = new SessionManager({ client, sessionId: "requested-session" });
   manager.onStateChange((snapshot) => {
@@ -76,14 +81,24 @@ test("models create state and persists only Pi session identity/cursor data", as
   assert.equal(manager.lastEntryId, "entry-0");
   assert.equal(manager.lastSeenEntryId, "entry-0");
   assert.equal(manager.leafId, null);
+  // The snapshot carries the projected agent state plus identity/cursor data,
+  // all plain JSON for the host IPC slice.
+  assert.deepEqual(created.model, {
+    id: "claude-sonnet-4-5",
+    provider: "anthropic",
+    name: "Claude Sonnet 4.5",
+  });
+  assert.equal(created.thinkingLevel, "high");
   assert.deepEqual(Object.keys(manager.snapshot).sort(), [
     "lastEntryId",
     "lastError",
     "lastSeenEntryId",
     "leafId",
+    "model",
     "sessionFile",
     "sessionId",
     "state",
+    "thinkingLevel",
   ]);
   assert.deepEqual(JSON.parse(JSON.stringify(manager.snapshot)), manager.snapshot);
 });
@@ -254,6 +269,8 @@ test("restore from a serializable snapshot does not require a live Pi process un
     leafId: null,
     lastEntryId: "entry-12",
     lastError: "previous process exited",
+    model: { id: "claude-sonnet-4-5", provider: "anthropic" },
+    thinkingLevel: "medium",
   });
 
   assert.deepEqual(restored.snapshot, {
@@ -264,6 +281,8 @@ test("restore from a serializable snapshot does not require a live Pi process un
     leafId: null,
     lastEntryId: "entry-12",
     lastError: "previous process exited",
+    model: { id: "claude-sonnet-4-5", provider: "anthropic" },
+    thinkingLevel: "medium",
   });
   assert.equal(restored.sessionFile, "/home/pi/.pi/agent/sessions/session-5");
   await assert.rejects(restored.resume(), (error: unknown) => {
@@ -602,6 +621,8 @@ test("a malformed persisted session file is rejected at construction", () => {
         leafId: null,
         lastEntryId: null,
         lastError: null,
+        model: null,
+        thinkingLevel: null,
       }),
     TypeError,
   );
@@ -642,4 +663,140 @@ test("synchronization keeps the append cursor distinct from the active leaf", as
     { type: "get_entries" },
     { type: "get_entries", since: "entry-2" },
   ]);
+});
+
+test("get_state projects the active model and thinking level into the session snapshot", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ sessionId: "pi-session-1" }); // new_session
+  client.queueResponse({
+    sessionId: "pi-session-1",
+    sessionFile: "/home/pi/.pi/agent/sessions/pi-session-1",
+    model: { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5" },
+    thinkingLevel: "high",
+  }); // get_state
+  const manager = new SessionManager({ client });
+
+  const opened = await manager.openSession(null);
+
+  assert.deepEqual(client.commands, [{ type: "new_session" }, { type: "get_state" }]);
+  assert.equal(opened.resumed, false);
+  assert.equal(opened.snapshot.state, "ready");
+  // The get_state handshake response seeds the authoritative agent state —
+  // never fabricated by the desktop shell.
+  assert.deepEqual(opened.snapshot.model, {
+    id: "claude-sonnet-4-5",
+    provider: "anthropic",
+    name: "Claude Sonnet 4.5",
+  });
+  assert.equal(opened.snapshot.thinkingLevel, "high");
+  assert.equal(manager.model?.id, "claude-sonnet-4-5");
+  assert.equal(manager.thinkingLevel, "high");
+  assert.deepEqual(JSON.parse(JSON.stringify(opened.snapshot)), opened.snapshot);
+});
+
+test("get_state projection tolerates data-nested and session-nested keys plus snake_case levels", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ sessionId: "pi-session-1" }); // new_session
+  // The level arrives snake_case inside `data.session`; the model arrives at
+  // the data level directly. Both are authoritative get_state projections.
+  client.queueResponse({
+    sessionId: "pi-session-1",
+    model: { id: "gpt-5", provider: "openai" },
+    session: {
+      model: { id: "stale-nested", provider: "stale" },
+      thinking_level: "xhigh",
+    },
+  }); // get_state
+  const manager = new SessionManager({ client });
+
+  const opened = await manager.openSession(null);
+
+  // The data-level model wins over the nested session copy; the snake_case
+  // thinking_level is normalized to the shared PiThinkingLevel vocabulary.
+  assert.deepEqual(opened.snapshot.model, { id: "gpt-5", provider: "openai" });
+  assert.equal(opened.snapshot.thinkingLevel, "xhigh");
+});
+
+test("an explicit null model/thinking level resets previously projected agent state", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ sessionId: "pi-session-1" }); // new_session
+  client.queueResponse({
+    sessionId: "pi-session-1",
+    model: null,
+    thinkingLevel: null,
+  }); // get_state
+  // A restored manager holds stale agent state; the authoritative handshake
+  // must replace it, not retain it.
+  const manager = new SessionManager({
+    client,
+    model: { id: "stale-model", provider: "stale-provider" },
+    thinkingLevel: "low",
+  });
+
+  const opened = await manager.openSession(null);
+
+  assert.equal(opened.snapshot.model, null);
+  assert.equal(opened.snapshot.thinkingLevel, null);
+  assert.equal(manager.model, null);
+  assert.equal(manager.thinkingLevel, null);
+});
+
+test("an unknown thinking level or malformed model projects null instead of fabricating state", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ sessionId: "pi-session-1" }); // new_session
+  client.queueResponse({
+    sessionId: "pi-session-1",
+    thinkingLevel: "turbo",
+    model: { id: "orphan-model" },
+  }); // get_state: both values are outside the accepted projection
+  const manager = new SessionManager({ client, thinkingLevel: "low" });
+
+  const opened = await manager.openSession(null);
+
+  // A level Pi does not recognize is reset (present but invalid), and a
+  // model without a provider is dropped entirely — the shell never reports
+  // fabricated agent state.
+  assert.equal(opened.snapshot.thinkingLevel, null);
+  assert.equal(opened.snapshot.model, null);
+});
+
+test("constructor validation rejects malformed model and unknown thinking levels", () => {
+  assert.throws(
+    () => new SessionManager({ model: { id: "m-1", provider: "" } }),
+    /model requires non-empty id and provider strings/,
+  );
+  assert.throws(
+    () => new SessionManager({ model: { id: "", provider: "anthropic" } }),
+    /model requires non-empty id and provider strings/,
+  );
+  assert.throws(
+    () =>
+      new SessionManager({
+        thinkingLevel: "turbo" as unknown as SessionManager["thinkingLevel"],
+      }),
+    /thinkingLevel must be one of/,
+  );
+});
+
+test("restored snapshots keep the projected model and thinking level", async () => {
+  const restored = SessionManager.fromSnapshot({
+    state: "disconnected",
+    sessionId: null,
+    sessionFile: null,
+    lastSeenEntryId: null,
+    leafId: null,
+    lastEntryId: null,
+    lastError: null,
+    model: { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5" },
+    thinkingLevel: "medium",
+  });
+
+  assert.deepEqual(restored.snapshot.model, {
+    id: "claude-sonnet-4-5",
+    provider: "anthropic",
+    name: "Claude Sonnet 4.5",
+  });
+  assert.equal(restored.snapshot.thinkingLevel, "medium");
+  assert.equal(restored.model?.provider, "anthropic");
+  assert.equal(restored.thinkingLevel, "medium");
 });

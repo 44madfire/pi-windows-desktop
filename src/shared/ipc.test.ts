@@ -3,9 +3,12 @@ import test from 'node:test';
 import { createDiagnosticsReport } from './diagnostics.ts';
 import {
   IPC_CHANNELS,
+  PI_THINKING_LEVELS,
   requireInvokeObject,
   type DesktopApi,
   type IpcContract,
+  type PiModel,
+  type PiThinkingLevel,
   type RuntimeInfo,
 } from './ipc.ts';
 
@@ -23,6 +26,9 @@ test('IPC channel names are unique and scoped to app capabilities', () => {
     'pi:get-status',
     'pi:event',
     'pi:extension-ui-response',
+    'pi:get-available-models',
+    'pi:set-model',
+    'pi:set-thinking-level',
     'conversation:send-prompt',
     'conversation:abort-prompt',
     'conversation:get',
@@ -61,6 +67,9 @@ test('every invoke channel is wired to a typed DesktopApi method', () => {
     [IPC_CHANNELS.stopPi]: 'stopPi',
     [IPC_CHANNELS.getPiStatus]: 'getPiStatus',
     [IPC_CHANNELS.piExtensionUiResponse]: 'sendExtensionUiResponse',
+    [IPC_CHANNELS.getAvailableModels]: 'getAvailableModels',
+    [IPC_CHANNELS.setModel]: 'setModel',
+    [IPC_CHANNELS.setThinkingLevel]: 'setThinkingLevel',
     [IPC_CHANNELS.sendPrompt]: 'sendPrompt',
     [IPC_CHANNELS.abortPrompt]: 'abortPrompt',
     [IPC_CHANNELS.getConversation]: 'getConversation',
@@ -83,15 +92,33 @@ test('every invoke channel is wired to a typed DesktopApi method', () => {
   const invokeChannels = Object.keys(invokeMethodByChannel);
   assert.equal(invokeChannels.length + Object.keys(eventOnlyChannels).length, Object.keys(IPC_CHANNELS).length);
 
+  const stoppedSnapshot: IpcContract[typeof IPC_CHANNELS.getPiStatus]['response'] = {
+    state: 'stopped',
+    workspace: null,
+    piVersion: null,
+    lastError: null,
+    model: null,
+    thinkingLevel: null,
+    availableModels: [],
+    lastWarning: null,
+    lastSeenEntryId: null,
+    leafId: null,
+    lastEntryId: null,
+    sessionId: null,
+    sessionFile: null,
+  };
   const api: DesktopApi = {
     getRuntimeInfo: async () => ({ appVersion: '', electronVersion: '', nodeVersion: '', platform: 'windows', architecture: 'x64' }),
     getDiagnostics: async () => ({ checkedAt: '', overall: 'pending', checks: [] }),
     listWslDistributions: async () => [],
     probeWslDistribution: async () => ({ distribution: '', available: false, pi: null, detail: '' }),
-    startPi: async () => ({ state: 'stopped', workspace: null, piVersion: null, lastError: null, lastWarning: null, lastSeenEntryId: null, leafId: null, lastEntryId: null, sessionId: null, sessionFile: null }),
-    stopPi: async () => ({ state: 'stopped', workspace: null, piVersion: null, lastError: null, lastWarning: null, lastSeenEntryId: null, leafId: null, lastEntryId: null, sessionId: null, sessionFile: null }),
-    getPiStatus: async () => ({ state: 'stopped', workspace: null, piVersion: null, lastError: null, lastWarning: null, lastSeenEntryId: null, leafId: null, lastEntryId: null, sessionId: null, sessionFile: null }),
+    startPi: async () => stoppedSnapshot,
+    stopPi: async () => stoppedSnapshot,
+    getPiStatus: async () => stoppedSnapshot,
     sendExtensionUiResponse: async () => undefined,
+    getAvailableModels: async () => [],
+    setModel: async (_provider, _modelId) => ({ id: 'model-1', provider: 'anthropic' }),
+    setThinkingLevel: async (level) => level,
     sendPrompt: async () => ({ timeline: [], executionState: 'idle', queuedPromptCount: 0, error: null }),
     abortPrompt: async () => ({ timeline: [], executionState: 'idle', queuedPromptCount: 0, error: null }),
     getConversation: async () => ({ timeline: [], executionState: 'idle', queuedPromptCount: 0, error: null }),
@@ -148,6 +175,119 @@ test('IpcResponse resolves typed results for the new channels', () => {
     response: { type: 'extension_ui_response', id: 'req-1', confirmed: true },
   };
   assert.equal(response.response.type, 'extension_ui_response');
+});
+
+test('M1 agent-state selectors expose typed JSON-safe wire shapes', () => {
+  // Model switching returns the authoritative Pi model: id + provider, with
+  // an optional display name. Nothing else leaks from the wire record.
+  const model: IpcContract[typeof IPC_CHANNELS.setModel]['response'] = {
+    id: 'claude-sonnet-4-5',
+    provider: 'anthropic',
+    name: 'Claude Sonnet 4.5',
+  };
+  assert.deepEqual(JSON.parse(JSON.stringify(model)), model);
+  assert.deepEqual(Object.keys(model).sort(), ['id', 'name', 'provider']);
+
+  const bareModel: PiModel = { id: 'gpt-5', provider: 'openai' };
+  assert.deepEqual(JSON.parse(JSON.stringify(bareModel)), bareModel);
+
+  // The model catalog is a plain array of the same model shape.
+  const models: IpcContract[typeof IPC_CHANNELS.getAvailableModels]['response'] = [
+    model,
+    bareModel,
+  ];
+  assert.deepEqual(JSON.parse(JSON.stringify(models)), models);
+
+  // set_model accepts exactly the provider/modelId pair; nothing else may
+  // reach Pi from the renderer.
+  const setModelRequest: IpcContract[typeof IPC_CHANNELS.setModel]['request'] = {
+    provider: 'anthropic',
+    modelId: 'claude-sonnet-4-5',
+  };
+  assert.deepEqual(JSON.parse(JSON.stringify(setModelRequest)), setModelRequest);
+  assert.deepEqual(Object.keys(setModelRequest).sort(), ['modelId', 'provider']);
+
+  // set_thinking_level accepts exactly one level from the closed set.
+  const setLevelRequest: IpcContract[typeof IPC_CHANNELS.setThinkingLevel]['request'] = {
+    level: 'high',
+  };
+  assert.deepEqual(JSON.parse(JSON.stringify(setLevelRequest)), setLevelRequest);
+  assert.deepEqual(Object.keys(setLevelRequest).sort(), ['level']);
+  const appliedLevel: IpcContract[typeof IPC_CHANNELS.setThinkingLevel]['response'] = 'xhigh';
+  assert.equal(appliedLevel, 'xhigh');
+});
+
+test('PiThinkingLevel is a closed set and the runtime snapshot projects agent state', () => {
+  // Every value Pi accepts for `thinkingLevel`/`set_thinking_level` is
+  // enumerated; a renderer value outside this set must never pass validation.
+  assert.deepEqual(PI_THINKING_LEVELS, [
+    'off',
+    'minimal',
+    'low',
+    'medium',
+    'high',
+    'xhigh',
+    'max',
+  ]);
+  const levelUnion: PiThinkingLevel = 'max';
+  assert.ok(PI_THINKING_LEVELS.includes(levelUnion));
+
+  // The shared runtime snapshot carries the projected agent state: active
+  // model, thinking level, and the switchable model catalog. All fields are
+  // plain JSON across the IPC boundary.
+  const snapshot: IpcContract[typeof IPC_CHANNELS.getPiStatus]['response'] = {
+    state: 'ready',
+    workspace: { distro: 'Ubuntu', linuxPath: '/home/pi' },
+    piVersion: '0.1.0',
+    lastError: null,
+    model: { id: 'claude-sonnet-4-5', provider: 'anthropic', name: 'Claude Sonnet 4.5' },
+    thinkingLevel: 'high',
+    availableModels: [{ id: 'claude-sonnet-4-5', provider: 'anthropic' }],
+    lastWarning: null,
+    lastSeenEntryId: null,
+    leafId: null,
+    lastEntryId: null,
+    sessionId: 'pi-session-1',
+    sessionFile: '/home/pi/.pi/agent/sessions/pi-session-1',
+  };
+  assert.deepEqual(JSON.parse(JSON.stringify(snapshot)), snapshot);
+  assert.deepEqual(
+    Object.keys(snapshot).sort(),
+    [
+      'availableModels',
+      'lastEntryId',
+      'lastError',
+      'lastSeenEntryId',
+      'lastWarning',
+      'leafId',
+      'model',
+      'piVersion',
+      'sessionFile',
+      'sessionId',
+      'state',
+      'thinkingLevel',
+      'workspace',
+    ],
+  );
+
+  // The pre-ready snapshot projects null model/level and an empty catalog:
+  // nothing is fabricated before Pi reports it.
+  const stopped: IpcContract[typeof IPC_CHANNELS.getPiStatus]['response'] = {
+    state: 'stopped',
+    workspace: null,
+    piVersion: null,
+    lastError: null,
+    model: null,
+    thinkingLevel: null,
+    availableModels: [],
+    lastWarning: null,
+    lastSeenEntryId: null,
+    leafId: null,
+    lastEntryId: null,
+    sessionId: null,
+    sessionFile: null,
+  };
+  assert.deepEqual(JSON.parse(JSON.stringify(stopped)), stopped);
 });
 
 test('M0 diagnostics pass shell checks while future integrations remain pending', () => {
