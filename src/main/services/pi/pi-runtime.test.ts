@@ -17,7 +17,7 @@ import {
   type SessionPiRpcClient,
   type SessionSnapshot,
 } from "../session/session-manager.ts";
-import { PiRuntimeController, sessionWorkspaceKey } from "./pi-runtime.ts";
+import { PiRuntimeController, sessionWorkspaceKey, type PiRuntimeSessionSnapshot } from "./pi-runtime.ts";
 
 const workspace: WslWorkspace = { distro: "Ubuntu", linuxPath: "/home/pi" };
 const sessionFile = "/home/pi/.pi/agent/sessions/pi-session-1";
@@ -348,26 +348,63 @@ test("agent/message/tool events never advance the durable entry cursor and still
 });
 
 function fakeStore(pointer: SessionPointer | null): SessionStore & { saved: SessionPointer[] } {
+  let current = pointer;
   return {
     saved: [],
     async load(workspaceKey: string): Promise<SessionPointer | null> {
-      return pointer && pointer.workspace === workspaceKey ? pointer : null;
+      return current && current.workspace === workspaceKey ? current : null;
     },
     async save(saved: SessionPointer): Promise<void> {
+      current = saved;
       this.saved.push(saved);
     },
   };
 }
 
-test("a restored runtime resumes switch_session, catches up from the cursor, and hydrates", async () => {
+test("a restored runtime resumes switch_session, requests full history, and re-hydrates the fresh conversation", async () => {
   const forwarded: PiEvent[] = [];
-  const transport = new FakeTransport();
+  const transport = new FakeTransport((command) => {
+    switch (command.type) {
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "get_state":
+        return { sessionId: "pi-session-1", sessionFile };
+      case "get_entries":
+        // Full history (no `since` cursor): the persisted session's old
+        // user/assistant turn is restored for the fresh conversation. An
+        // incremental catch-up from the persisted tail would return nothing.
+        if (command.since === undefined) {
+          return {
+            entries: [
+              {
+                type: "message",
+                id: "user-1",
+                parentId: null,
+                timestamp: "2026-01-01T00:00:00.000Z",
+                message: { role: "user", content: "old prompt" },
+              },
+              {
+                type: "message",
+                id: "assistant-1",
+                parentId: "user-1",
+                timestamp: "2026-01-01T00:00:01.000Z",
+                message: { role: "assistant", content: [{ type: "text", text: "old answer" }] },
+              },
+            ],
+            leafId: "assistant-1",
+          };
+        }
+        return { entries: [], leafId: "assistant-1" };
+      default:
+        return {};
+    }
+  });
   const store = fakeStore({
     workspace: sessionWorkspaceKey(workspace),
     sessionFile,
     sessionId: "pi-session-1",
-    lastEntryId: "entry-9",
-    leafId: "entry-1",
+    lastEntryId: "assistant-1",
+    leafId: "user-1",
   });
   const runtime = new PiRuntimeController({
     wsl: fakeWsl,
@@ -387,8 +424,8 @@ test("a restored runtime resumes switch_session, catches up from the cursor, and
       event.type === "runtime" && event.snapshot.state === "starting",
   );
   assert.ok(starting, "a starting snapshot must be published");
-  assert.equal(starting.snapshot.lastEntryId, "entry-9");
-  assert.equal(starting.snapshot.leafId, "entry-1");
+  assert.equal(starting.snapshot.lastEntryId, "assistant-1");
+  assert.equal(starting.snapshot.leafId, "user-1");
 
   const commands = transport.writtenCommands();
   assert.deepEqual(
@@ -397,39 +434,40 @@ test("a restored runtime resumes switch_session, catches up from the cursor, and
   );
   assert.equal(commands[0].sessionPath, sessionFile);
   const getEntries = commands[2];
-  // The catch-up cursor is the durable append cursor — never the leaf.
-  assert.equal(getEntries.since, "entry-9");
+  // A cold start creates a fresh conversation: the full entry list is
+  // requested (no `since` cursor) so old history is restored even when the
+  // persisted append cursor is at the tail — never an incremental catch-up
+  // that would hydrate nothing.
+  assert.equal(getEntries.since, undefined);
 
-  // The persisted append cursor drove the catch-up; the recovered entries
-  // advance the append cursor to the last entry id in append order, while
-  // `leafId` is the current active leaf exposed separately — never the
-  // durable cursor.
   assert.equal(started.state, "ready");
-  assert.equal(started.lastSeenEntryId, "user-1");
-  assert.equal(started.leafId, "entry-10");
-  assert.equal(started.lastEntryId, "user-1");
+  assert.equal(started.lastSeenEntryId, "assistant-1");
+  assert.equal(started.leafId, "assistant-1");
+  assert.equal(started.lastEntryId, "assistant-1");
   assert.equal(started.sessionId, "pi-session-1");
   assert.equal(started.sessionFile, sessionFile);
 
-  // Recovered entries hydrated the conversation timeline before ready.
-  const timeline = runtime.conversationSnapshot.timeline;
-  assert.equal(timeline.length, 1);
-  assert.equal(timeline[0].type === "message" ? timeline[0].content : '', "recovered prompt");
+  // Full history hydrated the fresh conversation before ready: both the old
+  // user prompt and the assistant answer are restored.
+  const contents = runtime.conversationSnapshot.timeline.map((record) =>
+    record.type === "message" ? record.content : "",
+  );
+  assert.deepEqual(contents, ["old prompt", "old answer"]);
 
-  // The resulting pointer was persisted (start + synchronization both save)
-  // with the durable append cursor, not the active leaf.
+  // The resulting pointer was persisted with the durable append cursor,
+  // not the active leaf.
   assert.ok(store.saved.length >= 1);
   const persisted = store.saved[store.saved.length - 1];
   assert.equal(persisted.workspace, sessionWorkspaceKey(workspace));
   assert.equal(persisted.sessionFile, sessionFile);
-  assert.equal(persisted.lastEntryId, "user-1");
+  assert.equal(persisted.lastEntryId, "assistant-1");
 
   await runtime.stop();
   const stopped = store.saved[store.saved.length - 1];
-  assert.equal(stopped.lastEntryId, "user-1");
+  assert.equal(stopped.lastEntryId, "assistant-1");
 });
 
-test("a stored leaf and cursor round-trip; the next sync still requests since the cursor", async () => {
+test("a stored leaf and cursor round-trip through a full-history cold start", async () => {
   const transport = new FakeTransport((command) => {
     switch (command.type) {
       case "new_session":
@@ -460,12 +498,14 @@ test("a stored leaf and cursor round-trip; the next sync still requests since th
 
   const started = await runtime.start(workspace);
 
-  // Both stored values round-trip through startup: the next synchronization
-  // still requests the durable append cursor (`since: "entry-2"`), never the
-  // restored leaf, and the ready runtime exposes both the append cursor and
-  // the restored active leaf until an authoritative response replaces it.
+  // Both stored values round-trip through startup: the cold start requests
+  // the full entry list (no `since` cursor) for the fresh conversation — the
+  // restored cursor is preserved in memory and still exposed — and the
+  // restored active leaf survives until an authoritative response replaces
+  // it. Reconnect and post-settle synchronization (not the cold start)
+  // request `since` from the durable append cursor.
   const getEntries = transport.writtenCommands().find((command) => command.type === "get_entries");
-  assert.equal(getEntries?.since, "entry-2");
+  assert.equal(getEntries?.since, undefined);
   assert.equal(started.state, "ready");
   assert.equal(started.lastSeenEntryId, "entry-2");
   assert.equal(started.leafId, "entry-1");
@@ -779,6 +819,226 @@ function runtimeWithTransportSequence(
   });
   return { runtime, transports: created };
 }
+
+test("a second runtime cold start requests full history and restores the previous run's turn", async () => {
+  // Pi owns the history: after runtime A's turn settles, the full entry list
+  // contains the old user/assistant turn, while an incremental catch-up from
+  // the persisted tail finds nothing new.
+  let turnPersisted = false;
+  const sharedHistory = (command: WireCommand): Record<string, unknown> => {
+    switch (command.type) {
+      case "new_session":
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "get_state":
+        return { sessionId: "pi-session-1", sessionFile };
+      case "get_entries": {
+        if (command.since === undefined) {
+          return turnPersisted
+            ? {
+                entries: [
+                  {
+                    type: "message",
+                    id: "user-1",
+                    parentId: null,
+                    timestamp: "2026-01-01T00:00:00.000Z",
+                    message: { role: "user", content: "old prompt" },
+                  },
+                  {
+                    type: "message",
+                    id: "assistant-1",
+                    parentId: "user-1",
+                    timestamp: "2026-01-01T00:00:01.000Z",
+                    message: { role: "assistant", content: [{ type: "text", text: "old answer" }] },
+                  },
+                ],
+                leafId: "assistant-1",
+              }
+            : { entries: [], leafId: null };
+        }
+        // Incremental catch-up after the persisted tail: nothing new.
+        return { entries: [], leafId: "assistant-1" };
+      }
+      default:
+        return {};
+    }
+  };
+  const store = fakeStore(null);
+
+  // Runtime A: a fresh session, one live turn, then a clean stop persists
+  // the pointer at the append tail.
+  const { runtime: runtimeA, transports: transportsA } = runtimeWithTransportSequence(
+    [new FakeTransport(sharedHistory)],
+    store,
+  );
+  const startedA = await runtimeA.start(workspace);
+  assert.equal(startedA.state, "ready");
+
+  await runtimeA.sendPrompt("old prompt");
+  transportsA[0].emitStdoutLine(JSON.stringify({ type: "agent_start" }));
+  transportsA[0].emitStdoutLine(
+    JSON.stringify({ type: "message_start", message: { id: "msg-1", role: "assistant", content: [] } }),
+  );
+  transportsA[0].emitStdoutLine(
+    JSON.stringify({
+      type: "message_end",
+      message: { id: "msg-1", role: "assistant", content: [{ type: "text", text: "old answer" }] },
+    }),
+  );
+  // Pi now owns the settled turn's authoritative entries.
+  turnPersisted = true;
+  transportsA[0].emitStdoutLine(JSON.stringify({ type: "agent_settled" }));
+  await flushMicrotasks();
+  await flushMicrotasks();
+
+  // The post-settled synchronization reconciled the turn; the pointer is
+  // persisted at the append tail (assistant-1).
+  assert.equal(runtimeA.snapshot.state, "ready");
+  assert.equal(runtimeA.snapshot.lastSeenEntryId, "assistant-1");
+  assert.equal(
+    runtimeA.conversationSnapshot.timeline.filter(
+      (record) => record.type === "message" && record.role === "user",
+    ).length,
+    1,
+  );
+  assert.equal(
+    runtimeA.conversationSnapshot.timeline.filter(
+      (record) => record.type === "message" && record.role === "assistant",
+    ).length,
+    1,
+  );
+  await runtimeA.stop();
+  assert.equal(store.saved[store.saved.length - 1].lastEntryId, "assistant-1");
+
+  // Runtime B: a clean cold start over the same workspace and pointer.
+  const { runtime: runtimeB, transports: transportsB } = runtimeWithTransportSequence(
+    [new FakeTransport(sharedHistory)],
+    store,
+  );
+  const startedB = await runtimeB.start(workspace);
+  assert.equal(startedB.state, "ready");
+
+  // B requested the full entry list — no `since` cursor — despite the
+  // persisted tail, and restored the old user/assistant turn.
+  const commandsB = transportsB[0].writtenCommands();
+  assert.deepEqual(
+    commandsB.map((command) => command.type),
+    ["switch_session", "get_state", "get_entries"],
+  );
+  assert.equal(commandsB[2].since, undefined);
+  const contentsB = runtimeB.conversationSnapshot.timeline.map((record) =>
+    record.type === "message" ? record.content : "",
+  );
+  assert.deepEqual(contentsB, ["old prompt", "old answer"]);
+  assert.equal(runtimeB.snapshot.lastSeenEntryId, "assistant-1");
+
+  await runtimeB.stop();
+});
+
+test("a failing pointer save stays best-effort: runtime stays ready, warns, and the queue keeps dispatching", async () => {
+  const forwarded: PiEvent[] = [];
+  const failingStore = {
+    async load(): Promise<SessionPointer | null> {
+      return null;
+    },
+    async save(): Promise<void> {
+      throw new Error("disk full");
+    },
+  } satisfies SessionStore;
+  let getEntriesCalls = 0;
+  const responses = (command: WireCommand): Record<string, unknown> => {
+    switch (command.type) {
+      case "new_session":
+      case "switch_session":
+        return { sessionId: "pi-session-1" };
+      case "get_state":
+        return { sessionId: "pi-session-1", sessionFile };
+      case "get_entries": {
+        getEntriesCalls += 1;
+        // 1: startup full-history catch-up on a fresh session — empty.
+        if (getEntriesCalls === 1) return { entries: [], leafId: null };
+        // 2: the post-agent_settled synchronization returns the settled
+        // turn's authoritative user entry for reconciliation.
+        return {
+          entries: [
+            {
+              type: "message",
+              id: "user-1",
+              parentId: null,
+              timestamp: "2026-01-01T00:00:00.000Z",
+              message: { role: "user", content: "first" },
+            },
+          ],
+          leafId: "user-1",
+        };
+      }
+      default:
+        return {};
+    }
+  };
+  const transport = new FakeTransport(responses);
+  const transports = [transport];
+  const runtime = new PiRuntimeController({
+    wsl: fakeWsl,
+    createTransport: () => transport,
+    sessionStore: failingStore,
+    handlers: { onEvent: (event) => forwarded.push(event) },
+  });
+
+  // Startup persistence is best effort: the pointer save fails, but the
+  // runtime still reaches ready and reports the warning instead of failing.
+  const started = await runtime.start(workspace);
+  assert.equal(started.state, "ready");
+  assert.match(runtime.snapshot.lastWarning ?? "", /disk full/);
+
+  await runtime.sendPrompt("first");
+  await runtime.sendPrompt("second");
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 1);
+  assert.equal(
+    transports[0].writtenCommands().filter((command) => command.type === "prompt").length,
+    1,
+  );
+
+  // The first turn settles; the authoritative post-settled sync succeeds
+  // while the pointer save keeps failing. The failure must not strand the
+  // queue: the runtime stays ready, the warning stays visible, and the next
+  // queued prompt dispatches after the sync.
+  transports[0].emitStdoutLine(JSON.stringify({ type: "agent_settled" }));
+  await flushMicrotasks();
+  await flushMicrotasks();
+
+  assert.deepEqual(
+    transports[0].writtenCommands().map((command) => command.type),
+    ["new_session", "get_state", "get_entries", "prompt", "get_entries", "prompt"],
+    "the queued prompt must follow the post-settled synchronization despite the failing pointer save",
+  );
+  assert.equal(runtime.snapshot.state, "ready");
+  assert.equal(runtime.snapshot.lastSeenEntryId, "user-1");
+  assert.match(runtime.snapshot.lastWarning ?? "", /disk full/);
+  assert.equal(runtime.conversationSnapshot.queuedPromptCount, 0);
+  assert.equal(
+    runtime.conversationSnapshot.timeline.filter(
+      (record) => record.type === "message" && record.content === "first",
+    ).length,
+    1,
+    "the reconciled user entry must not duplicate the live prompt record",
+  );
+
+  // The warning is visible on the runtime event channel, not just the local
+  // snapshot.
+  const warned = forwarded.find(
+    (event): event is Extract<PiEvent, { type: "runtime" }> =>
+      event.type === "runtime" &&
+      (event.snapshot as PiRuntimeSessionSnapshot).lastWarning !== null,
+  );
+  assert.ok(warned, "the pointer save failure must surface as a visible runtime warning");
+  assert.match(
+    (warned.snapshot as PiRuntimeSessionSnapshot).lastWarning ?? "",
+    /disk full/,
+  );
+
+  await runtime.stop();
+});
 
 test("reconnect reruns the handshake, catches up from the append cursor, hydrates, and persists before ready", async () => {
   const store = fakeStore(null);
