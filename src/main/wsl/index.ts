@@ -7,6 +7,21 @@ export const DEFAULT_WSL_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
 
 export const WSL_DISTRIBUTION_PATTERN = /^[A-Za-z0-9._-]+$/;
 
+/**
+ * Prefix written by the Pi PATH-lookup commands. Only a line starting with
+ * this marker is treated as the discovered executable path, so login-shell
+ * profile output can never be mistaken for the executable.
+ */
+export const PI_LOOKUP_MARKER = "__PI_DESKTOP_PI__";
+
+/**
+ * Shell snippet used for the non-login, login, and interactive-login Pi
+ * lookups. It prints the `command -v pi` result on a dedicated marker line;
+ * when `pi` is not on PATH the marker line is still emitted with an empty
+ * value.
+ */
+const PI_LOOKUP_COMMAND = `printf '${PI_LOOKUP_MARKER}%s\\n' "$(command -v pi)"`;
+
 export type ProcessFailureReason = "timeout" | "max-buffer" | "spawn-error" | null;
 
 export type ProcessEnvironment = Readonly<Record<string, string | undefined>>;
@@ -63,7 +78,11 @@ export interface WslDistributionProbe {
   readonly pi: PiExecutableProbe | null;
 }
 
-export type PiProbeFailureReason = "lookup-failed" | "not-found";
+export type PiProbeFailureReason =
+  | "lookup-failed"
+  | "not-found"
+  | "configured-executable-failed"
+  | "executable-version-failed";
 
 export type PiExecutableProbe =
   | {
@@ -76,8 +95,22 @@ export type PiExecutableProbe =
       readonly available: false;
       readonly executable: null;
       readonly version: null;
-      readonly reason: PiProbeFailureReason;
+      readonly reason: "lookup-failed" | "not-found";
       readonly lookupResult: WslCommandResult;
+    }
+  | {
+      readonly available: false;
+      readonly executable: null;
+      readonly version: null;
+      readonly reason: "configured-executable-failed";
+      readonly versionResult: WslCommandResult;
+    }
+  | {
+      readonly available: false;
+      readonly executable: null;
+      readonly version: null;
+      readonly reason: "executable-version-failed";
+      readonly versionResult: WslCommandResult;
     };
 
 /** A seam for replacing Pi discovery with an application-specific strategy. */
@@ -273,6 +306,25 @@ function firstNonEmptyLine(output: string): string | null {
   return null;
 }
 
+/**
+ * Extract the Pi executable path from the marker line emitted by
+ * PI_LOOKUP_COMMAND. Every other line (login banners, motd, profile echoes)
+ * is ignored; a marker line with an empty value means the lookup found
+ * nothing. Returns null when no marker line carries a non-empty path.
+ */
+export function parsePiLookupOutput(output: string): string | null {
+  for (const line of output.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith(PI_LOOKUP_MARKER)) {
+      continue;
+    }
+    const executable = trimmed.slice(PI_LOOKUP_MARKER.length).trim();
+    return executable.length > 0 ? executable : null;
+  }
+
+  return null;
+}
+
 function combineChunks(chunks: readonly Uint8Array[]): Uint8Array {
   const totalLength = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
   const output = new Uint8Array(totalLength);
@@ -410,12 +462,21 @@ export function createNodeProcessRunner(): ProcessRunner {
  * Default discovery strategy for a Pi executable inside a selected distro.
  *
  * When a configured executable path is supplied, discovery skips the PATH
- * lookup entirely and probes that executable's version directly. Otherwise it
- * runs a non-login `/bin/sh -c command -v pi` lookup, then falls back to a
- * profile-aware `/bin/bash -lc command -v pi` lookup when the first lookup
- * fails or returns no path, so nvm/fnm/profile-installed Pi executables are
- * still discoverable. Lookup and version commands always keep discrete argv
- * entries; a configured path is never interpolated into a shell command.
+ * lookup entirely and probes that executable's version directly; a failing
+ * probe makes the executable unavailable with reason
+ * "configured-executable-failed". Otherwise it runs a non-login
+ * `/bin/sh -c` lookup, then a profile-aware `/bin/bash -lc` lookup, and
+ * finally an interactive `/bin/bash -l -i -c` lookup, so nvm/fnm and other
+ * profile-initialized Pi executables are still discoverable. Every lookup
+ * prints the found path on a dedicated marker line
+ * (`printf '<marker>%s\n' "$(command -v pi)"`) and only that line is parsed,
+ * so shell and profile output can never be mistaken for the executable.
+ * A version probe that fails makes the executable unavailable with reason
+ * "executable-version-failed" when discovered or
+ * "configured-executable-failed" when configured; lookup-failed/not-found
+ * are reported only after every fallback has been tried. Lookup and version
+ * commands always keep discrete argv entries; a configured path is never
+ * interpolated into a shell command.
  */
 export class DefaultPiExecutableLocator implements PiExecutableLocator {
   private readonly runInDistribution: RunInDistribution;
@@ -431,55 +492,79 @@ export class DefaultPiExecutableLocator implements PiExecutableLocator {
 
   async locate(distribution: string): Promise<PiExecutableProbe> {
     if (this.configuredExecutable !== null) {
-      return this.probeVersion(distribution, this.configuredExecutable);
+      return this.probeVersion(distribution, this.configuredExecutable, true);
     }
 
     const shLookup = await this.runInDistribution(distribution, "/bin/sh", [
       "-c",
-      "command -v pi",
+      PI_LOOKUP_COMMAND,
     ]);
-    const shExecutable = shLookup.ok ? firstNonEmptyLine(shLookup.stdout) : null;
+    const shExecutable = shLookup.ok ? parsePiLookupOutput(shLookup.stdout) : null;
     if (shExecutable !== null) {
-      return this.probeVersion(distribution, shExecutable);
+      return this.probeVersion(distribution, shExecutable, false);
     }
 
     const loginLookup = await this.runInDistribution(distribution, "/bin/bash", [
       "-l",
       "-c",
-      "command -v pi",
+      PI_LOOKUP_COMMAND,
     ]);
-    if (!loginLookup.ok) {
+    const loginExecutable = loginLookup.ok ? parsePiLookupOutput(loginLookup.stdout) : null;
+    if (loginExecutable !== null) {
+      return this.probeVersion(distribution, loginExecutable, false);
+    }
+
+    // Profile-initialized tools (nvm, fnm, ...) only end up on PATH for
+    // interactive shells, so try an interactive login shell before giving up.
+    const interactiveLookup = await this.runInDistribution(distribution, "/bin/bash", [
+      "-l",
+      "-i",
+      "-c",
+      PI_LOOKUP_COMMAND,
+    ]);
+    if (!interactiveLookup.ok) {
       return {
         available: false,
         executable: null,
         version: null,
         reason: "lookup-failed",
-        lookupResult: loginLookup,
+        lookupResult: interactiveLookup,
       };
     }
 
-    const executable = firstNonEmptyLine(loginLookup.stdout);
-    if (executable === null) {
+    const interactiveExecutable = parsePiLookupOutput(interactiveLookup.stdout);
+    if (interactiveExecutable === null) {
       return {
         available: false,
         executable: null,
         version: null,
         reason: "not-found",
-        lookupResult: loginLookup,
+        lookupResult: interactiveLookup,
       };
     }
 
-    return this.probeVersion(distribution, executable);
+    return this.probeVersion(distribution, interactiveExecutable, false);
   }
 
-  private async probeVersion(distribution: string, executable: string): Promise<PiExecutableProbe> {
+  private async probeVersion(
+    distribution: string,
+    executable: string,
+    configured: boolean,
+  ): Promise<PiExecutableProbe> {
     const versionResult = await this.runInDistribution(distribution, executable, ["--version"]);
+    if (!versionResult.ok) {
+      return {
+        available: false,
+        executable: null,
+        version: null,
+        reason: configured ? "configured-executable-failed" : "executable-version-failed",
+        versionResult,
+      };
+    }
     return {
       available: true,
       executable,
-      version: versionResult.ok
-        ? firstNonEmptyLine(versionResult.stdout) ?? firstNonEmptyLine(versionResult.stderr)
-        : null,
+      version: firstNonEmptyLine(versionResult.stdout) ?? firstNonEmptyLine(versionResult.stderr),
       versionResult,
     };
   }

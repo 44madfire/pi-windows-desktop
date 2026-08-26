@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import {
   DefaultPiExecutableLocator,
+  PI_LOOKUP_MARKER,
   WslCommandError,
   WslInputError,
   WslProcessError,
@@ -10,12 +11,16 @@ import {
   createNodeProcessRunner,
   decodeWslOutput,
   isValidWslDistributionName,
+  parsePiLookupOutput,
   parseWslDistributionList,
   type PiExecutableLocator,
   type ProcessRequest,
   type ProcessResult,
   type RunInDistribution,
 } from "./index.ts";
+
+/** Exact `-c` script asserted on the wire for both Pi PATH lookups. */
+const PI_LOOKUP_SCRIPT = "printf '__PI_DESKTOP_PI__%s\\n' \"$(command -v pi)\"";
 
 interface FakeRunner {
   readonly calls: ProcessRequest[];
@@ -200,7 +205,7 @@ test("reports an unavailable distro without attempting Pi discovery", async () =
 });
 
 test("default Pi locator finds an executable and probes its version", async () => {
-  const fake = queuedRunner([result("/usr/local/bin/pi\n"), result("pi 2.4.1\n", "")]);
+  const fake = queuedRunner([result(`${PI_LOOKUP_MARKER}/usr/local/bin/pi\n`), result("pi 2.4.1\n", "")]);
 
   const probe = await new DefaultPiExecutableLocator(fakeRunInDistribution(fake)).locate("Ubuntu");
 
@@ -224,26 +229,52 @@ test("default Pi locator finds an executable and probes its version", async () =
     },
   });
   assert.deepEqual(fake.calls.map((call) => call.args), [
-    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", "command -v pi"],
+    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", PI_LOOKUP_SCRIPT],
     ["--distribution", "Ubuntu", "--exec", "/usr/local/bin/pi", "--version"],
   ]);
 });
 
-test("returns a typed not-found Pi probe when both lookups produce no path", async () => {
-  const fake = queuedRunner([result("\n", ""), result("\n", "")]);
+test("returns a typed not-found Pi probe when every lookup produces no path", async () => {
+  const fake = queuedRunner([
+    result(`${PI_LOOKUP_MARKER}\n`, ""),
+    result(`${PI_LOOKUP_MARKER}\n`, ""),
+    result(`${PI_LOOKUP_MARKER}\n`, ""),
+  ]);
   const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake));
 
   const probe = await locator.locate("Ubuntu");
 
   assert.equal(probe.available, false);
-  if (!probe.available) {
-    assert.equal(probe.reason, "not-found");
+  if (!probe.available && probe.reason === "not-found") {
     assert.equal(probe.lookupResult.stderr, "");
   }
   assert.deepEqual(fake.calls.map((call) => call.args), [
-    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", "command -v pi"],
-    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", "command -v pi"],
+    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-i", "-c", PI_LOOKUP_SCRIPT],
   ]);
+});
+
+test("parses only the marked lookup line, ignoring profile noise", () => {
+  assert.equal(
+    parsePiLookupOutput(
+      "Welcome to Ubuntu 24.04 LTS\n" +
+        "/usr/bin/echo\n" +
+        `${PI_LOOKUP_MARKER}/opt/my pi/bin/pi\r\n` +
+        "  System information as of Mon Aug 25 2026\n",
+    ),
+    "/opt/my pi/bin/pi",
+  );
+  assert.equal(
+    parsePiLookupOutput(`${PI_LOOKUP_MARKER}\n`),
+    null,
+  );
+  assert.equal(parsePiLookupOutput("no marker anywhere\n"), null);
+  assert.equal(parsePiLookupOutput(""), null);
+  assert.equal(
+    parsePiLookupOutput(`leading text ${PI_LOOKUP_MARKER}/bin/pi\n`),
+    null,
+  );
 });
 
 test("configured Pi executable path skips PATH lookup and probes its version", async () => {
@@ -262,17 +293,19 @@ test("configured Pi executable path skips PATH lookup and probes its version", a
   ]);
 });
 
-test("configured Pi executable reports unknown version when the version probe fails", async () => {
+test("configured Pi executable reports unavailable with configured-executable-failed when the version probe fails", async () => {
   const fake = queuedRunner([result("", "cannot execute", 126)]);
   const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake), "/opt/broken/pi");
 
   const probe = await locator.locate("Ubuntu");
 
-  assert.equal(probe.available, true);
-  if (probe.available) {
-    assert.equal(probe.executable, "/opt/broken/pi");
+  assert.equal(probe.available, false);
+  if (!probe.available && probe.reason === "configured-executable-failed") {
+    assert.equal(probe.executable, null);
     assert.equal(probe.version, null);
     assert.equal(probe.versionResult.exitCode, 126);
+    assert.equal(probe.versionResult.stderr, "cannot execute");
+    assert.deepEqual(probe.versionResult.command, { executable: "/opt/broken/pi", args: ["--version"] });
   }
   assert.equal(fake.calls.length, 1);
 });
@@ -280,7 +313,13 @@ test("configured Pi executable reports unknown version when the version probe fa
 test("falls back to a profile-aware lookup when the non-login lookup fails", async () => {
   const fake = queuedRunner([
     result("", "sh: command not found", 1),
-    result("/home/user/.nvm/versions/node/v22/bin/pi\n"),
+    result(
+      "Welcome to Ubuntu 24.04 LTS\n" +
+        "/usr/bin/echo\n" + // decoy: path-like line from profile output
+        `${PI_LOOKUP_MARKER}/home/user/.nvm/versions/node/v22/bin/pi\n` +
+        "  System information as of Mon Aug 25 2026\n",
+      "",
+    ),
     result("pi 3.0.0\n", ""),
   ]);
   const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake));
@@ -293,16 +332,16 @@ test("falls back to a profile-aware lookup when the non-login lookup fails", asy
     assert.equal(probe.version, "pi 3.0.0");
   }
   assert.deepEqual(fake.calls.map((call) => call.args), [
-    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", "command -v pi"],
-    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", "command -v pi"],
+    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", PI_LOOKUP_SCRIPT],
     ["--distribution", "Ubuntu", "--exec", "/home/user/.nvm/versions/node/v22/bin/pi", "--version"],
   ]);
 });
 
 test("falls back to a profile-aware lookup when the non-login lookup returns no path", async () => {
   const fake = queuedRunner([
-    result("\n", ""),
-    result("/opt/fnm/aliases/default/bin/pi\n"),
+    result(`${PI_LOOKUP_MARKER}\n`, ""),
+    result(`${PI_LOOKUP_MARKER}/opt/fnm/aliases/default/bin/pi\n`),
     result("pi 0.9.0\n", ""),
   ]);
   const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake));
@@ -315,30 +354,90 @@ test("falls back to a profile-aware lookup when the non-login lookup returns no 
     assert.equal(probe.version, "pi 0.9.0");
   }
   assert.deepEqual(fake.calls.map((call) => call.args), [
-    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", "command -v pi"],
-    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", "command -v pi"],
+    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", PI_LOOKUP_SCRIPT],
     ["--distribution", "Ubuntu", "--exec", "/opt/fnm/aliases/default/bin/pi", "--version"],
   ]);
 });
 
-test("reports lookup-failed when both the non-login and login lookups fail", async () => {
+test("falls back to an interactive login lookup for profile-initialized PATHs", async () => {
   const fake = queuedRunner([
-    result("", "sh: unavailable", 2),
-    result("", "bash: unavailable", 2),
+    result(`${PI_LOOKUP_MARKER}\n`, ""), // non-login lookup: no path
+    result("", "bash: pi: command not found", 1), // login lookup fails
+    result(
+      "Last login: Mon Aug 25 09:00:00 2026\n" +
+        "/usr/bin/echo\n" + // decoy: path-like line from profile output
+        `${PI_LOOKUP_MARKER}/home/user/.fnm/node-versions/v20.11.0/installation/bin/pi\n` +
+        "  System information as of Mon Aug 25 2026\n",
+      "bash: cannot set terminal process group (-1, 9)\n",
+    ),
+    result("pi 4.2.0\n", ""),
+  ]);
+  const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake));
+
+  const probe = await locator.locate("Ubuntu");
+
+  assert.equal(probe.available, true);
+  if (probe.available) {
+    assert.equal(probe.executable, "/home/user/.fnm/node-versions/v20.11.0/installation/bin/pi");
+    assert.equal(probe.version, "pi 4.2.0");
+  }
+  assert.deepEqual(fake.calls.map((call) => call.args), [
+    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-i", "-c", PI_LOOKUP_SCRIPT],
+    [
+      "--distribution",
+      "Ubuntu",
+      "--exec",
+      "/home/user/.fnm/node-versions/v20.11.0/installation/bin/pi",
+      "--version",
+    ],
+  ]);
+});
+
+test("reports an auto-discovered executable unavailable when its version probe fails", async () => {
+  const fake = queuedRunner([
+    result(`${PI_LOOKUP_MARKER}/usr/local/bin/pi\n`),
+    result("", "cannot execute: Exec format error", 126),
   ]);
   const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake));
 
   const probe = await locator.locate("Ubuntu");
 
   assert.equal(probe.available, false);
-  if (!probe.available) {
-    assert.equal(probe.reason, "lookup-failed");
-    assert.equal(probe.lookupResult.exitCode, 2);
-    assert.equal(probe.lookupResult.stderr, "bash: unavailable");
+  if (!probe.available && probe.reason === "executable-version-failed") {
+    assert.equal(probe.executable, null);
+    assert.equal(probe.version, null);
+    assert.equal(probe.versionResult.exitCode, 126);
+    assert.equal(probe.versionResult.stderr, "cannot execute: Exec format error");
+    assert.deepEqual(probe.versionResult.command, { executable: "/usr/local/bin/pi", args: ["--version"] });
   }
   assert.deepEqual(fake.calls.map((call) => call.args), [
-    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", "command -v pi"],
-    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", "command -v pi"],
+    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/usr/local/bin/pi", "--version"],
+  ]);
+});
+
+test("reports lookup-failed when every lookup fails", async () => {
+  const fake = queuedRunner([
+    result("", "sh: unavailable", 2),
+    result("", "bash: unavailable", 2),
+    result("", "bash: interactive shell unavailable", 2),
+  ]);
+  const locator = new DefaultPiExecutableLocator(fakeRunInDistribution(fake));
+
+  const probe = await locator.locate("Ubuntu");
+
+  assert.equal(probe.available, false);
+  if (!probe.available && probe.reason === "lookup-failed") {
+    assert.equal(probe.lookupResult.exitCode, 2);
+    assert.equal(probe.lookupResult.stderr, "bash: interactive shell unavailable");
+  }
+  assert.deepEqual(fake.calls.map((call) => call.args), [
+    ["--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-c", PI_LOOKUP_SCRIPT],
+    ["--distribution", "Ubuntu", "--exec", "/bin/bash", "-l", "-i", "-c", PI_LOOKUP_SCRIPT],
   ]);
 });
 
