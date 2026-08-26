@@ -53,6 +53,7 @@ button:focus-visible {
 .page-heading,
 .hero-footer,
 .text-button,
+.warning-banner,
 .error-banner {
   display: flex;
   align-items: center;
@@ -515,6 +516,18 @@ p {
   border-radius: 10px;
   color: #f1c1c1;
   background: rgba(110, 42, 52, 0.25);
+  font-size: 12px;
+}
+
+.warning-banner {
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+  padding: 12px 15px;
+  border: 1px solid rgba(219, 196, 138, 0.26);
+  border-radius: 10px;
+  color: #ddcc9f;
+  background: rgba(219, 196, 138, 0.08);
   font-size: 12px;
 }
 
