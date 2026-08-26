@@ -323,6 +323,31 @@ test("a failed switch_session degrades softly to new_session", async () => {
   assert.equal(manager.state, "ready");
   assert.equal(manager.snapshot.lastError, null);
 });
+test("strict reconnect rejects a cancelled switch without creating a new session", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ cancelled: true });
+  const manager = new SessionManager({
+    client,
+    sessionId: "pi-session-old",
+    sessionFile: "/sessions/old",
+    lastEntryId: "entry-old",
+  });
+
+  await assert.rejects(
+    manager.openSession("/sessions/old", { force: true, fallbackToNewSession: false }),
+    (error: unknown) => {
+      assert.ok(error instanceof SessionManagerError);
+      assert.equal(error.code, "SESSION_NOT_RESUMED");
+      return true;
+    },
+  );
+  assert.deepEqual(client.commands, [
+    { type: "switch_session", sessionPath: "/sessions/old" },
+  ]);
+  assert.equal(manager.sessionId, "pi-session-old");
+  assert.equal(manager.lastSeenEntryId, "entry-old");
+});
+
 
 test("a cancelled switch_session with a stale persisted cursor clears identity before fresh catch-up", async () => {
   const client = new FakePiRpcClient();

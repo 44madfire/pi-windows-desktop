@@ -141,6 +141,12 @@ export interface SessionOpenOptions {
    * persisted session file again before history catch-up.
    */
   readonly force?: boolean;
+  /**
+   * Permit a failed/cancelled switch_session to create a fresh session.
+   * Initial startup permits this by default; reconnect callers disable it so
+   * an old conversation cannot be paired with a new Pi session.
+   */
+  readonly fallbackToNewSession?: boolean;
 }
 
 export interface SessionForkResult {
@@ -156,7 +162,8 @@ export type SessionManagerErrorCode =
   | "INVALID_ENTRY_ID"
   | "INVALID_COMMAND"
   | "INVALID_RESPONSE"
-  | "RPC_FAILURE";
+  | "RPC_FAILURE"
+  | "SESSION_NOT_RESUMED";
 
 export class SessionManagerError extends Error {
   readonly code: SessionManagerErrorCode;
@@ -551,11 +558,13 @@ export class SessionManager {
    * Open the Pi-owned session and read its authoritative identity.
    *
    * Handshake: when a persisted session file is supplied, `switch_session` is
-   * tried first; a cancellation (`cancelled: true`) or any failure degrades
-   * softly to `new_session`. The successful open is always followed by
-   * `get_state`, whose `sessionFile` (falling back to `sessionId`) is the
-   * authoritative session identity. Pi owns the session file; the caller
-   * persists only this pointer.
+   * tried first. By default, cancellation (`cancelled: true`) or any failure
+   * degrades softly to `new_session`; callers may set
+   * `fallbackToNewSession: false` to reject instead and preserve the old
+   * identity/cursor for strict reconnect. The successful open is always
+   * followed by `get_state`, whose `sessionFile` (falling back to `sessionId`)
+   * is the authoritative session identity. Pi owns the session file; the
+   * caller persists only this pointer.
    */
   openSession(sessionFile: string | null, options: SessionOpenOptions = {}): Promise<SessionOpenResult> {
     return this.enqueue(async () => {
@@ -577,6 +586,13 @@ export class SessionManager {
       try {
         const resumed = target !== null ? await this.trySwitchSession(client, target) : false;
         if (!resumed) {
+          if (options.fallbackToNewSession === false) {
+            throw new SessionManagerError(
+              "SESSION_NOT_RESUMED",
+              "open",
+              "Pi did not resume the existing session",
+            );
+          }
           // The persisted session could not be resumed: drop the stale
           // identity and cursor before starting a fresh session so the
           // `new_session -> get_state -> get_entries` sequence sends no
@@ -722,11 +738,12 @@ export class SessionManager {
       }
     });
   }
-
   /**
    * Attempt `switch_session` against a persisted Pi session file. Returns
-   * true when Pi accepted it; cancellation and RPC failures degrade softly to
-   * false so the caller falls back to `new_session` without failing startup.
+   * true when Pi accepted it; cancellation and RPC failures return false so
+   * the caller can choose the default fresh-session fallback or reject for a
+   * strict reconnect. The original failure is intentionally normalized here;
+   * callers that need diagnostics receive the session-level error.
    */
   private async trySwitchSession(
     client: SessionPiRpcClient,

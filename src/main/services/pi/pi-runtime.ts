@@ -24,14 +24,11 @@ export interface PiRuntimeOptions {
 }
 
 /**
- * Runtime snapshot extended with Pi session identity. The shared
- * `PiRuntimeSnapshot` carries these fields via the host IPC slice; this local
- * intersection keeps the session core self-contained either way.
+ * Runtime snapshot including Pi session identity and cursor state. The shared
+ * `PiRuntimeSnapshot` carries all fields via the host IPC slice; this local
+ * alias keeps the session core self-contained either way.
  */
-export type PiRuntimeSessionSnapshot = PiRuntimeSnapshot & {
-  readonly sessionId: string | null;
-  readonly sessionFile: string | null;
-};
+export type PiRuntimeSessionSnapshot = PiRuntimeSnapshot;
 
 /** Stable workspace key used for session pointer persistence. */
 export function sessionWorkspaceKey(workspace: WslWorkspace): string {
@@ -105,6 +102,8 @@ export class PiRuntimeController {
     workspace: null,
     piVersion: null,
     lastError: null,
+    lastSeenEntryId: null,
+    leafId: null,
     lastEntryId: null,
     sessionId: null,
     sessionFile: null,
@@ -133,20 +132,34 @@ export class PiRuntimeController {
       await this.stop();
     }
 
-    const workspaceKey = sessionWorkspaceKey(workspace);
-    const pointer = await this.loadPointer(workspaceKey);
     const sameWorkspace =
       this.snapshotValue.workspace !== null &&
       this.snapshotValue.workspace.distro === workspace.distro &&
       this.snapshotValue.workspace.linuxPath === workspace.linuxPath;
-    const previousCursor = pointer?.lastEntryId ?? (sameWorkspace ? this.snapshotValue.lastEntryId : null);
+    // A runtime whose transport died on the same workspace reuses the
+    // existing logical session and conversation through the explicit
+    // reconnect seam; a fresh start would create a second, unhandshaken
+    // conversation and lose the queue.
+    if (this.snapshotValue.state === 'disconnected' && sameWorkspace) {
+      return this.reconnect();
+    }
+
+    const workspaceKey = sessionWorkspaceKey(workspace);
+    const pointer = await this.loadPointer(workspaceKey);
+    const previousCursor = pointer?.lastEntryId ?? (sameWorkspace ? this.snapshotValue.lastSeenEntryId : null);
     const previousSessionId = pointer?.sessionId ?? (sameWorkspace ? this.snapshotValue.sessionId : null);
     const previousSessionFile = pointer?.sessionFile ?? (sameWorkspace ? this.snapshotValue.sessionFile : null);
+    // The active leaf is restored as an independent nullable field: it is
+    // never the append cursor, but a restarted runtime exposes the branch
+    // tip until the next authoritative get_entries response replaces it.
+    const previousLeafId = pointer?.leafId ?? (sameWorkspace ? this.snapshotValue.leafId : null);
     this.setSnapshot({
       state: 'starting',
       workspace,
       lastError: null,
+      lastSeenEntryId: previousCursor,
       lastEntryId: previousCursor,
+      leafId: previousLeafId,
       sessionId: previousSessionId,
       sessionFile: previousSessionFile,
       piVersion: null,
@@ -171,6 +184,7 @@ export class PiRuntimeController {
         sessionId: previousSessionId,
         sessionFile: previousSessionFile,
         lastEntryId: previousCursor,
+        leafId: previousLeafId,
         client,
       });
       this.session = session;
@@ -180,8 +194,13 @@ export class PiRuntimeController {
         // a cancelled resume must reset the runtime snapshot instead of
         // retaining stale session fields alongside a new identity.
         const patch: Partial<PiRuntimeSessionSnapshot> = {};
-        if (sessionSnapshot.lastEntryId !== this.snapshotValue.lastEntryId) {
-          patch.lastEntryId = sessionSnapshot.lastEntryId;
+        if (sessionSnapshot.lastSeenEntryId !== this.snapshotValue.lastSeenEntryId) {
+          patch.lastSeenEntryId = sessionSnapshot.lastSeenEntryId;
+          // The shared snapshot keeps lastEntryId as a compat alias.
+          patch.lastEntryId = sessionSnapshot.lastSeenEntryId;
+        }
+        if (sessionSnapshot.leafId !== this.snapshotValue.leafId) {
+          patch.leafId = sessionSnapshot.leafId;
         }
         if (sessionSnapshot.sessionId !== this.snapshotValue.sessionId) {
           patch.sessionId = sessionSnapshot.sessionId;
@@ -191,7 +210,7 @@ export class PiRuntimeController {
         }
         if (Object.keys(patch).length > 0) {
           this.setSnapshot(patch);
-          if (sessionSnapshot.lastEntryId !== null) {
+          if (sessionSnapshot.lastSeenEntryId !== null) {
             // Re-persist whenever a synchronization produces a durable cursor.
             void this.persistPointer(workspaceKey, session).catch(() => undefined);
           }
@@ -222,7 +241,9 @@ export class PiRuntimeController {
         lastError: null,
         sessionId: session.sessionId,
         sessionFile: session.sessionFile,
-        lastEntryId: session.lastEntryId,
+        lastSeenEntryId: session.lastSeenEntryId,
+        leafId: session.leafId,
+        lastEntryId: session.lastSeenEntryId,
       });
       return this.snapshot;
     } catch (error) {
@@ -242,6 +263,80 @@ export class PiRuntimeController {
       this.conversation = null;
       this.session = null;
       this.setSnapshot({ state: 'failed', lastError: errorMessage(error) });
+      throw error;
+    }
+  }
+
+  /**
+   * Reconnect the existing disconnected client/session/conversation.
+   *
+   * Replaces the Pi transport (`client.reconnect()`), then re-runs the
+   * session handshake (`switch_session` with strict resume semantics),
+   * `get_state`, catch-up from the durable append cursor (`get_entries`),
+   * conversation hydration, and pointer persistence. `ready` is published
+   * only after that handshake completes, and only then are prompts queued
+   * while disconnected resumed — no prompt is sent before the handshake.
+   *
+   * On failure the transport is closed cleanly (best-effort) but the session
+   * and conversation references are kept, so the queued conversation work
+   * and the durable cursor survive for a later retry via `reconnect()` or a
+   * same-workspace `start()`.
+   */
+  async reconnect(): Promise<PiRuntimeSnapshot> {
+    const client = this.client;
+    const session = this.session;
+    const conversation = this.conversation;
+    const workspace = this.snapshotValue.workspace;
+    if (!client || !session || !conversation || !workspace) {
+      throw new Error('Pi is not running. Start Pi before reconnecting.');
+    }
+    if (this.snapshotValue.state !== 'disconnected') {
+      throw new Error(`Cannot reconnect Pi while runtime is ${this.snapshotValue.state}`);
+    }
+
+    const workspaceKey = sessionWorkspaceKey(workspace);
+    this.setSnapshot({ state: 'starting', workspace, lastError: null });
+    try {
+      // Replace the transport. Pending requests are rejected and are not
+      // replayed: Pi may have accepted a command before the transport died.
+      await client.reconnect();
+
+      // The same logical session is reopened and caught up from the durable
+      // append cursor; no fresh session is created behind the caller's back.
+      // The handshake is forced: a replacement transport is a new Pi process
+      // that must be bound to the session file again even if the manager was
+      // already ready when the transport died.
+      await session.openSession(session.sessionFile, {
+        force: true,
+        fallbackToNewSession: false,
+      });
+      const sync = await session.synchronize();
+      conversation.hydrate(sync.entries);
+      await this.persistPointer(workspaceKey, session);
+
+      this.setSnapshot({
+        state: 'ready',
+        workspace,
+        lastError: null,
+        sessionId: session.sessionId,
+        sessionFile: session.sessionFile,
+        lastSeenEntryId: session.lastSeenEntryId,
+        leafId: session.leafId,
+        lastEntryId: session.lastSeenEntryId,
+      });
+
+      // The handshake is complete: resume prompts queued while disconnected.
+      conversation.resumeQueuedPrompts();
+      return this.snapshot;
+    } catch (error) {
+      // Terminate the transport so no Pi process leaks, while preserving the
+      // conversation queue and session cursor for a later reconnect.
+      try {
+        await client.close();
+      } catch {
+        // A cleanup failure never masks the reconnect failure.
+      }
+      this.setSnapshot({ state: 'disconnected', lastError: errorMessage(error) });
       throw error;
     }
   }
@@ -323,7 +418,10 @@ export class PiRuntimeController {
       workspace: workspaceKey,
       sessionFile: session.sessionFile,
       sessionId: session.sessionId,
-      lastEntryId: session.lastEntryId,
+      // The durable append-order cursor (compat alias lastEntryId) plus the
+      // transient active leaf; the leaf is never used as a catch-up cursor.
+      lastEntryId: session.lastSeenEntryId,
+      leafId: session.leafId,
     };
     await this.sessionStore.save(pointer);
   }
