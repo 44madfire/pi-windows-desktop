@@ -5,12 +5,13 @@ import type {
   ExtensionUiResponse,
   PiEvent,
   PiRuntimeSnapshot,
+  PiThinkingLevel,
   RuntimeInfo,
   WslDistributionInfo,
   WslProbeInfo,
 } from '../shared/ipc';
 import type { ConversationSnapshot } from '../shared/conversation';
-import { ConversationPanel } from './components/conversation';
+import { ConversationPanel, type AgentStateControl } from './components/conversation';
 import {
   ExtensionUiSurface,
   getExtensionUiNotice,
@@ -23,6 +24,11 @@ import {
 import { WorkspaceProofCard } from './components/workspace/WorkspaceProofCard';
 
 type View = 'overview' | 'conversation' | 'diagnostics';
+
+function describeAgentStateError(cause: unknown, fallback: string): string {
+  if (cause instanceof Error && cause.message.trim()) return cause.message;
+  return fallback;
+}
 
 function StatusMark({ status }: { status: DiagnosticCheck['status'] }): ReactElement {
   const symbol = status === 'pass' ? '✓' : status === 'fail' ? '!' : '•';
@@ -90,6 +96,11 @@ function App(): ReactElement {
   const [linuxPath, setLinuxPath] = useState('/home/user/src/project');
   const [probe, setProbe] = useState<WslProbeInfo | null>(null);
   const [piStatus, setPiStatus] = useState<PiRuntimeSnapshot | null>(null);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+  const [agentControlPending, setAgentControlPending] = useState<AgentStateControl | null>(null);
+  const [agentControlError, setAgentControlError] = useState<string | null>(null);
+
   const [conversation, setConversation] = useState<ConversationSnapshot>({
     timeline: [],
     executionState: 'idle',
@@ -103,6 +114,7 @@ function App(): ReactElement {
   const [extensionRespondingId, setExtensionRespondingId] = useState<string | null>(null);
   const extensionNoticeSequenceRef = useRef(0);
   const extensionNoticeTimersRef = useRef<number[]>([]);
+  const modelsRequestRef = useRef(0);
 
   const showExtensionNotice = useCallback((message: string, tone: ExtensionUiNoticeTone): void => {
     const trimmedMessage = message.trim();
@@ -155,6 +167,39 @@ function App(): ReactElement {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  const loadAvailableModels = useCallback(async (): Promise<void> => {
+    const requestId = modelsRequestRef.current + 1;
+    modelsRequestRef.current = requestId;
+    setModelsLoading(true);
+    setModelsError(null);
+
+    try {
+      const models = await window.piDesktop.getAvailableModels();
+      if (modelsRequestRef.current !== requestId) return;
+      setPiStatus((current) => (
+        current?.state === 'ready'
+          ? { ...current, availableModels: models }
+          : current
+      ));
+    } catch (cause) {
+      if (modelsRequestRef.current === requestId) {
+        setModelsError(describeAgentStateError(cause, 'Pi could not load available models.'));
+      }
+    } finally {
+      if (modelsRequestRef.current === requestId) setModelsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (piStatus?.state !== 'ready') {
+      modelsRequestRef.current += 1;
+      setModelsLoading(false);
+      setModelsError(null);
+      return;
+    }
+    void loadAvailableModels();
+  }, [loadAvailableModels, piStatus?.state]);
 
   const handlePiEvent = useCallback((event: PiEvent): void => {
     if (event.type === 'runtime') {
@@ -219,6 +264,42 @@ function App(): ReactElement {
   const stopPi = useCallback(async () => {
     setPiStatus(await window.piDesktop.stopPi());
     setConversation(await window.piDesktop.getConversation());
+  }, []);
+
+  const changeModel = useCallback(async (provider: string, modelId: string): Promise<void> => {
+    setAgentControlPending('model');
+    setAgentControlError(null);
+
+    try {
+      const model = await window.piDesktop.setModel(provider, modelId);
+      setPiStatus((current) => (
+        current?.state === 'ready'
+          ? { ...current, model }
+          : current
+      ));
+    } catch (cause) {
+      setAgentControlError(describeAgentStateError(cause, 'Pi could not change the model.'));
+    } finally {
+      setAgentControlPending((current) => current === 'model' ? null : current);
+    }
+  }, []);
+
+  const changeThinkingLevel = useCallback(async (level: PiThinkingLevel): Promise<void> => {
+    setAgentControlPending('thinking');
+    setAgentControlError(null);
+
+    try {
+      const thinkingLevel = await window.piDesktop.setThinkingLevel(level);
+      setPiStatus((current) => (
+        current?.state === 'ready'
+          ? { ...current, thinkingLevel }
+          : current
+      ));
+    } catch (cause) {
+      setAgentControlError(describeAgentStateError(cause, 'Pi could not change the thinking level.'));
+    } finally {
+      setAgentControlPending((current) => current === 'thinking' ? null : current);
+    }
   }, []);
 
   const sendPrompt = useCallback(async (prompt: string) => {
@@ -317,6 +398,20 @@ function App(): ReactElement {
             onSendPrompt={sendPrompt}
             onAbort={abortPrompt}
             isLoading={isLoading}
+            agentState={{
+              model: piStatus?.model ?? null,
+              thinkingLevel: piStatus?.thinkingLevel ?? null,
+              availableModels: piStatus?.availableModels ?? [],
+              runtimeReady: piStatus?.state === 'ready',
+              isLoadingModels: modelsLoading,
+              pendingControl: agentControlPending,
+              error: agentControlError ?? modelsError,
+              onRetryModels: modelsError || (piStatus?.state === 'ready' && piStatus.availableModels?.length === 0)
+                ? loadAvailableModels
+                : undefined,
+              onSetModel: changeModel,
+              onSetThinkingLevel: changeThinkingLevel,
+            }}
           />
         ) : view === 'overview' ? (
           <div className="overview-layout">
