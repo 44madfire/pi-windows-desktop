@@ -283,6 +283,26 @@ test(
       assert.equal(typeof stateData.sessionId, "string");
       assert.ok((stateData.sessionId as string).length > 0);
 
+      // M1 agent-state projection: when the process reports a model or
+      // thinking level, the shape must match the projection contract; a
+      // session-less `--no-session` process may legitimately report either
+      // as null/absent, and the shell must never fabricate state.
+      if (stateData.model !== undefined && stateData.model !== null) {
+        assert.ok(stateData.model !== null && typeof stateData.model === "object");
+        const model = stateData.model as Record<string, unknown>;
+        assert.equal(typeof model.id, "string");
+        assert.ok((model.id as string).length > 0);
+        assert.equal(typeof model.provider, "string");
+        assert.ok((model.provider as string).length > 0);
+        if (model.name !== undefined) {
+          assert.equal(typeof model.name, "string");
+        }
+      }
+      if (stateData.thinkingLevel !== undefined && stateData.thinkingLevel !== null) {
+        assert.equal(typeof stateData.thinkingLevel, "string");
+        assert.ok((stateData.thinkingLevel as string).length > 0);
+      }
+
       const entries = await client.request({ type: "get_entries" });
       assert.equal(entries.type, "response");
       assert.equal(entries.command, "get_entries");
@@ -325,6 +345,40 @@ test(
           assert.ok((event.id as string).length > 0);
           assert.equal(typeof event.method, "string");
           assert.ok((event.method as string).length > 0);
+        }
+      }
+    } finally {
+      await client.close();
+    }
+  },
+);
+
+test(
+  "live pi RPC answers get_available_models with an authoritative models array",
+  { skip, timeout: TEST_TIMEOUT_MS },
+  async () => {
+    // Model listing is a non-LLM catalog query: it must answer without
+    // credentials, pinning the shape `data.models` of `{id, provider, name?}`
+    // records the shell's selector depends on.
+    const client = new LivePiRpcClient(PI_RPC_BIN);
+    try {
+      const response = await client.request({ type: "get_available_models" });
+      assert.equal(response.type, "response");
+      assert.equal(response.command, "get_available_models");
+      assert.equal(response.success, true);
+      assert.ok(Number.isFinite(response.id));
+      assert.ok(response.data !== null && typeof response.data === "object");
+      const data = response.data as Record<string, unknown>;
+      assert.ok(Array.isArray(data.models));
+      const models = data.models as Array<Record<string, unknown>>;
+      for (const model of models) {
+        assert.ok(model !== null && typeof model === "object");
+        assert.equal(typeof model.id, "string");
+        assert.ok((model.id as string).length > 0);
+        assert.equal(typeof model.provider, "string");
+        assert.ok((model.provider as string).length > 0);
+        if (model.name !== undefined) {
+          assert.equal(typeof model.name, "string");
         }
       }
     } finally {
