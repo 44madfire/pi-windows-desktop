@@ -19,6 +19,114 @@
   padding: 22px 26px 20px;
   border-bottom: 1px solid rgba(167, 191, 222, 0.11);
 }
+.conversation-header-main {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: flex-end;
+  gap: 22px;
+}
+
+.agent-state-controls {
+  display: grid;
+  min-width: 300px;
+  flex: 1;
+  gap: 7px;
+}
+
+.agent-state-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(108px, 0.8fr);
+  gap: 9px;
+}
+
+.agent-state-field {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.agent-state-label {
+  overflow: hidden;
+  color: #7f8fa4;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.agent-state-select {
+  width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(167, 191, 222, 0.18);
+  border-radius: 8px;
+  outline: none;
+  color: #dce7f4;
+  background: rgba(8, 13, 20, 0.62);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.agent-state-select:focus-visible {
+  border-color: rgba(126, 212, 199, 0.7);
+  box-shadow: 0 0 0 3px rgba(126, 212, 199, 0.08);
+}
+
+.agent-state-select:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.agent-state-feedback {
+  display: flex;
+  min-height: 15px;
+  align-items: center;
+  gap: 6px;
+  color: #718197;
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.agent-state-feedback-error {
+  color: #f1bcbc;
+}
+
+.agent-state-feedback-icon {
+  display: grid;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 50%;
+  color: #8fb4b0;
+  background: rgba(112, 210, 190, 0.12);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.agent-state-feedback-error .agent-state-feedback-icon {
+  color: #f8dede;
+  background: rgba(241, 167, 167, 0.14);
+}
+
+.agent-state-retry {
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  color: #f6d8d8;
+  background: transparent;
+  cursor: pointer;
+  font-size: 10px;
+  text-decoration: underline;
+}
+
+.agent-state-retry:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
 
 .conversation-eyebrow {
   margin: 0 0 5px;
@@ -628,6 +736,18 @@
     flex-direction: column;
     gap: 10px;
   }
+  .conversation-header-main {
+    width: 100%;
+    align-items: stretch;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .agent-state-controls {
+    width: 100%;
+    min-width: 0;
+  }
+
 
   .conversation-message {
     max-width: 94%;

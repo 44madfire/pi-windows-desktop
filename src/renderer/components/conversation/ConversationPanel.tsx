@@ -7,6 +7,8 @@ import {
   type KeyboardEvent,
   type ReactElement,
 } from 'react';
+import { PI_THINKING_LEVELS, type PiModel, type PiThinkingLevel } from '../../../shared/ipc';
+
 import './ConversationPanel.css';
 
 export type ConversationExecutionState =
@@ -63,6 +65,21 @@ export type ConversationTimelineRecord =
   | ConversationToolRecord
   | ConversationBashRecord;
 
+export type AgentStateControl = 'model' | 'thinking';
+
+export type AgentStateSelectorProps = {
+  model: PiModel | null;
+  thinkingLevel: PiThinkingLevel | null;
+  availableModels: readonly PiModel[];
+  runtimeReady: boolean;
+  isLoadingModels: boolean;
+  pendingControl: AgentStateControl | null;
+  error: string | null;
+  onRetryModels?: () => void | Promise<void>;
+  onSetModel: (provider: string, modelId: string) => void | Promise<void>;
+  onSetThinkingLevel: (level: PiThinkingLevel) => void | Promise<void>;
+};
+
 export type ConversationPanelProps = {
   timeline: readonly ConversationTimelineRecord[];
   executionState: ConversationExecutionState;
@@ -75,9 +92,161 @@ export type ConversationPanelProps = {
   isLoading?: boolean;
   /** A host/session error to announce above the timeline. */
   error?: string | null;
+  /** Agent state selectors shown in the conversation header. */
+  agentState?: AgentStateSelectorProps;
   title?: string;
   placeholder?: string;
 };
+
+const THINKING_LEVEL_LABELS: Record<PiThinkingLevel, string> = {
+  off: 'Off',
+  minimal: 'Minimal',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'Extra high',
+  max: 'Maximum',
+};
+
+function modelOptionValue(model: PiModel): string {
+  return JSON.stringify([model.provider, model.id]);
+}
+
+function modelOptionLabel(model: PiModel): string {
+  const name = model.name?.trim();
+  return name ? `${name} · ${model.provider}` : `${model.id} · ${model.provider}`;
+}
+
+function AgentStateSelectors({
+  model,
+  thinkingLevel,
+  availableModels,
+  runtimeReady,
+  isLoadingModels,
+  pendingControl,
+  error,
+  onRetryModels,
+  onSetModel,
+  onSetThinkingLevel,
+}: AgentStateSelectorProps): ReactElement {
+  const feedbackId = useId();
+  const modelOptions =
+    model && !availableModels.some((availableModel) => modelOptionValue(availableModel) === modelOptionValue(model))
+      ? [...availableModels, model]
+      : availableModels;
+  const modelValue = model ? modelOptionValue(model) : '';
+  const modelPlaceholder = isLoadingModels
+    ? 'Loading models…'
+    : !runtimeReady
+      ? 'Start Pi to choose'
+      : modelOptions.length === 0
+        ? 'No models available'
+        : model
+          ? 'Current model unavailable'
+          : 'Choose a model';
+  const feedback = error
+    ? error
+    : pendingControl === 'model'
+      ? 'Updating model…'
+      : pendingControl === 'thinking'
+        ? 'Updating thinking level…'
+        : isLoadingModels
+          ? 'Loading available models…'
+          : !runtimeReady
+            ? 'Start Pi to adjust agent state.'
+            : availableModels.length === 0
+              ? 'Pi did not report any available models.'
+              : null;
+  const modelDisabled =
+    !runtimeReady || isLoadingModels || pendingControl !== null || availableModels.length === 0;
+  const thinkingDisabled = !runtimeReady || pendingControl !== null || thinkingLevel === null;
+
+  return (
+    <div className="agent-state-controls" aria-busy={isLoadingModels || pendingControl !== null}>
+      <div className="agent-state-fields">
+        <label className="agent-state-field" htmlFor={`${feedbackId}-model`}>
+          <span className="agent-state-label">Model</span>
+          <select
+            id={`${feedbackId}-model`}
+            className="agent-state-select"
+            value={modelValue}
+            onChange={(event) => {
+              const selectedModel = modelOptions.find(
+                (availableModel) => modelOptionValue(availableModel) === event.target.value,
+              );
+              if (!selectedModel) return;
+              void Promise.resolve(onSetModel(selectedModel.provider, selectedModel.id)).catch(() => {
+                // The parent owns the visible command error state.
+              });
+            }}
+            disabled={modelDisabled}
+            aria-describedby={feedback ? feedbackId : undefined}
+          >
+            <option value="" disabled>{modelPlaceholder}</option>
+            {modelOptions.map((availableModel) => (
+              <option key={modelOptionValue(availableModel)} value={modelOptionValue(availableModel)}>
+                {modelOptionLabel(availableModel)}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="agent-state-field" htmlFor={`${feedbackId}-thinking`}>
+          <span className="agent-state-label">Thinking</span>
+          <select
+            id={`${feedbackId}-thinking`}
+            className="agent-state-select"
+            value={thinkingLevel ?? ''}
+            onChange={(event) => {
+              const level = event.target.value as PiThinkingLevel;
+              if (!level) return;
+              void Promise.resolve(onSetThinkingLevel(level)).catch(() => {
+                // The parent owns the visible command error state.
+              });
+            }}
+            disabled={thinkingDisabled}
+            aria-describedby={feedback ? feedbackId : undefined}
+          >
+            <option value="" disabled>
+              {thinkingLevel === null ? 'Unavailable' : 'Select level'}
+            </option>
+            {PI_THINKING_LEVELS.map((level) => (
+              <option key={level} value={level}>{THINKING_LEVEL_LABELS[level]}</option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      {feedback && (
+        <div
+          className={error ? 'agent-state-feedback agent-state-feedback-error' : 'agent-state-feedback'}
+          id={feedbackId}
+          role={error ? 'alert' : 'status'}
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          <span className="agent-state-feedback-icon" aria-hidden="true">{error ? '!' : '•'}</span>
+          <span>{feedback}</span>
+          {error && onRetryModels && (
+            <button
+              className="agent-state-retry"
+              type="button"
+              onClick={() => {
+                void Promise.resolve(onRetryModels()).catch(() => {
+                  // The parent owns the visible model-loading error state.
+                });
+              }}
+              disabled={isLoadingModels || pendingControl !== null}
+            >
+              Try again
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 
 const EXECUTING_STATES: ReadonlySet<ConversationExecutionState> = new Set([
   'starting',
@@ -281,6 +450,7 @@ function ConversationPanel({
   streamingText,
   isLoading = false,
   error = null,
+  agentState,
   title = 'Conversation',
   placeholder = 'Ask Pi to make a change…',
 }: ConversationPanelProps): ReactElement {
@@ -328,16 +498,18 @@ function ConversationPanel({
       aria-labelledby={titleId}
     >
       <header className="conversation-header">
-        <div>
-          <p className="conversation-eyebrow">M1 · session</p>
-          <h2 id={titleId}>{title}</h2>
+        <div className="conversation-header-main">
+          <div>
+            <p className="conversation-eyebrow">M1 · session</p>
+            <h2 id={titleId}>{title}</h2>
+          </div>
+          {agentState && <AgentStateSelectors {...agentState} />}
         </div>
         <div className="conversation-header-status" role="status" aria-live="polite" aria-atomic="true">
           <span className={`conversation-execution-dot conversation-execution-dot-${executionState}`} aria-hidden="true" />
           <span>{statusLabel}</span>
         </div>
       </header>
-
       {error && (
         <div className="conversation-error" id={errorId} role="alert">
           <span className="conversation-error-icon" aria-hidden="true">!</span>
