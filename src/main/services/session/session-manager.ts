@@ -10,6 +10,7 @@ import type {
   PiRpcEvent,
   PiRpcSuccessResponse,
 } from "../pi/protocol.ts";
+import { PiRpcCommandError } from "../pi/errors.ts";
 
 export type {
   JsonValue,
@@ -131,6 +132,13 @@ export interface SessionSynchronizationResult {
   readonly sessionId: string | null;
   /** The durable cursor the replay was requested from; null = full history. */
   readonly requestedAfter: SessionCursor;
+  /**
+   * The durable append cursor held before this synchronization — the request
+   * start before any stale-cursor retry. After a full-history retry it
+   * differs from `requestedAfter` (which then reports the retried null
+   * cursor); the response re-anchors `lastSeenEntryId` from its entries as
+   * usual.
+   */
   readonly previousLastEntryId: SessionCursor;
   /**
    * Durable append-order cursor: the last entry id observed in the response
@@ -480,6 +488,32 @@ function isCancelled(response: PiRpcSuccessResponse): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Pi answers `get_entries` with a stale or unknown `since` cursor by failing
+ * the command (`success: false`) with "Entry not found: <cursor>" — the only
+ * get_entries failure path in Pi's RPC implementation. The matcher accepts
+ * that authoritative wording plus explicit cursor/entry failure phrasing
+ * ("unknown/invalid/stale/missing entry or cursor"), and never matches
+ * transport, protocol, timeout, or closed errors (none of those is a
+ * `PiRpcCommandError`) or command failures for other commands.
+ */
+const STALE_CURSOR_FAILURE_PATTERN =
+  /\bentry not found\b|\b(?:since|cursor|entry)\b[^.!?]{0,80}\b(?:not found|unknown|invalid|stale|missing|unrecognized|does not exist|doesn'?t exist|no such)\b|\b(?:unknown|invalid|stale|missing|unrecognized)\b[^.!?]{0,80}\b(?:since|cursor|entry)\b/i;
+
+/**
+ * True only for a genuine Pi command failure of the synchronize command
+ * (`get_entries`) whose error text clearly indicates a stale or unknown
+ * `since` cursor. Transport failures (rejected before the command reaches
+ * Pi), protocol/timeout errors, and unrelated command failures never match,
+ * so only the cursor-recovery retry is gated on this classification.
+ */
+function isStaleCursorFailure(error: unknown): boolean {
+  if (!(error instanceof PiRpcCommandError)) return false;
+  if (error.command !== "get_entries") return false;
+  const text = typeof error.response.error === "string" ? error.response.error : error.message;
+  return STALE_CURSOR_FAILURE_PATTERN.test(text);
 }
 
 function validateCommand(command: PiRpcCommand, operation: string): PiRpcCommand {
@@ -1322,14 +1356,24 @@ export class SessionManager {
       requestedSince === undefined ? this.lastSeenEntryIdValue : requestedSince;
     this.setState("synchronizing");
 
-    return this.request(
-      client,
-      validateCommand(
-        this.commands.synchronize(this.sessionIdValue, previousLastEntryId),
-        "synchronize",
-      ),
-      "synchronize",
-    )
+    // A stale/unknown `since` cursor is a genuine Pi command failure
+    // ("Entry not found: <cursor>"), never a transport problem: retry exactly
+    // once with the full entry list (no `since` cursor). The retry runs
+    // before any failure state is published — the session stays
+    // "synchronizing", hydration stays idempotent, and the full response
+    // re-anchors the durable cursor as usual. Transport failures and
+    // unrelated command failures fall through to the disconnected path
+    // unchanged, and a first attempt that was already full-history is never
+    // duplicated.
+    let requestedAfter = previousLastEntryId;
+    return this.synchronizeRequest(client, operation, previousLastEntryId)
+      .catch((error: unknown) => {
+        if (previousLastEntryId === null || !isStaleCursorFailure(error)) {
+          throw error;
+        }
+        requestedAfter = null;
+        return this.synchronizeRequest(client, operation, null);
+      })
       .then((response) => {
         const entries = readEntries(response.data);
         // Identity/cursor handling is preserved for the legitimate
@@ -1340,7 +1384,7 @@ export class SessionManager {
         this.setState("ready");
         return {
           sessionId: this.sessionIdValue,
-          requestedAfter: previousLastEntryId,
+          requestedAfter,
           previousLastEntryId,
           lastSeenEntryId: this.lastSeenEntryIdValue,
           leafId: this.leafIdValue,
@@ -1352,6 +1396,19 @@ export class SessionManager {
       .catch((error: unknown) => {
         throw this.fail(operation, error, "disconnected");
       });
+  }
+
+  /** Issue one synchronize command; shared by the attempt and its full-history retry. */
+  private synchronizeRequest(
+    client: SessionPiRpcClient,
+    operation: "resume" | "reconnect" | "synchronize",
+    cursor: SessionCursor,
+  ): Promise<PiRpcSuccessResponse> {
+    return this.request(
+      client,
+      validateCommand(this.commands.synchronize(this.sessionIdValue, cursor), "synchronize"),
+      "synchronize",
+    );
   }
 
   private applyResponseMetadata(
