@@ -667,6 +667,202 @@ test('hydrate marks failed tool results and skips unknown roles', () => {
   assert.equal(tool.type === 'tool' ? tool.output : '', 'exit 1');
 });
 
+const flushMicrotasks = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+test('reconcile matches live records to authoritative entries without duplicating history', async () => {
+  const mock = createClient();
+  const controller = new ConversationController(mock.client);
+  const prompt = controller.sendPrompt('Inspect the project');
+  mock.resolvePrompt();
+  await prompt;
+  mock.emit({ type: 'message_start', message: { id: 'msg-1', role: 'assistant', content: [] } });
+  mock.emit({
+    type: 'message_end',
+    message: { id: 'msg-1', role: 'assistant', content: [{ type: 'text', text: 'Done' }] },
+  });
+  mock.emit({ type: 'agent_settled' });
+
+  const before = controller.snapshot.timeline.filter((record) => record.type === 'message');
+  assert.equal(before.length, 2);
+
+  // Pi's authoritative history for the settled turn arrives on the next
+  // get_entries; the live user/assistant records already represent it.
+  const entries = [
+    {
+      type: 'message',
+      id: 'user-1',
+      parentId: null,
+      timestamp: '2026-01-01T00:00:00.000Z',
+      message: { role: 'user', content: 'Inspect the project' },
+    },
+    {
+      type: 'message',
+      id: 'assistant-1',
+      parentId: 'user-1',
+      timestamp: '2026-01-01T00:00:01.000Z',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'Done' }] },
+    },
+  ];
+  controller.hydrate(entries);
+  // A replay of the same authoritative history (a second synchronize, a
+  // reconnection) must be equally idempotent.
+  controller.hydrate(entries);
+
+  const messages = controller.snapshot.timeline.filter((record) => record.type === 'message');
+  assert.equal(messages.length, 2, 'live user/assistant records must not be duplicated by authoritative entries');
+  assert.equal(messages.filter((record) => record.role === 'user').length, 1);
+  assert.equal(messages.filter((record) => record.role === 'assistant').length, 1);
+
+  // Genuinely new history still appends after reconciliation.
+  controller.hydrate([
+    {
+      type: 'message',
+      id: 'user-2',
+      parentId: null,
+      timestamp: '2026-01-01T00:00:02.000Z',
+      message: { role: 'user', content: 'next' },
+    },
+  ]);
+  const after = controller.snapshot.timeline.filter((record) => record.type === 'message');
+  assert.equal(after.length, 3);
+  assert.equal(after[2].type === 'message' ? after[2].content : '', 'next');
+});
+
+test('reconcile matches live tool records by stable tool identity', async () => {
+  const mock = createClient();
+  const controller = new ConversationController(mock.client);
+  const prompt = controller.sendPrompt('run pwd');
+  mock.resolvePrompt();
+  await prompt;
+  // Legacy-shaped tool events without a Pi toolCallId create a local id.
+  mock.emit({ type: 'tool_execution_start', toolName: 'bash', command: 'pwd' });
+  mock.emit({ type: 'tool_execution_end', toolName: 'bash', command: 'pwd', output: '/home/pi', exitCode: 0 });
+  mock.emit({ type: 'agent_settled' });
+  const liveBash = controller.snapshot.timeline.find((record) => record.type === 'bash');
+  assert.ok(liveBash && liveBash.type === 'bash' && liveBash.id.startsWith('conversation-'));
+
+  controller.hydrate([
+    {
+      type: 'message',
+      id: 'user-1',
+      parentId: null,
+      timestamp: '2026-01-01T00:00:00.000Z',
+      message: { role: 'user', content: 'run pwd' },
+    },
+    {
+      type: 'message',
+      id: 'assistant-1',
+      parentId: 'user-1',
+      timestamp: '2026-01-01T00:00:01.000Z',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'toolCall', id: 'tool-1', name: 'bash', arguments: { command: 'pwd' } }],
+      },
+    },
+    {
+      type: 'message',
+      id: 'result-1',
+      parentId: 'assistant-1',
+      timestamp: '2026-01-01T00:00:02.000Z',
+      message: {
+        role: 'toolResult',
+        toolCallId: 'tool-1',
+        toolName: 'bash',
+        content: [{ type: 'text', text: '/home/pi' }],
+      },
+    },
+  ]);
+
+  assert.equal(controller.snapshot.timeline.length, 2);
+  assert.equal(controller.snapshot.timeline.filter((record) => record.type === 'bash').length, 1);
+  assert.equal(controller.snapshot.timeline.filter((record) => record.type === 'message').length, 1);
+});
+
+test('a settle hook synchronizes before the next queued prompt dispatches', async () => {
+  const mock = createClient();
+  let settleCalls = 0;
+  const controller = new ConversationController(mock.client, {
+    onSettle: async () => {
+      settleCalls += 1;
+      // The runtime handshake: get_entries returns the settled turn's
+      // authoritative entry, which the live user record already represents.
+      controller.hydrate([
+        {
+          type: 'message',
+          id: 'user-1',
+          parentId: null,
+          timestamp: '2026-01-01T00:00:00.000Z',
+          message: { role: 'user', content: 'first' },
+        },
+      ]);
+    },
+  });
+  void controller.sendPrompt('first');
+  await controller.sendPrompt('second');
+  assert.equal(controller.snapshot.queuedPromptCount, 1);
+  mock.resolvePrompt();
+  assert.equal(mock.calls.length, 1);
+
+  // agent_settled completes the turn; the queued prompt must not dispatch
+  // before the settle hook ran and reconciled the authoritative entry.
+  mock.emit({ type: 'agent_settled' });
+  assert.equal(settleCalls, 1);
+  assert.equal(
+    mock.calls.filter((call) => call.type === 'prompt').length,
+    1,
+    'no prompt may dispatch before the settle hook resolved',
+  );
+  assert.equal(
+    controller.snapshot.timeline.filter((record) => record.type === 'message' && record.content === 'first').length,
+    1,
+    'the authoritative user entry reconciled, not duplicated',
+  );
+  assert.equal(controller.snapshot.queuedPromptCount, 1);
+
+  // The hook resolved: the queued prompt dispatches now.
+  await flushMicrotasks();
+  assert.equal(mock.calls.filter((call) => call.type === 'prompt')[1]?.message, 'second');
+  assert.equal(controller.snapshot.queuedPromptCount, 0);
+  mock.resolvePrompt();
+  mock.emit({ type: 'agent_settled' });
+  assert.equal(settleCalls, 2);
+  await flushMicrotasks();
+  assert.equal(controller.snapshot.executionState, 'idle');
+});
+
+test('a rejected settle hook pauses the queue with a visible error state', async () => {
+  const mock = createClient();
+  const controller = new ConversationController(mock.client, {
+    onSettle: async () => {
+      throw new Error('get_entries failed');
+    },
+  });
+  void controller.sendPrompt('first');
+  await controller.sendPrompt('second');
+  mock.resolvePrompt();
+  assert.equal(mock.calls.filter((call) => call.type === 'prompt').length, 1);
+
+  mock.emit({ type: 'agent_settled' });
+  await flushMicrotasks();
+
+  // The failed post-settled sync leaves the queue paused with a visible
+  // error; the reconnect handshake is the recovery seam.
+  assert.equal(controller.snapshot.executionState, 'error');
+  assert.match(controller.snapshot.error ?? '', /get_entries failed/);
+  assert.equal(controller.snapshot.queuedPromptCount, 1);
+  assert.equal(mock.calls.filter((call) => call.type === 'prompt').length, 1);
+
+  controller.resumeQueuedPrompts();
+  assert.equal(mock.calls.filter((call) => call.type === 'prompt')[1]?.message, 'second');
+  assert.equal(controller.snapshot.queuedPromptCount, 0);
+  mock.resolvePrompt();
+  // The resumed turn settles; the hook still fails, so the error state is
+  // republished and the (now empty) queue stays paused.
+  mock.emit({ type: 'agent_settled' });
+  await flushMicrotasks();
+  assert.equal(controller.snapshot.executionState, 'error');
+});
+
 test('hydrate reads current Pi toolCall blocks (id/name/arguments) and attaches result output/status', () => {
   const mock = createClient();
   const controller = new ConversationController(mock.client);
