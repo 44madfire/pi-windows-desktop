@@ -7,6 +7,7 @@ type Event = { type: string; [key: string]: unknown };
 
 function createClient(): {
   client: PiRpcClient;
+  setState: (state: 'idle' | 'ready' | 'disconnected') => void;
   emit: (event: Event) => void;
   emitError: (error: Error) => void;
   calls: Array<{ type: string; message?: string }>;
@@ -21,6 +22,7 @@ function createClient(): {
   let resolvePrompt!: () => void;
   let rejectPrompt!: (error: Error) => void;
   const client = {
+    state: 'idle',
     onEvent(listener: (event: Event) => void) {
       eventListeners.add(listener);
       return () => eventListeners.delete(listener);
@@ -42,8 +44,12 @@ function createClient(): {
       return Promise.resolve({ type: 'response', success: true, id: 'test' });
     },
   } as unknown as PiRpcClient;
+  const mutableClient = client as unknown as { state: 'idle' | 'ready' | 'disconnected' };
   return {
     client,
+    setState: (state) => {
+      mutableClient.state = state;
+    },
     emit: (event) => eventListeners.forEach((listener) => listener(event)),
     emitError: (error) => errorListeners.forEach((listener) => listener(error)),
     calls,
@@ -323,8 +329,18 @@ test('transport failure while streaming fails the turn and leaves a recoverable 
   const assistantRecords = controller.snapshot.timeline.filter((record) => record.type === 'message' && record.role === 'assistant');
   const lastAssistant = assistantRecords[assistantRecords.length - 1];
   assert.equal(lastAssistant?.type === 'message' ? lastAssistant.content : '', 'partial');
-  // The active prompt was cleared: a later send is processed immediately.
+
+  // The active prompt was cleared, but the queue is paused: a later send
+  // enqueues without dispatching into the disconnected client.
   const second = controller.sendPrompt('second');
+  assert.equal(mock.calls[1]?.message, undefined);
+  assert.equal(controller.snapshot.queuedPromptCount, 1);
+  assert.equal(controller.snapshot.executionState, 'error');
+
+  // Only the runtime reconnect handshake resumes the queue; the resumed
+  // prompt is dispatched and completes normally on agent_settled.
+  controller.resumeQueuedPrompts();
+  assert.equal(controller.snapshot.executionState, 'starting');
   assert.equal(mock.calls[1]?.message, 'second');
   mock.resolvePrompt();
   await second;
@@ -333,7 +349,7 @@ test('transport failure while streaming fails the turn and leaves a recoverable 
   assert.equal(controller.snapshot.timeline.filter((record) => record.type === 'message').length, 3);
 });
 
-test('transport failure while a prompt request is pending advances the queue exactly once', async () => {
+test('transport failure while a prompt request is pending pauses the queue and resumes exactly once', async () => {
   const mock = createClient();
   const controller = new ConversationController(mock.client);
   const snapshots: Array<{ executionState: string; error: string | null }> = [];
@@ -347,15 +363,43 @@ test('transport failure while a prompt request is pending advances the queue exa
   mock.rejectPrompt(new Error('Pi process exited (code=1)'));
   mock.emitError(new Error('Pi process exited (code=1)'));
 
-  // The error state was published, and exactly one queued prompt advanced.
+  // The error state was published, and the queue paused: the queued prompt
+  // is retained and nothing is dispatched into the disconnected client.
   assert.ok(snapshots.some((s) => s.executionState === 'error' && /Pi process exited/.test(s.error ?? '')));
+  assert.deepEqual(mock.calls.map((call) => call.type), ['prompt']);
+  assert.equal(controller.snapshot.queuedPromptCount, 1);
+
+  // The runtime reconnect handshake resumes the queue, which dispatches the
+  // retained prompt exactly once. The rejected active prompt is not replayed.
+  controller.resumeQueuedPrompts();
   assert.deepEqual(mock.calls.map((call) => call.type), ['prompt', 'prompt']);
   assert.equal(mock.calls[1]?.message, 'second');
   assert.equal(controller.snapshot.queuedPromptCount, 0);
 
-  // The rejected request did not fail the newly advanced turn: it completes
-  // normally on agent_settled.
+  // The resumed turn completes normally on agent_settled.
   mock.resolvePrompt();
+  mock.emit({ type: 'agent_settled' });
+  assert.equal(controller.snapshot.executionState, 'idle');
+});
+
+test('sendPrompt while the client is disconnected enqueues without sending until resumed', async () => {
+  const mock = createClient();
+  mock.setState('disconnected');
+  const controller = new ConversationController(mock.client);
+
+  // A prompt sent into a disconnected client is retained, never dispatched:
+  // no Pi process is spawned implicitly and the queue pauses until the
+  // runtime handshake resumes it.
+  const prompt = controller.sendPrompt('first');
+  assert.equal(mock.calls.length, 0, 'no prompt is sent while disconnected');
+  assert.equal(controller.snapshot.queuedPromptCount, 1);
+
+  mock.setState('ready');
+  controller.resumeQueuedPrompts();
+  assert.equal(mock.calls[0]?.message, 'first');
+  assert.equal(controller.snapshot.queuedPromptCount, 0);
+  mock.resolvePrompt();
+  await prompt;
   mock.emit({ type: 'agent_settled' });
   assert.equal(controller.snapshot.executionState, 'idle');
 });
@@ -621,4 +665,60 @@ test('hydrate marks failed tool results and skips unknown roles', () => {
   const tool = controller.snapshot.timeline[1];
   assert.equal(tool.type === 'tool' ? tool.status : '', 'failed');
   assert.equal(tool.type === 'tool' ? tool.output : '', 'exit 1');
+});
+
+test('hydrate reads current Pi toolCall blocks (id/name/arguments) and attaches result output/status', () => {
+  const mock = createClient();
+  const controller = new ConversationController(mock.client);
+  controller.hydrate([
+    {
+      type: 'message',
+      id: 'user-1',
+      parentId: null,
+      timestamp: '2026-01-01T00:00:00.000Z',
+      message: { role: 'user', content: 'Check repo status' },
+    },
+    {
+      type: 'message',
+      id: 'assistant-1',
+      parentId: 'user-1',
+      timestamp: '2026-01-01T00:00:01.000Z',
+      // Current Pi hydration shape: toolCall content blocks carry
+      // id/name/arguments, with the bash command under arguments.command.
+      message: {
+        role: 'assistant',
+        content: [{ type: 'toolCall', id: 'tool-1', name: 'bash', arguments: { command: 'git status' } }],
+      },
+    },
+    {
+      type: 'message',
+      id: 'result-1',
+      parentId: 'assistant-1',
+      timestamp: '2026-01-01T00:00:02.000Z',
+      message: {
+        role: 'toolResult',
+        toolCallId: 'tool-1',
+        toolName: 'bash',
+        content: [{ type: 'text', text: 'On branch main\nnothing to commit, working tree clean' }],
+      },
+    },
+  ]);
+
+  assert.deepEqual(
+    controller.snapshot.timeline.map((record) => record.type),
+    ['message', 'bash'],
+  );
+  const user = controller.snapshot.timeline[0];
+  assert.equal(user.type === 'message' ? user.role : '', 'user');
+  assert.equal(user.type === 'message' ? user.content : '', 'Check repo status');
+  const bash = controller.snapshot.timeline[1];
+  // The toolCall block is the authority: its id names the record and its
+  // name/arguments.command survive into the bash record.
+  assert.equal(bash.type, 'bash');
+  assert.equal(bash.type === 'bash' ? bash.id : '', 'tool-1');
+  assert.equal(bash.type === 'bash' ? bash.command : '', 'git status');
+  // The toolResult entry contributes the final output and status.
+  assert.equal(bash.type === 'bash' ? bash.output : '', 'On branch main\nnothing to commit, working tree clean');
+  assert.equal(bash.type === 'bash' ? bash.status : '', 'completed');
+  assert.equal(controller.snapshot.executionState, 'idle');
 });

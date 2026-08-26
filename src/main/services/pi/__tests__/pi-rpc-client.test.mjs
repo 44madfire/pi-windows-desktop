@@ -269,6 +269,76 @@ test("rejects pending work on process failure and reconnects through the factory
   assert.deepEqual((await recovered).data, { recovered: true });
 });
 
+test("a disconnected client rejects requests without invoking the transport factory", async () => {
+  const firstTransport = new FakeTransport();
+  const secondTransport = new FakeTransport();
+  const transports = [firstTransport, secondTransport];
+  const createdTransports = [];
+  const client = new PiRpcClient({
+    transportFactory: {
+      create: () => {
+        const transport = transports.shift();
+        createdTransports.push(transport);
+        return transport;
+      },
+    },
+    defaultTimeoutMs: 100,
+  });
+  await client.connect();
+  assert.equal(createdTransports.length, 1);
+
+  // The established transport exits mid-session; the client is left
+  // disconnected with no active transport.
+  firstTransport.emitExit(1, "SIGTERM");
+  assert.equal(client.state, "disconnected");
+
+  // A request on a disconnected client must reject instead of silently
+  // spawning a replacement transport behind the caller's back: the caller
+  // owns recovery, so no factory invocation may happen here.
+  await assert.rejects(client.send({ type: "get_state" }), (error) => {
+    assert.ok(error instanceof PiRpcTransportError);
+    return true;
+  });
+  assert.equal(createdTransports.length, 1, "the transport factory must not be invoked");
+  assert.equal(client.state, "disconnected");
+});
+
+test("connect() from disconnected rejects; only explicit reconnect() replaces the transport", async () => {
+  const firstTransport = new FakeTransport();
+  const secondTransport = new FakeTransport();
+  const transports = [firstTransport, secondTransport];
+  const createdTransports = [];
+  const client = new PiRpcClient({
+    transportFactory: {
+      create: () => {
+        const transport = transports.shift();
+        createdTransports.push(transport);
+        return transport;
+      },
+    },
+  });
+  await client.connect();
+  assert.equal(createdTransports.length, 1);
+
+  firstTransport.emitExit(1, "SIGTERM");
+  assert.equal(client.state, "disconnected");
+
+  // Auto-connect is only allowed from idle: calling connect() on a
+  // disconnected client rejects without spawning a replacement transport.
+  await assert.rejects(client.connect(), (error) => {
+    assert.ok(error instanceof PiRpcTransportError);
+    assert.equal(error.source, "process");
+    return true;
+  });
+  assert.equal(createdTransports.length, 1, "the transport factory must not be invoked");
+  assert.equal(client.state, "disconnected");
+
+  // Explicit reconnect() is the only seam that replaces the transport.
+  await client.reconnect();
+  assert.equal(client.state, "ready");
+  assert.equal(createdTransports.length, 2);
+});
+
 test("close ends stdin first, then escalates to SIGTERM and finally SIGKILL", async () => {
   const transport = new FakeTransport();
   const client = new PiRpcClient(() => transport, {
