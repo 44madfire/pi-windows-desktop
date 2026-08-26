@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import type { PiThinkingLevel } from "../../../shared/ipc.ts";
 import {
   SessionManager,
   SessionManagerError,
@@ -9,6 +10,7 @@ import {
   type PiRpcEvent,
   type PiRpcSuccessResponse,
   type SessionPiRpcClient,
+  type SessionSnapshot,
 } from "./session-manager.ts";
 
 type QueuedResponse = PiRpcSuccessResponse | Error;
@@ -60,6 +62,9 @@ test("models create state and persists only Pi session identity/cursor data", as
   client.queueResponse({
     sessionId: "pi-session-1",
     lastEntryId: "entry-0",
+    // Even when the new_session acknowledgement carries agent-state-shaped
+    // fields, they are never projected: get_state is the only authoritative
+    // source for the selected model/thinking.
     model: { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5" },
     thinkingLevel: "high",
   });
@@ -81,14 +86,10 @@ test("models create state and persists only Pi session identity/cursor data", as
   assert.equal(manager.lastEntryId, "entry-0");
   assert.equal(manager.lastSeenEntryId, "entry-0");
   assert.equal(manager.leafId, null);
-  // The snapshot carries the projected agent state plus identity/cursor data,
-  // all plain JSON for the host IPC slice.
-  assert.deepEqual(created.model, {
-    id: "claude-sonnet-4-5",
-    provider: "anthropic",
-    name: "Claude Sonnet 4.5",
-  });
-  assert.equal(created.thinkingLevel, "high");
+  // The snapshot carries identity/cursor data; the agent state stays null
+  // because no get_state has been read yet.
+  assert.equal(created.model, null);
+  assert.equal(created.thinkingLevel, null);
   assert.deepEqual(Object.keys(manager.snapshot).sort(), [
     "lastEntryId",
     "lastError",
@@ -234,6 +235,38 @@ test("fork sends only the authoritative entry id and close detaches without owni
   assert.equal(manager.state, "closed");
 });
 
+test("fork and close acknowledgements never project agent state from wrapper fields", async () => {
+  const client = new FakePiRpcClient();
+  // Agent-state-shaped fields on the fork and close acknowledgements must be
+  // ignored: get_state is the only authoritative source for model/thinking.
+  client.queueResponse({
+    entryId: "fork-1",
+    model: { id: "intruder-model", provider: "intruder" },
+    thinkingLevel: "max",
+  }); // fork
+  client.queueResponse({
+    cancelled: true,
+    model: { id: "intruder-model", provider: "intruder" },
+    thinkingLevel: "max",
+  }); // close (abort)
+  const manager = new SessionManager({
+    client,
+    sessionId: "session-3",
+    commands: { close: () => ({ type: "abort" }) },
+  });
+  await manager.reconnect(client, { synchronize: false });
+
+  const fork = await manager.fork("fork-1");
+  assert.equal(fork.entryId, "fork-1");
+  assert.equal(manager.model, null);
+  assert.equal(manager.thinkingLevel, null);
+
+  const closed = await manager.close();
+  assert.equal(closed.state, "closed");
+  assert.equal(manager.model, null);
+  assert.equal(manager.thinkingLevel, null);
+});
+
 test("a failed sync becomes recoverable and reconnect can continue from the same cursor", async () => {
   const failedClient = new FakePiRpcClient();
   failedClient.queueError("Pi process restarted");
@@ -304,6 +337,9 @@ test("openSession resumes a persisted session file with switch_session then get_
   client.queueResponse({
     sessionId: "pi-session-1",
     sessionFile: "/home/pi/.pi/agent/sessions/pi-session-1",
+    // A resumed persisted session must report the authoritative agent state.
+    model: { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5" },
+    thinkingLevel: "high",
   }); // get_state
   const manager = new SessionManager({
     client,
@@ -549,8 +585,13 @@ test("get_state identity falls back from sessionFile to sessionId", async () => 
 
 test("openSession injectable commands build switch and state through the factory", async () => {
   const client = new FakePiRpcClient();
-  client.queueResponse({ sessionId: "custom-session" });
-  client.queueResponse({ sessionId: "custom-session" });
+  client.queueResponse({ sessionId: "custom-session" }); // switch (session_resume)
+  client.queueResponse({
+    sessionId: "custom-session",
+    // A resumed persisted session must report the authoritative agent state.
+    model: { id: "custom-model", provider: "custom-provider" },
+    thinkingLevel: "low",
+  }); // get_state (session_info)
   const commands: PiRpcCommand[] = [];
   const manager = new SessionManager({
     client,
@@ -799,4 +840,608 @@ test("restored snapshots keep the projected model and thinking level", async () 
   assert.equal(restored.snapshot.thinkingLevel, "medium");
   assert.equal(restored.model?.provider, "anthropic");
   assert.equal(restored.thinkingLevel, "medium");
+});
+
+test("refreshState issues get_state, re-projects metadata, and emits exactly once", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({
+    sessionId: "pi-session-1",
+    sessionFile: "/sessions/pi-session-1",
+    model: { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5" },
+    thinkingLevel: "high",
+  });
+  const manager = new SessionManager({ client, sessionId: "requested-session" });
+  const snapshots: SessionSnapshot[] = [];
+  manager.onStateChange((snapshot) => {
+    snapshots.push(snapshot);
+  });
+
+  const snapshot = await manager.refreshState();
+
+  assert.deepEqual(client.commands, [{ type: "get_state" }]);
+  assert.equal(snapshot.state, "new", "refreshState never changes the lifecycle state");
+  // The authoritative get_state replaced the stale requested identity and
+  // seeded the projected agent state.
+  assert.equal(snapshot.sessionId, "pi-session-1");
+  assert.equal(snapshot.sessionFile, "/sessions/pi-session-1");
+  assert.deepEqual(snapshot.model, {
+    id: "claude-sonnet-4-5",
+    provider: "anthropic",
+    name: "Claude Sonnet 4.5",
+  });
+  assert.equal(snapshot.thinkingLevel, "high");
+  // Exactly one snapshot emit per refresh.
+  assert.equal(snapshots.length, 1);
+  assert.equal(snapshots[0].sessionId, "pi-session-1");
+  assert.equal(snapshots[0].thinkingLevel, "high");
+});
+
+test("refreshState rejects with a session failure when get_state fails", async () => {
+  const client = new FakePiRpcClient();
+  client.queueError("transport died");
+  const manager = new SessionManager({ client, sessionId: "pi-session-1" });
+
+  await assert.rejects(manager.refreshState(), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "RPC_FAILURE");
+    return true;
+  });
+  assert.equal(manager.state, "disconnected");
+});
+
+test("refreshState rejects when an established session's get_state omits the cached model", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ sessionId: "pi-session-1" }); // get_state without the model
+  const manager = new SessionManager({
+    client,
+    sessionId: "pi-session-1",
+    model: { id: "claude-sonnet-4-5", provider: "anthropic" },
+    thinkingLevel: "high",
+  });
+
+  await assert.rejects(manager.refreshState(), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "INVALID_RESPONSE");
+    return true;
+  });
+  // The settle refresh never preserved the cached selection: the session is
+  // marked disconnected instead of re-using stale agent state.
+  assert.equal(manager.state, "disconnected");
+});
+
+test("a forced reconnect rejects when get_state omits an established session's cached agent state", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ sessionId: "pi-session-1" }); // switch_session
+  client.queueResponse({ sessionId: "pi-session-1" }); // get_state without model/level
+  const manager = new SessionManager({
+    client,
+    sessionId: "pi-session-1",
+    sessionFile: "/sessions/pi-session-1",
+    model: { id: "claude-sonnet-4-5", provider: "anthropic" },
+    thinkingLevel: "high",
+  });
+
+  await assert.rejects(
+    manager.openSession("/sessions/pi-session-1", { force: true }),
+    (error: unknown) => {
+      assert.ok(error instanceof SessionManagerError);
+      assert.equal(error.code, "INVALID_RESPONSE");
+      return true;
+    },
+  );
+  assert.equal(manager.state, "failed");
+});
+
+test("a resumed persisted session rejects when get_state omits the authoritative agent state", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ sessionId: "pi-session-1" }); // switch_session
+  client.queueResponse({ sessionId: "pi-session-1" }); // get_state without model/level
+  // No cached agent state: the requirement comes purely from the successful
+  // resume of a persisted session — a persisted session must report the
+  // authoritative model and thinking level.
+  const manager = new SessionManager({
+    client,
+    sessionId: "pi-session-1",
+    sessionFile: "/sessions/pi-session-1",
+  });
+
+  await assert.rejects(
+    manager.openSession("/sessions/pi-session-1"),
+    (error: unknown) => {
+      assert.ok(error instanceof SessionManagerError);
+      assert.equal(error.code, "INVALID_RESPONSE");
+      return true;
+    },
+  );
+  assert.equal(manager.state, "failed");
+});
+
+test("getAvailableThinkingLevels issues the exact command and parses data.levels strictly", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ levels: ["off", "low", "max"] });
+  const manager = new SessionManager({ client, sessionId: "pi-session-1" });
+
+  const levels = await manager.getAvailableThinkingLevels();
+
+  assert.deepEqual(client.commands, [{ type: "get_available_thinking_levels" }]);
+  // Only what Pi reported — never the global enum.
+  assert.deepEqual(levels, ["off", "low", "max"]);
+});
+
+test("getAvailableThinkingLevels rejects malformed payloads without failing the session", async () => {
+  const client = new FakePiRpcClient();
+  // Absent `levels` key is malformed.
+  client.queueResponse({});
+  const manager = new SessionManager({ client, sessionId: "pi-session-1" });
+
+  await assert.rejects(manager.getAvailableThinkingLevels(), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "INVALID_RESPONSE");
+    return true;
+  });
+  // A catalog failure never fails the session: the queue stays healthy.
+  assert.equal(manager.state, "new");
+  assert.equal(manager.snapshot.lastError, null);
+
+  // An unknown level entry rejects the whole list.
+  client.queueResponse({ levels: ["off", "turbo"] });
+  await assert.rejects(manager.getAvailableThinkingLevels(), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "INVALID_RESPONSE");
+    return true;
+  });
+
+  // Pi's live contract guarantees at least one level: an empty array is
+  // malformed, never an authoritative empty list.
+  client.queueResponse({ levels: [] });
+  await assert.rejects(manager.getAvailableThinkingLevels(), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "INVALID_RESPONSE");
+    return true;
+  });
+
+  // A bare array is not the documented `{levels: [...]}` shape.
+  client.queueResponse(["off", "low"]);
+  await assert.rejects(manager.getAvailableThinkingLevels(), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "INVALID_RESPONSE");
+    return true;
+  });
+  assert.equal(manager.state, "new");
+});
+
+test("setModel issues set_model, refreshes get_state, and exposes the effective model", async () => {
+  const client = new FakePiRpcClient();
+  // set_model answers with the full Model object (Pi's documented contract)…
+  client.queueResponse({
+    id: "claude-sonnet-4-5",
+    provider: "anthropic",
+    name: "Claude Sonnet 4.5",
+  });
+  // …and the authoritative get_state refresh confirms it (and re-reads the
+  // effective thinking level).
+  client.queueResponse({
+    sessionId: "pi-session-1",
+    sessionFile: "/sessions/pi-session-1",
+    model: { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5" },
+    thinkingLevel: "high",
+  });
+  const manager = new SessionManager({ client });
+  await manager.reconnect(client, { synchronize: false });
+  const snapshots: SessionSnapshot[] = [];
+  manager.onStateChange((snapshot) => {
+    snapshots.push(snapshot);
+  });
+
+  const result = await manager.setModel("anthropic", "claude-sonnet-4-5");
+
+  assert.deepEqual(client.commands.slice(-2), [
+    { type: "set_model", provider: "anthropic", modelId: "claude-sonnet-4-5" },
+    { type: "get_state" },
+  ]);
+  assert.deepEqual(result.model, {
+    id: "claude-sonnet-4-5",
+    provider: "anthropic",
+    name: "Claude Sonnet 4.5",
+  });
+  assert.equal(result.snapshot.thinkingLevel, "high");
+  assert.equal(manager.model?.id, "claude-sonnet-4-5");
+  assert.equal(manager.thinkingLevel, "high");
+  // Exactly one snapshot emit: the final authoritative refresh.
+  assert.equal(snapshots.length, 1);
+  assert.equal(snapshots[0].model?.id, "claude-sonnet-4-5");
+});
+
+test("setModel honors the authoritative get_state over the response echo", async () => {
+  const client = new FakePiRpcClient();
+  // A nested model echo is applied…
+  client.queueResponse({ model: { id: "echoed-model", provider: "echoed-provider" } });
+  // …but the get_state refresh is authoritative and wins.
+  client.queueResponse({
+    sessionId: "pi-session-1",
+    model: { id: "gpt-5", provider: "openai" },
+    thinkingLevel: "low",
+  });
+  const manager = new SessionManager({ client });
+  await manager.reconnect(client, { synchronize: false });
+
+  const result = await manager.setModel("anthropic", "claude-sonnet-4-5");
+
+  assert.deepEqual(result.model, { id: "gpt-5", provider: "openai" });
+  assert.equal(result.snapshot.thinkingLevel, "low");
+  assert.equal(manager.model?.provider, "openai");
+  assert.equal(manager.thinkingLevel, "low");
+});
+
+test("setModel rejects when Pi reports no effective model", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({}); // set_model bare acknowledgement
+  client.queueResponse({ sessionId: "pi-session-1" }); // get_state without model
+  const manager = new SessionManager({ client });
+  await manager.reconnect(client, { synchronize: false });
+
+  await assert.rejects(manager.setModel("anthropic", "claude-sonnet-4-5"), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "INVALID_RESPONSE");
+    return true;
+  });
+  // The failed mutation never fails the session.
+  assert.equal(manager.state, "ready");
+  assert.equal(manager.model, null);
+});
+
+test("setThinkingLevel issues set_thinking_level, refreshes get_state, and never falls back to the requested level", async () => {
+  const client = new FakePiRpcClient();
+  // set_thinking_level answers success-only with no effective payload.
+  client.queueResponse({});
+  // The authoritative get_state reports a different effective level than the
+  // one requested; it must win.
+  client.queueResponse({ sessionId: "pi-session-1", thinkingLevel: "low" });
+  const manager = new SessionManager({ client });
+  await manager.reconnect(client, { synchronize: false });
+
+  const result = await manager.setThinkingLevel("high");
+
+  assert.deepEqual(client.commands.slice(-2), [
+    { type: "set_thinking_level", level: "high" },
+    { type: "get_state" },
+  ]);
+  assert.equal(result.level, "low");
+  assert.equal(result.snapshot.thinkingLevel, "low");
+  assert.equal(manager.thinkingLevel, "low");
+});
+
+test("setThinkingLevel rejects when Pi reports no effective level", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({}); // success-only response
+  client.queueResponse({ sessionId: "pi-session-1" }); // get_state without a level
+  const manager = new SessionManager({ client });
+  await manager.reconnect(client, { synchronize: false });
+
+  await assert.rejects(manager.setThinkingLevel("high"), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "INVALID_RESPONSE");
+    return true;
+  });
+  assert.equal(manager.state, "ready");
+  assert.equal(manager.thinkingLevel, null);
+});
+
+test("setModel rejects when the get_state refresh omits the model even though set_model echoed one", async () => {
+  const client = new FakePiRpcClient();
+  // The set_model response echoes a full model object…
+  client.queueResponse({ id: "echoed-model", provider: "echoed-provider" });
+  // …but the authoritative get_state refresh omits the model entirely; the
+  // echo must never stand in for the effective state.
+  client.queueResponse({ sessionId: "pi-session-1", thinkingLevel: "high" });
+  const manager = new SessionManager({ client });
+  await manager.reconnect(client, { synchronize: false });
+
+  await assert.rejects(manager.setModel("anthropic", "claude-sonnet-4-5"), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "INVALID_RESPONSE");
+    return true;
+  });
+  assert.equal(manager.state, "ready");
+  // The rejected refresh applied nothing: neither the echoed model nor the
+  // response's thinking level is partially confirmed without the model.
+  assert.equal(manager.model, null);
+  assert.equal(manager.thinkingLevel, null);
+});
+
+test("setModel rejects when the get_state refresh omits the thinking level", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ id: "gpt-5", provider: "openai" }); // set_model
+  client.queueResponse({
+    sessionId: "pi-session-1",
+    model: { id: "gpt-5", provider: "openai" },
+  }); // get_state without Pi's required thinkingLevel field
+  const manager = new SessionManager({ client });
+  await manager.reconnect(client, { synchronize: false });
+
+  await assert.rejects(manager.setModel("openai", "gpt-5"), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "INVALID_RESPONSE");
+    return true;
+  });
+  assert.equal(manager.state, "ready");
+  // The rejected refresh applied nothing: the response's model is not
+  // partially confirmed without its required thinking level, so no
+  // unconfirmed model/thinking leaks into the manager.
+  assert.equal(manager.model, null);
+  assert.equal(manager.thinkingLevel, null);
+});
+
+test("setModel with preexisting state rejects when the refresh omits the model instead of preserving the cached value", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ id: "echoed-model", provider: "echoed" }); // set_model
+  client.queueResponse({ sessionId: "pi-session-1" }); // get_state: no model, no level
+  const manager = new SessionManager({
+    client,
+    model: { id: "stale-model", provider: "stale" },
+    thinkingLevel: "low",
+  });
+  await manager.reconnect(client, { synchronize: false });
+
+  await assert.rejects(manager.setModel("anthropic", "claude-sonnet-4-5"), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "INVALID_RESPONSE");
+    return true;
+  });
+  // The mutation rejects: the preexisting cached model/level were never
+  // reported as the effective result of the failed mutation.
+  assert.equal(manager.state, "ready");
+  assert.deepEqual(manager.model, { id: "stale-model", provider: "stale" });
+  assert.equal(manager.thinkingLevel, "low");
+});
+
+test("setThinkingLevel with preexisting state rejects when the refresh omits the level instead of preserving it", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({}); // success-only response
+  client.queueResponse({ sessionId: "pi-session-1" }); // get_state without a level
+  const manager = new SessionManager({ client, thinkingLevel: "medium" });
+  await manager.reconnect(client, { synchronize: false });
+
+  await assert.rejects(manager.setThinkingLevel("high"), (error: unknown) => {
+    assert.ok(error instanceof SessionManagerError);
+    assert.equal(error.code, "INVALID_RESPONSE");
+    return true;
+  });
+  assert.equal(manager.state, "ready");
+  // The requested level is never a fallback and the cached level is not
+  // reported as the effective level of the failed mutation.
+  assert.equal(manager.thinkingLevel, "medium");
+});
+
+test("setModel preserves the compatible display name from the set_model response when get_state omits it", async () => {
+  const client = new FakePiRpcClient();
+  // The set_model response carries the full model object including the
+  // display name…
+  client.queueResponse({ id: "gpt-5", provider: "openai", name: "GPT-5" });
+  // …and the authoritative get_state confirms the SAME identity without the
+  // optional name; the compatible display metadata survives.
+  client.queueResponse({
+    sessionId: "pi-session-1",
+    model: { id: "gpt-5", provider: "openai" },
+    thinkingLevel: "low",
+  });
+  const manager = new SessionManager({ client });
+  await manager.reconnect(client, { synchronize: false });
+
+  const result = await manager.setModel("openai", "gpt-5");
+
+  // The identity and effective level come from get_state; the name is the
+  // compatible echo enrichment.
+  assert.deepEqual(result.model, { id: "gpt-5", provider: "openai", name: "GPT-5" });
+  assert.equal(result.snapshot.thinkingLevel, "low");
+  assert.deepEqual(manager.model, { id: "gpt-5", provider: "openai", name: "GPT-5" });
+});
+
+test("setModel never uses the echoed name when get_state reports a different identity", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ id: "echoed-model", provider: "echoed-provider", name: "Echoed" });
+  client.queueResponse({
+    sessionId: "pi-session-1",
+    model: { id: "gpt-5", provider: "openai" },
+    thinkingLevel: "medium",
+  });
+  const manager = new SessionManager({ client });
+  await manager.reconnect(client, { synchronize: false });
+
+  const result = await manager.setModel("openai", "gpt-5");
+
+  // get_state identity/effective values are authoritative: the echo's name
+  // never attaches to a different model.
+  assert.deepEqual(result.model, { id: "gpt-5", provider: "openai" });
+  assert.deepEqual(manager.model, { id: "gpt-5", provider: "openai" });
+});
+
+test("a later get_state keeps the preserved display name for the same identity", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ id: "gpt-5", provider: "openai", name: "GPT-5" }); // set_model
+  client.queueResponse({
+    sessionId: "pi-session-1",
+    model: { id: "gpt-5", provider: "openai" },
+    thinkingLevel: "low",
+  }); // get_state refresh without the name
+  const manager = new SessionManager({ client });
+  await manager.reconnect(client, { synchronize: false });
+  await manager.setModel("openai", "gpt-5");
+
+  // A settle-style refresh re-reporting the same identity without the name
+  // keeps the compatible display name; a different identity or an explicit
+  // null would replace it.
+  client.queueResponse({
+    sessionId: "pi-session-1",
+    model: { id: "gpt-5", provider: "openai" },
+    thinkingLevel: "low",
+  });
+  const snapshot = await manager.refreshState();
+
+  assert.deepEqual(snapshot.model, { id: "gpt-5", provider: "openai", name: "GPT-5" });
+  assert.equal(snapshot.thinkingLevel, "low");
+});
+
+test("setModel ignores identity and cursor fields on the set_model response", async () => {
+  const client = new FakePiRpcClient();
+  // The set_model response carries intruder identity/cursor/model fields…
+  client.queueResponse({
+    sessionId: "intruder-session",
+    lastEntryId: "intruder-entry",
+    model: { id: "echoed", provider: "echoed" },
+  });
+  // …and the authoritative get_state refresh owns identity and agent state.
+  client.queueResponse({
+    sessionId: "pi-session-1",
+    model: { id: "gpt-5", provider: "openai" },
+    thinkingLevel: "low",
+  });
+  const manager = new SessionManager({
+    client,
+    sessionId: "pi-session-1",
+    lastEntryId: "entry-1",
+  });
+  await manager.reconnect(client, { synchronize: false });
+
+  const result = await manager.setModel("openai", "gpt-5");
+
+  // Identity/cursor from the mutation response never poisoned the manager.
+  assert.equal(manager.sessionId, "pi-session-1");
+  assert.equal(manager.lastSeenEntryId, "entry-1");
+  assert.deepEqual(result.model, { id: "gpt-5", provider: "openai" });
+  assert.equal(result.snapshot.thinkingLevel, "low");
+});
+
+test("setThinkingLevel ignores identity and cursor fields on the success-only response", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ sessionId: "intruder-session", lastEntryId: "intruder-entry" });
+  client.queueResponse({ sessionId: "pi-session-1", thinkingLevel: "max" });
+  const manager = new SessionManager({
+    client,
+    sessionId: "pi-session-1",
+    lastEntryId: "entry-1",
+  });
+  await manager.reconnect(client, { synchronize: false });
+
+  const result = await manager.setThinkingLevel("high");
+
+  assert.equal(manager.sessionId, "pi-session-1");
+  assert.equal(manager.lastSeenEntryId, "entry-1");
+  assert.equal(result.level, "max");
+  assert.equal(result.snapshot.thinkingLevel, "max");
+});
+
+test("synchronization never overwrites the projected agent state from get_entries wrapper fields", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({
+    entries: [{ id: "entry-1" }],
+    leafId: "entry-1",
+    // Arbitrary wrapper fields that must never touch the selected agent
+    // state: get_state is the only authoritative source for model/thinking.
+    model: { id: "intruder-model", provider: "intruder" },
+    thinkingLevel: "max",
+  });
+  const manager = new SessionManager({
+    client,
+    sessionId: "session-10",
+    model: { id: "selected-model", provider: "anthropic" },
+    thinkingLevel: "low",
+  });
+
+  const result = await manager.resume();
+
+  assert.equal(result.lastSeenEntryId, "entry-1");
+  assert.equal(manager.lastSeenEntryId, "entry-1");
+  assert.deepEqual(manager.model, { id: "selected-model", provider: "anthropic" });
+  assert.equal(manager.thinkingLevel, "low");
+});
+
+test("setModel then synchronize preserves the selected model and thinking level", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ id: "claude-sonnet-4-5", provider: "anthropic" }); // set_model
+  client.queueResponse({
+    sessionId: "pi-session-1",
+    model: { id: "claude-sonnet-4-5", provider: "anthropic" },
+    thinkingLevel: "high",
+  }); // get_state refresh
+  client.queueResponse({ entries: [{ id: "entry-1" }], leafId: "entry-1" }); // get_entries
+  const manager = new SessionManager({ client });
+  await manager.reconnect(client, { synchronize: false });
+
+  await manager.setModel("anthropic", "claude-sonnet-4-5");
+  assert.equal(manager.model?.id, "claude-sonnet-4-5");
+  assert.equal(manager.thinkingLevel, "high");
+
+  // The settle synchronization (get_entries) must not regress the selected
+  // model/thinking: Pi stays authoritative and the manager keeps the values
+  // it projected from get_state.
+  const synced = await manager.synchronize();
+  assert.equal(synced.lastSeenEntryId, "entry-1");
+  assert.equal(manager.model?.id, "claude-sonnet-4-5");
+  assert.equal(manager.thinkingLevel, "high");
+});
+
+test("setModel and setThinkingLevel validate inputs before issuing commands", async () => {
+  const client = new FakePiRpcClient();
+  const manager = new SessionManager({ client });
+  await manager.reconnect(client, { synchronize: false });
+
+  await assert.rejects(manager.setModel("", "m"), /provider must be a non-empty string/);
+  await assert.rejects(manager.setModel("anthropic", "   "), /modelId must be a non-empty string/);
+  await assert.rejects(
+    manager.setThinkingLevel("turbo" as unknown as PiThinkingLevel),
+    /thinkingLevel must be one of/,
+  );
+  // No rejected payload ever became a Pi command.
+  assert.deepEqual(client.commands, []);
+});
+
+test("mutation and catalog commands are injectable through the factory", async () => {
+  const client = new FakePiRpcClient();
+  client.queueResponse({ levels: ["off"] }); // getAvailableThinkingLevels
+  client.queueResponse({ id: "custom-model", provider: "custom" }); // set_model
+  client.queueResponse({
+    sessionId: "custom-session",
+    model: { id: "custom-model", provider: "custom" },
+    thinkingLevel: "low",
+  }); // get_state refresh
+  client.queueResponse({}); // set_thinking_level
+  client.queueResponse({ sessionId: "custom-session", thinkingLevel: "max" }); // get_state refresh
+  const commands: PiRpcCommand[] = [];
+  const manager = new SessionManager({
+    client,
+    commands: {
+      getAvailableThinkingLevels: () => {
+        const command = { type: "thinking_levels" };
+        commands.push(command);
+        return command;
+      },
+      setModel: (provider, modelId) => {
+        const command = { type: "model_switch", provider, modelId };
+        commands.push(command);
+        return command;
+      },
+      setThinkingLevel: (level) => {
+        const command = { type: "level_switch", level };
+        commands.push(command);
+        return command;
+      },
+    },
+  });
+  await manager.reconnect(client, { synchronize: false });
+
+  const levels = await manager.getAvailableThinkingLevels();
+  assert.deepEqual(levels, ["off"]);
+
+  const modelResult = await manager.setModel("p", "m");
+  assert.equal(modelResult.model.id, "custom-model");
+
+  const levelResult = await manager.setThinkingLevel("low");
+  assert.equal(levelResult.level, "max");
+
+  assert.deepEqual(commands, [
+    { type: "thinking_levels" },
+    { type: "model_switch", provider: "p", modelId: "m" },
+    { type: "level_switch", level: "low" },
+  ]);
 });
