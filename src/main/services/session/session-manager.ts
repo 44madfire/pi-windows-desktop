@@ -41,6 +41,15 @@ export interface SessionSnapshot {
   readonly sessionId: string | null;
   /** Pi-owned session file path, authoritative for resuming the session. */
   readonly sessionFile: string | null;
+  /**
+   * Durable append-order cursor: the last entry id observed in a get_entries
+   * response (preserved when a response returns no entries). Drives the next
+   * `since` catch-up; `lastEntryId` is a compatibility alias of this value.
+   */
+  readonly lastSeenEntryId: SessionCursor;
+  /** Current active leaf from the last get_entries response; never a cursor. */
+  readonly leafId: SessionCursor;
+  /** Compatibility alias equal to lastSeenEntryId (legacy name). */
   readonly lastEntryId: SessionCursor;
   readonly lastError: string | null;
 }
@@ -63,8 +72,8 @@ export type SessionSnapshotListener = (snapshot: SessionSnapshot) => void | Prom
  * may evolve independently of the desktop shell.  The defaults match Pi's
  * current RPC vocabulary: session open is `switch_session` (resume) or
  * `new_session` (create) followed by `get_state`; history replay is
- * `get_entries` with an optional `since` cursor; `entries`/`leafId` in the
- * response are authoritative.
+ * `get_entries` with an optional `since` cursor; the response's `entries`
+ * (append order) and `leafId` (active leaf) are authoritative.
  */
 export interface SessionCommandFactory {
   readonly create: (sessionId: string | null) => PiRpcCommand;
@@ -81,6 +90,11 @@ export interface SessionManagerOptions {
   readonly client?: SessionPiRpcClient;
   readonly sessionId?: string | null;
   readonly sessionFile?: string | null;
+  /** Durable append-order cursor; drives the next get_entries `since`. */
+  readonly lastSeenEntryId?: SessionCursor;
+  /** Current active leaf from the last get_entries; never a cursor. */
+  readonly leafId?: SessionCursor;
+  /** Legacy alias for `lastSeenEntryId` accepted for restored pointers. */
   readonly lastEntryId?: SessionCursor;
   readonly initialSnapshot?: SessionSnapshot;
   readonly commands?: Partial<SessionCommandFactory>;
@@ -96,7 +110,15 @@ export interface SessionSynchronizationResult {
   /** The durable cursor the replay was requested from; null = full history. */
   readonly requestedAfter: SessionCursor;
   readonly previousLastEntryId: SessionCursor;
-  /** Authoritative cursor from the response (prefers `leafId`). */
+  /**
+   * Durable append-order cursor: the last entry id observed in the response
+   * (preserved when the response returns no entries). `lastEntryId` is a
+   * compatibility alias of this value.
+   */
+  readonly lastSeenEntryId: SessionCursor;
+  /** Current active leaf from the response (`leafId`); never a cursor. */
+  readonly leafId: SessionCursor;
+  /** Compatibility alias equal to lastSeenEntryId (legacy name). */
   readonly lastEntryId: SessionCursor;
   /** Raw Pi-owned records returned by the synchronization command. */
   readonly entries: readonly JsonValue[];
@@ -110,6 +132,15 @@ export interface SessionOpenResult {
   /** True when a persisted Pi session file was resumed via switch_session. */
   readonly resumed: boolean;
   readonly snapshot: SessionSnapshot;
+}
+
+export interface SessionOpenOptions {
+  /**
+   * Re-run the open handshake even when the manager is already ready. Used
+   * after a transport replacement: the new Pi process must be bound to the
+   * persisted session file again before history catch-up.
+   */
+  readonly force?: boolean;
 }
 
 export interface SessionForkResult {
@@ -232,19 +263,60 @@ function responseSessionFile(response: PiRpcSuccessResponse): string | null {
   return readString(asRecord(response.data), ["sessionFile", "session_file"]);
 }
 
-function responseCursor(response: PiRpcSuccessResponse, entries: readonly JsonValue[]): string | null {
+function recordHasKey(record: JsonObject | null, key: string): boolean {
+  return record !== null && record[key] !== undefined;
+}
+
+/**
+ * Read the current active leaf (`leafId`) from a response. The leaf pins the
+ * branch tip and may lag the append end; it is exposed separately and never
+ * used as a catch-up cursor.
+ *
+ * A response that carries the key with an explicit `null` (Pi reports no
+ * active leaf) must reset the leaf, so presence is reported separately from
+ * the value.
+ */
+function responseLeafId(response: PiRpcSuccessResponse): {
+  readonly present: boolean;
+  readonly value: string | null;
+} {
   const root = asRecord(response);
-  // `leafId` is the authoritative cursor of a get_entries response.
-  const rootLeaf = readString(root, ["leafId", "leaf_id"]);
-  if (rootLeaf !== null) return rootLeaf;
-
+  if (recordHasKey(root, "leafId") || recordHasKey(root, "leaf_id")) {
+    return { present: true, value: readString(root, ["leafId", "leaf_id"]) };
+  }
   const data = asRecord(response.data);
-  const dataLeaf = readString(data, ["leafId", "leaf_id"]);
-  if (dataLeaf !== null) return dataLeaf;
+  if (recordHasKey(data, "leafId") || recordHasKey(data, "leaf_id")) {
+    return { present: true, value: readString(data, ["leafId", "leaf_id"]) };
+  }
+  return { present: false, value: null };
+}
 
+/**
+ * Resolve the durable append-order cursor from a response.
+ *
+ * The last entry id observed in append order is authoritative. When a
+ * response returns no append-ordered entries the previous cursor is
+ * preserved; explicit cursor fields carried by other command responses
+ * (`lastEntryId`/`nextCursor`/`cursor`) are honored only then. `leafId` is
+ * deliberately excluded: it is the active branch leaf, which can point
+ * anywhere in the branch tree, and using it as a `since` cursor would skip
+ * append-ordered records.
+ */
+function responseAppendCursor(
+  response: PiRpcSuccessResponse,
+  entries: readonly JsonValue[],
+  previous: SessionCursor,
+): SessionCursor {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entryId = entryIdFromValue(entries[index]);
+    if (entryId !== null) return entryId;
+  }
+
+  const root = asRecord(response);
   const rootCursor = readString(root, ["lastEntryId", "last_entry_id", "nextCursor", "next_cursor"]);
   if (rootCursor !== null) return rootCursor;
 
+  const data = asRecord(response.data);
   const dataCursor = readString(data, [
     "lastEntryId",
     "last_entry_id",
@@ -257,12 +329,7 @@ function responseCursor(response: PiRpcSuccessResponse, entries: readonly JsonVa
   const nestedCursor = readString(asRecord(data?.session), ["lastEntryId", "last_entry_id"]);
   if (nestedCursor !== null) return nestedCursor;
 
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const entryId = entryIdFromValue(entries[index]);
-    if (entryId !== null) return entryId;
-  }
-
-  return null;
+  return previous;
 }
 
 function responseData(response: PiRpcSuccessResponse): JsonValue | null {
@@ -354,17 +421,20 @@ function validateCursor(cursor: SessionCursor | undefined): SessionCursor {
  * `PiRpcClient` satisfies `SessionPiRpcClient` structurally.  `openSession()`
  * runs the resume-or-create handshake (`switch_session`/`new_session` then
  * `get_state`) and adopts Pi's authoritative session file/id; `synchronize()`
- * requests history via `get_entries` since the persisted `lastEntryId` cursor
- * and returns the raw `entries` plus the authoritative `leafId` cursor to the
- * caller without maintaining a second history database.  Durable cursors come
- * only from those responses, never from agent events.
+ * requests history via `get_entries` since the persisted append cursor
+ * (`lastSeenEntryId`) and returns the raw `entries` plus the active
+ * `leafId` to the caller without maintaining a second history database.
+ * The append cursor is the last entry id observed in append order (never the
+ * active leaf), and durable cursors come only from those responses, never
+ * from agent events.
  */
 export class SessionManager {
   private clientValue: SessionPiRpcClient | null = null;
   private stateValue: SessionLifecycleState = "new";
   private sessionIdValue: string | null = null;
   private sessionFileValue: string | null = null;
-  private lastEntryIdValue: SessionCursor = null;
+  private lastSeenEntryIdValue: SessionCursor = null;
+  private leafIdValue: SessionCursor = null;
   private lastErrorValue: string | null = null;
   private readonly commands: SessionCommandFactory;
   private readonly stateListeners = new Set<SessionSnapshotListener>();
@@ -375,7 +445,16 @@ export class SessionManager {
     this.stateValue = initial?.state ?? "new";
     this.sessionIdValue = validateSessionId(options.sessionId ?? initial?.sessionId);
     this.sessionFileValue = validateSessionFile(options.sessionFile ?? initial?.sessionFile);
-    this.lastEntryIdValue = validateCursor(options.lastEntryId ?? initial?.lastEntryId);
+    // The canonical append cursor is lastSeenEntryId; lastEntryId is accepted
+    // as a legacy alias so restored pointers migrate without losing the
+    // durable cursor.
+    this.lastSeenEntryIdValue = validateCursor(
+      options.lastSeenEntryId ??
+        initial?.lastSeenEntryId ??
+        options.lastEntryId ??
+        initial?.lastEntryId,
+    );
+    this.leafIdValue = validateCursor(options.leafId ?? initial?.leafId);
     this.lastErrorValue = initial?.lastError ?? null;
     this.commands = { ...defaultCommands, ...options.commands };
 
@@ -405,13 +484,24 @@ export class SessionManager {
     return this.sessionFileValue;
   }
 
-  get lastEntryId(): SessionCursor {
-    return this.lastEntryIdValue;
+  /** Durable append-order cursor; drives the next get_entries `since`. */
+  get lastSeenEntryId(): SessionCursor {
+    return this.lastSeenEntryIdValue;
   }
 
-  /** Alias that makes the persisted entry id explicit as a synchronization cursor. */
+  /** Current active leaf from the last get_entries response; never a cursor. */
+  get leafId(): SessionCursor {
+    return this.leafIdValue;
+  }
+
+  /** Compatibility alias equal to lastSeenEntryId (legacy name). */
+  get lastEntryId(): SessionCursor {
+    return this.lastSeenEntryIdValue;
+  }
+
+  /** Alias that makes the durable append cursor explicit as a synchronization cursor. */
   get cursor(): SessionCursor {
-    return this.lastEntryIdValue;
+    return this.lastSeenEntryIdValue;
   }
 
   getSnapshot(): SessionSnapshot {
@@ -419,7 +509,9 @@ export class SessionManager {
       state: this.stateValue,
       sessionId: this.sessionIdValue,
       sessionFile: this.sessionFileValue,
-      lastEntryId: this.lastEntryIdValue,
+      lastSeenEntryId: this.lastSeenEntryIdValue,
+      leafId: this.leafIdValue,
+      lastEntryId: this.lastSeenEntryIdValue,
       lastError: this.lastErrorValue,
     };
   }
@@ -465,10 +557,15 @@ export class SessionManager {
    * authoritative session identity. Pi owns the session file; the caller
    * persists only this pointer.
    */
-  openSession(sessionFile: string | null): Promise<SessionOpenResult> {
+  openSession(sessionFile: string | null, options: SessionOpenOptions = {}): Promise<SessionOpenResult> {
     return this.enqueue(async () => {
-      if (this.stateValue === "ready") return this.openResult(false);
-      this.assertState("open", ["new", "failed", "disconnected"]);
+      if (this.stateValue === "ready" && !options.force) return this.openResult(false);
+      this.assertState(
+        "open",
+        options.force
+          ? ["new", "ready", "failed", "disconnected"]
+          : ["new", "failed", "disconnected"],
+      );
       const client = this.requireClient("open");
       this.clearError();
       // Reject a malformed persisted session file before touching state or
@@ -489,7 +586,8 @@ export class SessionManager {
           // retain the abandoned session's pointer data.
           this.sessionIdValue = null;
           this.sessionFileValue = null;
-          this.lastEntryIdValue = null;
+          this.lastSeenEntryIdValue = null;
+          this.leafIdValue = null;
           this.emitSnapshot();
           const command = validateCommand(this.commands.create(this.sessionIdValue), "create");
           const response = await this.request(client, command, "create");
@@ -664,7 +762,7 @@ export class SessionManager {
 
   private synchronizeInternal(operation: "resume" | "reconnect" | "synchronize"): Promise<SessionSynchronizationResult> {
     const client = this.requireClient(operation);
-    const previousLastEntryId = this.lastEntryIdValue;
+    const previousLastEntryId = this.lastSeenEntryIdValue;
     this.setState("synchronizing");
 
     return this.request(
@@ -683,7 +781,9 @@ export class SessionManager {
           sessionId: this.sessionIdValue,
           requestedAfter: previousLastEntryId,
           previousLastEntryId,
-          lastEntryId: this.lastEntryIdValue,
+          lastSeenEntryId: this.lastSeenEntryIdValue,
+          leafId: this.leafIdValue,
+          lastEntryId: this.lastSeenEntryIdValue,
           entries,
           entryCount: entries.length,
         };
@@ -703,8 +803,11 @@ export class SessionManager {
     const sessionFile = responseSessionFile(response);
     if (sessionFile !== null) this.sessionFileValue = sessionFile;
 
-    const cursor = responseCursor(response, entries);
-    if (cursor !== null) this.lastEntryIdValue = cursor;
+    const leaf = responseLeafId(response);
+    if (leaf.present) this.leafIdValue = leaf.value;
+
+    const cursor = responseAppendCursor(response, entries, this.lastSeenEntryIdValue);
+    if (cursor !== null) this.lastSeenEntryIdValue = cursor;
   }
 
   private request(

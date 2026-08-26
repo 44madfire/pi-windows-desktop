@@ -74,9 +74,13 @@ test("models create state and persists only Pi session identity/cursor data", as
   assert.equal(created.sessionId, "pi-session-1");
   assert.equal(created.sessionFile, null);
   assert.equal(manager.lastEntryId, "entry-0");
+  assert.equal(manager.lastSeenEntryId, "entry-0");
+  assert.equal(manager.leafId, null);
   assert.deepEqual(Object.keys(manager.snapshot).sort(), [
     "lastEntryId",
     "lastError",
+    "lastSeenEntryId",
+    "leafId",
     "sessionFile",
     "sessionId",
     "state",
@@ -202,6 +206,8 @@ test("restore from a serializable snapshot does not require a live Pi process un
     state: "disconnected",
     sessionId: "session-5",
     sessionFile: "/home/pi/.pi/agent/sessions/session-5",
+    lastSeenEntryId: "entry-12",
+    leafId: null,
     lastEntryId: "entry-12",
     lastError: "previous process exited",
   });
@@ -210,6 +216,8 @@ test("restore from a serializable snapshot does not require a live Pi process un
     state: "disconnected",
     sessionId: "session-5",
     sessionFile: "/home/pi/.pi/agent/sessions/session-5",
+    lastSeenEntryId: "entry-12",
+    leafId: null,
     lastEntryId: "entry-12",
     lastError: "previous process exited",
   });
@@ -461,9 +469,48 @@ test("a malformed persisted session file is rejected at construction", () => {
         state: "disconnected",
         sessionId: null,
         sessionFile: "/a/./b",
+        lastSeenEntryId: null,
+        leafId: null,
         lastEntryId: null,
         lastError: null,
       }),
     TypeError,
   );
+});
+
+test("synchronization keeps the append cursor distinct from the active leaf", async () => {
+  const client = new FakePiRpcClient();
+  // Pi's get_entries answers append-ordered entries plus the current active
+  // leaf. The leaf pins the branch tip and may lag the append end, so it is
+  // never the durable catch-up cursor: the append cursor is the last entry id
+  // observed in append order.
+  client.queueResponse({
+    entries: [
+      { id: "entry-1", role: "user" },
+      { id: "entry-2", role: "assistant" },
+    ],
+    leafId: "entry-1",
+  });
+  const manager = new SessionManager({ client, sessionId: "session-7" });
+
+  const result = await manager.resume();
+
+  // The append cursor is the last entry id in append order...
+  assert.equal(result.lastSeenEntryId, "entry-2");
+  assert.equal(manager.lastSeenEntryId, "entry-2");
+  assert.equal(manager.snapshot.lastSeenEntryId, "entry-2");
+  // ...while leafId is the current active leaf, exposed separately.
+  assert.equal(result.leafId, "entry-1");
+  assert.equal(manager.leafId, "entry-1");
+  assert.equal(manager.snapshot.leafId, "entry-1");
+
+  // The next incremental request resumes from the append cursor, not the
+  // active leaf, so no append-ordered record is skipped.
+  client.queueResponse({ entries: [], leafId: "entry-2" });
+  await manager.synchronize();
+
+  assert.deepEqual(client.commands, [
+    { type: "get_entries" },
+    { type: "get_entries", since: "entry-2" },
+  ]);
 });
